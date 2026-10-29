@@ -119,6 +119,28 @@ optional MicroDuck backend. MicroDuck needs two external files, the MJCF from
 | `--robot-model` | none | external MicroDuck MJCF; required only with `--robot microduck` |
 | `--walking-policy` | none | external MicroDuck ONNX policy; required only with `--robot microduck` |
 
+### SlowFast visual-token budget diagnostic
+
+From the repository root, run
+`python scripts/inspect_slowfast_budget.py --checkpoint checkpoints/LightNav-0`
+in the inference environment. The script
+reads the local checkpoint's `eval_config.json`, tokenizer and Qwen3-VL processor;
+it uses synthetic RGB frames on CPU and prints JSON without loading weights,
+downloading files or writing an output file. The checkpoint must be present locally.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--checkpoint` | `checkpoints/LightNav-0` | local checkpoint directory containing `eval_config.json` and processor files |
+| `--instruction` | `walk forward through the corridor and stop` | fixed prompt text for measuring the complete generation input length |
+
+For episode lengths 2, 10, 34, 90, 120 and 256, the report separates ViT input
+patch rows, ViT output tokens before post-ViT pooling, LLM visual tokens after
+pooling, expanded video placeholders, and the full generation prompt length.
+Post-ViT pooling lowers the LLM visual-token count but does not proportionally
+lower ViT work. `model_input_tokens` is `null` when the checkpoint's `max_seq_len`
+would cut the generation prompt; the untruncated processor measurement is shown
+separately.
+
 Engine-level environment variables (no flag):
 
 | Variable | Default | Meaning |
