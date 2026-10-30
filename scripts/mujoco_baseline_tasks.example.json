@@ -1,0 +1,29 @@
+{
+  "scene_id": "procthor-val-2",
+  "robot": "TurtleBot",
+  "expected_spawn_xy": [6.5, 13.8],
+  "expected_spawn_yaw": 0.0,
+  "tasks": [
+    {
+      "id": "living_room_forward_candidate",
+      "instruction": "Walk forward about one meter and stop.",
+      "goal_xy": [7.5, 13.8],
+      "radius_m": 0.5,
+      "goal_verified": false
+    },
+    {
+      "id": "living_room_left_candidate",
+      "instruction": "Turn left, move about one meter, and stop.",
+      "goal_xy": [6.5, 14.8],
+      "radius_m": 0.5,
+      "goal_verified": false
+    },
+    {
+      "id": "living_room_diagonal_candidate",
+      "instruction": "Move forward and slightly left into the living room, then stop.",
+      "goal_xy": [8.0, 14.3],
+      "radius_m": 0.5,
+      "goal_verified": false
+    }
+  ]
+}

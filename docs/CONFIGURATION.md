@@ -141,6 +141,33 @@ lower ViT work. `model_input_tokens` is `null` when the checkpoint's `max_seq_le
 would cut the generation prompt; the untruncated processor measurement is shown
 separately.
 
+### Independent MuJoCo Baseline evaluator
+
+`scripts/eval_mujoco_baseline.py` controls the existing MuJoCo demo through its
+WebSocket, relays model messages through an observation proxy, and reads
+simulator poses. It independently checks the recorded TurtleBot trajectory
+against the bundled scene's collision geoms. It runs in `mujoco_demo`'s `uv`
+environment; the AutoDL example uses LightNav `ws://127.0.0.1:8051` and MuJoCo
+port `8088`;
+see [EVAL_MUJOCO_BASELINE.md](EVAL_MUJOCO_BASELINE.md) for target verification,
+commands, output and metric definitions. The task JSON and checkpoint processor
+diagnostic must be supplied before running a scored evaluation. Start the model
+service with default `--aspect_mode stretch` and the same SlowFast/processor
+settings used for the diagnostic. `--model-id` is a user-provided label, not a
+weight identity check.
+
+| Flag | Meaning |
+| --- | --- |
+| `--demo-url` | MuJoCo demo HTTP base URL, for example `http://127.0.0.1:8088` |
+| `--vln-server` | LightNav inference WebSocket URL that the demo should use |
+| `--tasks` | fixed JSON task set with scene, robot, expected spawn XY/yaw, instruction, target circles and `goal_verified` flags |
+| `--budget-diagnostic` | JSON report from `inspect_slowfast_budget.py`, used to calibrate derived per-step visual-token budgets |
+| `--model-id` | operator-provided checkpoint/version label recorded with every run |
+| `--repeat` | number of repetitions of each fixed task |
+| `--timeout-s` | wall-clock limit for one task run |
+| `--max-steps` | completed model-prediction limit for one task run |
+| `--output` | new, exclusive directory for per-run `results.jsonl` and aggregate `summary.json`; existing runs are not overwritten |
+
 Engine-level environment variables (no flag):
 
 | Variable | Default | Meaning |

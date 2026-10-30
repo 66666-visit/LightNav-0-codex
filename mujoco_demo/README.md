@@ -141,6 +141,11 @@ robot streams its first-person frames to the server and tracks the returned
 waypoints with the MPC — the same client protocol and controller the real robots use in
 [`robot_deploy/`](../robot_deploy/README.md).
 
+For fixed-task, repeated Baseline runs with simulator-pose and trajectory checks and
+JSONL metrics, see [MuJoCo Baseline evaluation](../docs/EVAL_MUJOCO_BASELINE.md).
+Its AutoDL example uses LightNav at `ws://127.0.0.1:8051` and this demo at
+`http://127.0.0.1:8088`.
+
 ## Layout
 
 ```text
