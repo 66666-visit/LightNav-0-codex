@@ -14,7 +14,7 @@ import argparse
 import os
 import sys
 
-from lightnav.habitat.runner import HabitatEvalConfig, run_habitat_eval
+from lightnav.habitat.runner import HabitatEvalConfig, MemoryConfig, run_habitat_eval
 
 # Argparse defaults come from the dataclass so the CLI and the Python API cannot drift.
 _DEFAULTS = HabitatEvalConfig(model_path="")
@@ -93,6 +93,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--zmq_timeout_ms", type=int, default=_DEFAULTS.zmq_timeout_ms)
     p.add_argument("--verbose", action="store_true", help="Print one line per step.")
+    p.add_argument(
+        "--memory_enabled",
+        action="store_true",
+        help="Enable episode-local explicit memory in the VLN policy (default: off).",
+    )
+    p.add_argument(
+        "--memory_top_k", type=int, default=_DEFAULTS.memory.top_k,
+        help="Maximum number of retrieved memory records per inference step.",
+    )
+    p.add_argument(
+        "--memory_max_context_chars", type=int, default=_DEFAULTS.memory.max_context_chars,
+        help="Character cap for the memory text inserted into the VLN prompt.",
+    )
 
     # Visualisation (docs/VISUALIZATION.md); needs `pip install 'lightnav[video]'`.
     viz = p.add_argument_group("visualisation")
@@ -162,6 +175,11 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
         max_new_tokens=args.max_new_tokens,
         zmq_timeout_ms=args.zmq_timeout_ms,
         verbose=args.verbose,
+        memory=MemoryConfig(
+            enabled=args.memory_enabled,
+            top_k=args.memory_top_k,
+            max_context_chars=args.memory_max_context_chars,
+        ),
         save_video=args.save_video,
         video_fps=args.video_fps,
         hfov_deg=args.hfov_deg,

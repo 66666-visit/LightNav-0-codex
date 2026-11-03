@@ -18,6 +18,10 @@ from lightnav.habitat.policy import (
     select_action_waypoint,
 )
 from lightnav.inference.policies import NavigationPolicy
+from lightnav.inference.samples import build_vln_traj_sample
+from lightnav.memory.manager import MemoryManager
+from lightnav.memory.memory_writer import MockSceneExtractor
+from lightnav.memory.schemas import MemoryContext, SceneExtraction
 from lightnav.traj_vocab import RVQBundle
 
 
@@ -85,6 +89,133 @@ def _build_policy(engine: StubEngine, centroids: np.ndarray | None = None) -> Tr
 def _reset_and_act(policy: TrajVocabVLNCEPolicy, instruction: str = "go") -> dict:
     policy.reset({"rgb": _rgb_frame(), "instruction": {"text": instruction}})
     return policy.act({"rgb": _rgb_frame()}, info={})
+
+
+class MemoryStubEngine(StubEngine):
+    def __init__(self) -> None:
+        super().__init__("<traj_1>", action_method="flat")
+        self.bundle.pool_enable = False
+        self.bundle.pool_spatial = 1
+        self.bundle.pool_mode = "avg"
+        self.bundle.video_fps = 4
+        self.bundle.slowfast_tiers = None
+        self.samples: list[dict] = []
+
+    def generate(self, sample: dict):
+        self.samples.append(sample)
+        return self._text, 1.0
+
+
+class MemoryStub:
+    def __init__(self) -> None:
+        self.resets: list[tuple[str, str]] = []
+        self.packets: list = []
+        self.actions: list[tuple[dict, str | None]] = []
+        self.closed = 0
+
+    def reset_episode(self, episode_id: str, instruction: str) -> None:
+        self.resets.append((episode_id, instruction))
+
+    def observe(self, packet) -> None:
+        self.packets.append(packet)
+
+    def get_context(self) -> MemoryContext:
+        return MemoryContext(text="Observed blue door at step 0.")
+
+    def record_action(self, action: dict, prediction: str | None = None) -> None:
+        self.actions.append((action, prediction))
+
+    def close_episode(self) -> None:
+        self.closed += 1
+
+
+def test_enabled_memory_reaches_original_vln_sample_without_evaluator_info() -> None:
+    engine = MemoryStubEngine()
+    memory = MemoryStub()
+    policy = TrajVocabVLNCEPolicy(
+        engine,
+        _build_centroids(),
+        dt=1.0,
+        lin_vel_range=(0.0, 0.3),
+        ang_vel_range=(-30.0, 30.0),
+        memory_enabled=True,
+        memory_manager=memory,
+    )
+    policy.reset({"instruction": {"text": "go to kitchen"}})
+    private_info = {"distance_to_goal": 0.01, "oracle_success": True, "agent_pose": [1, 2, 3]}
+    action1 = policy.act({"rgb": _rgb_frame()}, info=private_info)
+    policy.act({"rgb": _rgb_frame()}, info=private_info)
+
+    assert len(engine.samples) == 2
+    message = engine.samples[0]["conversations"][0]["value"]
+    assert "<navigation_task>go to kitchen</navigation_task>" in message
+    assert message.count("<video>") == 1
+    assert "Observed blue door" in message
+    assert memory.packets[0].step_id == 0
+    assert memory.packets[0].last_action is None
+    assert memory.packets[1].last_action == action1
+    assert memory.packets[1].prediction == "<traj_1>"
+    assert not any(hasattr(memory.packets[0], key) for key in private_info)
+    assert memory.actions[0][1] == "<traj_1>"
+    policy.close_episode()
+    policy.close_episode()
+    assert memory.closed == 1
+
+
+def test_disabled_memory_uses_unchanged_generation_entrypoint() -> None:
+    engine = StubEngine("<traj_1>")
+    policy = _build_policy(engine)
+    _reset_and_act(policy)
+    assert engine.calls[-1][0] == "gen_frames"
+    assert policy.memory_manager is None
+
+
+def test_mock_rgb_memory_pipeline_reaches_model_sample() -> None:
+    engine = MemoryStubEngine()
+    manager = MemoryManager(extractor=MockSceneExtractor({
+        0: SceneExtraction("hall", ["blue door"], ["blue door"], 0.9, "test"),
+    }))
+    policy = TrajVocabVLNCEPolicy(
+        engine, _build_centroids(), dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        memory_enabled=True, memory_manager=manager,
+    )
+    policy.reset({"instruction": {"text": "go through the blue door"}})
+    policy.act({"rgb": _rgb_frame()})
+
+    prompt = engine.samples[0]["conversations"][0]["value"]
+    assert "<navigation_task>go through the blue door</navigation_task>" in prompt
+    assert "Observed instruction-related blue door" in prompt
+    assert "source=mock_scene_extractor" in prompt
+    assert len(engine.samples[0]["video_segments"]) == 1
+    assert manager.scene_graph.query_nodes(kind="object", label="blue door")
+    policy.close_episode()
+    assert manager.episodic.events == []
+
+
+def test_null_memory_keeps_first_prompt_identical_to_original_sample() -> None:
+    engine = MemoryStubEngine()
+    manager = MemoryManager()
+    policy = TrajVocabVLNCEPolicy(
+        engine, _build_centroids(), dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        memory_enabled=True, memory_manager=manager,
+    )
+    policy.reset({"instruction": {"text": "go through the blue door"}})
+    policy.act({"rgb": _rgb_frame()})
+    original = build_vln_traj_sample(
+        policy.agent._get_video_tensor(), policy.agent.instruction,
+        list(policy.agent._history_frame_ids), engine.bundle,
+    )
+    assert manager.get_context().text == ""
+    assert engine.samples[0]["conversations"] == original["conversations"]
+    assert len(engine.samples[0]["video_segments"]) == len(original["video_segments"])
+    for actual_segment, original_segment in zip(
+        engine.samples[0]["video_segments"], original["video_segments"]
+    ):
+        assert actual_segment["frame_indices"] == original_segment["frame_indices"]
+        assert torch.equal(actual_segment["video"], original_segment["video"])
+    policy.close_episode()
 
 
 # -- helpers -----------------------------------------------------------------------------

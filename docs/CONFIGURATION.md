@@ -77,6 +77,16 @@ wins.
 
 ## Server / CLI parameters
 
+`lightnav-eval-habitat` also accepts `--memory_enabled` (default off), exposed as
+`HabitatEvalConfig.memory.enabled`. `--memory_top_k` (default 5) and
+`--memory_max_context_chars` (default 600) control retrieval and text size. This enables episode-local explicit memory in the
+Habitat VLN policy. It adds a bounded text memory context to the existing model
+sample after observing the current RGB frame; the original instruction, video
+segments, and trajectory/RVQ output contract remain intact. With the flag off,
+the original inference call is used. The default extractor does not label RGB
+objects; supplying a validated scene extractor is required for visual semantic
+landmarks. See [MEMORY_MVP.md](MEMORY_MVP.md) for the data flow and evidence rules.
+
 `lightnav-serve` flags (environment names are what `scripts/start_servers.sh` and
 `docker/entrypoint.sh` read):
 

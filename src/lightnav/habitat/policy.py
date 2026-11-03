@@ -15,13 +15,17 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from lightnav.inference.samples import build_vln_traj_sample
 from lightnav.tracking import TrackingAgent
 from lightnav.velocity import first_waypoint_to_velocity_cmd
 from lightnav.vln_utils import parse_rvq_action_tokens, parse_traj_token
+
+if TYPE_CHECKING:
+    from lightnav.memory.manager import MemoryManager
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +77,8 @@ class TrajVocabVLNCEPolicy:
         ang_vel_range: tuple[float, float],
         num_history_frames: int = 64,
         rvq_bundle: Any = None,
+        memory_enabled: bool = False,
+        memory_manager: MemoryManager | None = None,
     ) -> None:
         if (centroids is None) == (rvq_bundle is None):
             raise ValueError("pass exactly one of `centroids` (flat) or `rvq_bundle` (rvq).")
@@ -124,6 +130,21 @@ class TrajVocabVLNCEPolicy:
         self.H: int = self.agent.H
         self.instruction: str = ""
 
+        self.memory_enabled = bool(memory_enabled)
+        if self.memory_enabled:
+            if memory_manager is None:
+                from lightnav.memory.manager import MemoryManager
+
+                memory_manager = MemoryManager()
+            self.memory_manager = memory_manager
+        else:
+            self.memory_manager = None
+        self._memory_episode_index = -1
+        self._memory_episode_open = False
+        self._memory_step = 0
+        self._last_executed_action: dict | None = None
+        self._last_prediction: str | None = None
+
         self._last_cluster_id: int | None = None
         self._last_rvq_codes: list[int] | None = None
         self._last_waypoints: np.ndarray | None = None
@@ -141,9 +162,28 @@ class TrajVocabVLNCEPolicy:
 
     def reset(self, obs: dict[str, Any] | None = None) -> None:
         """Reset the frame buffer and seed the instruction from ``obs`` if given."""
+        self.close_episode()
         self.instruction = extract_instruction(obs) if obs is not None else ""
         self.agent.reset(self.instruction)
         self._clear_last()
+        if self.memory_manager is not None:
+            self._memory_episode_index += 1
+            self.memory_manager.reset_episode(
+                episode_id=f"policy_episode_{self._memory_episode_index}",
+                instruction=self.instruction,
+            )
+            self._memory_episode_open = True
+            self._memory_step = 0
+            self._last_executed_action = None
+            self._last_prediction = None
+
+    def close_episode(self) -> None:
+        """Release the explicit memory of the current episode, if enabled."""
+        if self._memory_episode_open:
+            self.memory_manager.close_episode()
+            self._memory_episode_open = False
+            self._last_executed_action = None
+            self._last_prediction = None
 
     def observe(self, obs: dict[str, Any], info: dict[str, Any] | None = None) -> None:
         """Push the RGB frame into the history buffer without running inference."""
@@ -151,20 +191,53 @@ class TrajVocabVLNCEPolicy:
 
     def stop_action(self) -> dict:
         """The explicit STOP: a zero velocity_control command (sets ``is_stop_called``)."""
-        return first_waypoint_to_velocity_cmd(
+        action = first_waypoint_to_velocity_cmd(
             np.zeros(3, dtype=np.float32), self.dt, self.lin_vel_range, self.ang_vel_range
         )
+        if self._memory_episode_open:
+            self.memory_manager.record_action(action, prediction=None)
+            self._last_executed_action = action
+        return action
 
     def act(self, obs: dict[str, Any], info: dict[str, Any] | None = None) -> dict:
         """Run one inference step and return a Habitat ``velocity_control`` action dict."""
         self.agent.observe(obs["rgb"])
-        text, _ = self.engine.generate_from_frames(
-            self.agent._get_video_tensor(),
-            self.agent.instruction,
-            predict_horizon=1,
-            frame_ids=list(self.agent._history_frame_ids),
-            task_type="vlnce_traj",
-        )
+        if self._memory_episode_open:
+            from lightnav.memory.memory_context_builder import inject_memory_context
+            from lightnav.memory.schemas import ObservationPacket
+
+            # Only robot-visible data enters memory. Habitat ``info`` contains
+            # evaluator-only state such as distance_to_goal and oracle_success.
+            self.memory_manager.observe(
+                ObservationPacket(
+                    step_id=self._memory_step,
+                    rgb=obs["rgb"],
+                    instruction=self.instruction,
+                    last_action=self._last_executed_action,
+                    prediction=self._last_prediction,
+                )
+            )
+            self._memory_step += 1
+            sample = build_vln_traj_sample(
+                self.agent._get_video_tensor(),
+                self.agent.instruction,
+                list(self.agent._history_frame_ids),
+                self.engine.bundle,
+            )
+            sample = inject_memory_context(
+                sample,
+                self.memory_manager.get_context(),
+                max_chars=getattr(self.memory_manager, "max_context_chars", 600),
+            )
+            text, _ = self.engine.generate(sample)
+        else:
+            text, _ = self.engine.generate_from_frames(
+                self.agent._get_video_tensor(),
+                self.agent.instruction,
+                predict_horizon=1,
+                frame_ids=list(self.agent._history_frame_ids),
+                task_type="vlnce_traj",
+            )
         self._last_raw_text = text
 
         try:
@@ -176,9 +249,14 @@ class TrajVocabVLNCEPolicy:
             self._last_waypoints = None
             self._last_action_waypoint_index = None
             self._last_action_waypoint = None
-            return first_waypoint_to_velocity_cmd(
+            action = first_waypoint_to_velocity_cmd(
                 np.zeros(3, dtype=np.float32), self.dt, self.lin_vel_range, self.ang_vel_range
             )
+            if self._memory_episode_open:
+                self.memory_manager.record_action(action, prediction=text)
+                self._last_executed_action = action
+                self._last_prediction = text
+            return action
 
         # decode_waypoints already validated the tokens; re-parse only to expose the ids.
         if self.method == "rvq":
@@ -193,9 +271,14 @@ class TrajVocabVLNCEPolicy:
         waypoint_index, waypoint = select_action_waypoint(self._last_waypoints)
         self._last_action_waypoint_index = int(waypoint_index)
         self._last_action_waypoint = waypoint.copy()
-        return first_waypoint_to_velocity_cmd(
+        action = first_waypoint_to_velocity_cmd(
             waypoint, self.dt, self.lin_vel_range, self.ang_vel_range
         )
+        if self._memory_episode_open:
+            self.memory_manager.record_action(action, prediction=text)
+            self._last_executed_action = action
+            self._last_prediction = text
+        return action
 
     def get_info(self) -> dict[str, Any]:
         """Return the last predicted trajectory and ids for logging; minimal dict before any act.

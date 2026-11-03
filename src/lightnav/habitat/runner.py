@@ -18,7 +18,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -40,6 +40,19 @@ from lightnav.vln_utils import DEFAULT_TRAJ_HORIZON, DEFAULT_TRAJ_K
 logger = logging.getLogger(__name__)
 
 _CENTROIDS_FILENAME = "centroids_whole_chunk_K{K}_h{H}.npy"
+
+
+@dataclass
+class MemoryConfig:
+    """Habitat policy's episode-local explicit memory settings."""
+
+    enabled: bool = False
+    top_k: int = 5
+    max_context_chars: int = 600
+
+    def __post_init__(self) -> None:
+        if self.top_k < 1 or self.max_context_chars < 1:
+            raise ValueError("memory.top_k and memory.max_context_chars must be positive")
 
 
 @dataclass
@@ -81,6 +94,7 @@ class HabitatEvalConfig:
     cam_height: float = 0.88  # metres above the floor, as in the yamls
     waypoint_dt_s: float = 0.1  # seconds per waypoint row assumed by the HUD readout only
     record_dir: str = ""
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +285,14 @@ def build_velocity_policy(
         if cfg.num_history_frames is not None
         else int(bundle.num_history_frames)
     )
+    memory_manager = None
+    if cfg.memory.enabled:
+        from lightnav.memory.manager import MemoryManager
+
+        memory_manager = MemoryManager(
+            top_k=cfg.memory.top_k,
+            max_context_chars=cfg.memory.max_context_chars,
+        )
     return TrajVocabVLNCEPolicy(
         engine,
         centroids,
@@ -279,6 +301,8 @@ def build_velocity_policy(
         ang_vel_range=tuple(float(x) for x in info["ang_vel_range"]),
         num_history_frames=num_history_frames,
         rvq_bundle=rvq_bundle,
+        memory_enabled=cfg.memory.enabled,
+        memory_manager=memory_manager,
     )
 
 
@@ -702,8 +726,12 @@ def run_habitat_eval(
                 if viz is not None and obs.get("rgb") is not None:
                     viz.final_frame(obs["rgb"], step=step + 1, instruction=instruction)
             finally:
-                if viz is not None:
-                    video_rel = viz.end_episode()
+                try:
+                    if viz is not None:
+                        video_rel = viz.end_episode()
+                finally:
+                    if hasattr(policy, "close_episode"):
+                        policy.close_episode()
 
             oracle_success_metric = info.get("oracle_success")
             if oracle_success_metric is None:
@@ -760,9 +788,15 @@ def run_habitat_eval(
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     finally:
-        if viz is not None:
-            viz.close()
-        env.close()
+        try:
+            if policy is not None and hasattr(policy, "close_episode"):
+                policy.close_episode()
+        finally:
+            try:
+                if viz is not None:
+                    viz.close()
+            finally:
+                env.close()
 
     elapsed = time.time() - start_time
     if skipped_lang > 0:

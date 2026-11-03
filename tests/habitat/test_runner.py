@@ -17,6 +17,7 @@ import pytest
 from lightnav.habitat.policy import TrajVocabVLNCEPolicy, extract_instruction
 from lightnav.habitat.runner import (
     HabitatEvalConfig,
+    MemoryConfig,
     _safe_scalar,
     build_velocity_policy,
     resolve_action_decoder,
@@ -191,6 +192,54 @@ def test_full_split_runs_until_the_first_repeated_scene_episode_key(tmp_path):
     assert h.policy.resets == ["go to the sofa", "turn around twice", "leave the room"]
     # Every action sent to the env is the policy's velocity dict.
     assert all(a["action"] == "velocity_control" for a in h.env.actions)
+
+
+def test_memory_config_defaults_off_and_cli_maps_nested_settings():
+    from lightnav.cli.eval_habitat import build_parser, config_from_args
+
+    defaults = HabitatEvalConfig(model_path="model")
+    assert defaults.memory == MemoryConfig(enabled=False, top_k=5, max_context_chars=600)
+    args = build_parser().parse_args([
+        "--model_path", "model", "--memory_enabled", "--memory_top_k", "3",
+        "--memory_max_context_chars", "240",
+    ])
+    cfg = config_from_args(args)
+    assert cfg.memory == MemoryConfig(enabled=True, top_k=3, max_context_chars=240)
+
+
+def test_runner_closes_each_episode_memory_even_on_error(tmp_path):
+    class ClosingPolicy(FakePolicy):
+        def __init__(self, *, fail: bool = False):
+            super().__init__()
+            self.fail = fail
+            self.active = False
+            self.close_count = 0
+
+        def reset(self, obs):
+            super().reset(obs)
+            self.active = True
+
+        def act(self, obs, info):
+            if self.fail:
+                raise RuntimeError("model failed")
+            return super().act(obs, info)
+
+        def close_episode(self):
+            if self.active:
+                self.close_count += 1
+                self.active = False
+
+    success = Harness(FakeEnv(steps_to_terminate=1))
+    success.policy = ClosingPolicy()
+    success.run(_cfg(tmp_path / "success", episodes=2))
+    assert success.policy.close_count == 2
+
+    failure = Harness(FakeEnv(steps_to_terminate=1))
+    failure.policy = ClosingPolicy(fail=True)
+    with pytest.raises(RuntimeError, match="model failed"):
+        failure.run(_cfg(tmp_path / "failure", episodes=1))
+    assert failure.policy.close_count == 1
+    assert failure.env.closed
 
 
 def test_episode_result_record_fields(tmp_path):

@@ -103,6 +103,9 @@ the client stops when the server's episode iterator cycles back to an already se
 | `--max_new_tokens N` | `64` | per-step decode cap; raised automatically to grounding prefix + action tokens when smaller |
 | `--zmq_timeout_ms N` | `600000` | receive timeout per attempt (Habitat scene loads are slow) |
 | `--verbose` | off | one line per step with the raw model text and the chosen waypoint |
+| `--memory_enabled` | off | enable episode-local explicit memory and insert retrieved context into the VLN model prompt |
+| `--memory_top_k N` | `5` | maximum retrieved records in one memory context |
+| `--memory_max_context_chars N` | `600` | character cap for memory text added to the prompt |
 | `--save_video` | off | write `<output_dir>/videos/<episode_id>.mp4` per episode (predicted trajectory, pointing markers, HUD over the agent's frames; one frame per step). Needs `pip install -e ".[video]"` |
 | `--video_fps N` | `10` | playback frame rate of the saved videos |
 | `--hfov_deg F` | `120.0` | agent camera horizontal FOV for the trajectory overlay (the shipped yamls) |
@@ -113,6 +116,30 @@ the client stops when the server's episode iterator cycles back to an already se
 Decoding is greedy (temperature 0); the client never touches the sampling knobs. The
 visualisation flags are described in [VISUALIZATION.md](VISUALIZATION.md); none of them
 changes the evaluation.
+
+### Explicit memory MVP
+
+Pass `--memory_enabled` on the eval client to activate the `memory.enabled` switch
+(`HabitatEvalConfig.memory.enabled` in Python). Each accepted episode resets its
+working, episodic, and scene-graph memory; the memory is closed at episode end,
+including errors. The policy writes only RGB observations, the navigation
+instruction, and its own previous actions and predictions. Habitat metrics and
+oracle state stay in the evaluator. The original video history and SlowFast
+processing still run. Retrieved text is bounded and inserted into the existing
+VLN sample before inference, so enabling memory can change trajectory-token
+predictions. The switch defaults to off for baseline-equivalent inference.
+
+The repository does not ship an RGB object/scene semantic detector. The default
+extractor records no semantic place or object labels, so a first RGB frame alone
+does not create a place node or memory text. `MockSceneExtractor` is for CPU tests
+or an explicitly provided observation adapter. A real RGB extractor must be
+integrated and validated before claiming semantic landmark recognition on R2R.
+The memory text has a character limit, not a measured multimodal token budget;
+observe actual context limits during a single-episode AutoDL run. Since the
+checkpoint was not trained with memory text, compare that run against the
+baseline before a full split.
+
+The call chain, evidence rules, and smoke command are in [MEMORY_MVP.md](MEMORY_MVP.md).
 
 ### Action decoder
 
