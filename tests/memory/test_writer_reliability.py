@@ -8,7 +8,7 @@ import numpy as np
 
 from lightnav.memory.manager import MemoryManager
 from lightnav.memory.memory_writer import MockSceneExtractor, NullSceneExtractor
-from lightnav.memory.schemas import ObservationPacket, SceneExtraction
+from lightnav.memory.schemas import DetectedObject, ObservationPacket, SceneExtraction
 
 
 def _rgb(value: int) -> np.ndarray:
@@ -99,7 +99,7 @@ class MemoryWriterReliabilityTests(unittest.TestCase):
         manager.observe(ObservationPacket(1, _rgb(0), "find a chair"))
 
         self.assertEqual(place.last_step, 0)
-        self.assertEqual(manager.scene_graph.query_nodes(kind="object"), [])
+        self.assertEqual(len(manager.scene_graph.query_nodes(kind="object")), 1)
         self.assertEqual(manager.scene_graph.query_edges(relation="visible_from"), [])
         observations = manager.episodic.query(kind="object_observation")
         self.assertEqual(len(observations), 1)
@@ -126,14 +126,14 @@ class MemoryWriterReliabilityTests(unittest.TestCase):
 
         manager.observe(ObservationPacket(2, _rgb(0), "find a chair"))
         self.assertEqual(len(manager.scene_graph.query_nodes(kind="place")), 1)
-        self.assertEqual(manager.scene_graph.query_nodes(kind="object"), [])
+        self.assertEqual(len(manager.scene_graph.query_nodes(kind="object")), 1)
         self.assertEqual(manager.scene_graph.query_edges(relation="visible_from"), [])
         observations = manager.episodic.query(kind="object_observation")
         self.assertEqual(len(observations), 1)
         self.assertIsNone(observations[0].place_id)
         self.assertEqual(manager.scene_graph.get_node(old_place).last_step, 0)
 
-    def test_object_without_place_is_event_only(self) -> None:
+    def test_object_without_place_has_no_place_or_relation(self) -> None:
         extractor = MockSceneExtractor({
             0: SceneExtraction(objects=["chair"], confidence=0.8, source="script"),
         })
@@ -141,7 +141,8 @@ class MemoryWriterReliabilityTests(unittest.TestCase):
         manager.reset_episode("episode", "find the chair")
         manager.observe(ObservationPacket(0, _rgb(0), "find the chair"))
 
-        self.assertEqual(manager.scene_graph.nodes, [])
+        self.assertEqual(len(manager.scene_graph.query_nodes(kind="object")), 1)
+        self.assertEqual(manager.scene_graph.query_nodes(kind="place"), [])
         self.assertEqual(manager.scene_graph.edges, [])
         observations = manager.episodic.query(kind="object_observation")
         self.assertEqual(len(observations), 1)
@@ -217,6 +218,21 @@ class MemoryWriterReliabilityTests(unittest.TestCase):
         manager.observe(ObservationPacket(0, _rgb(0), "find the hall"))
         self.assertEqual(manager.working.state.step_id, 0)
         self.assertEqual(len(manager.scene_graph.query_nodes(kind="place")), 1)
+
+    def test_invalid_object_confidence_is_rejected_before_any_write(self) -> None:
+        extractor = MockSceneExtractor({
+            0: SceneExtraction(
+                confidence=0.9, source="script",
+                detections=[DetectedObject("chair", float("nan"))],
+            ),
+        })
+        manager = MemoryManager(extractor=extractor)
+        manager.reset_episode("episode", "find a chair")
+        with self.assertRaisesRegex(ValueError, "detection confidence"):
+            manager.observe(ObservationPacket(0, _rgb(0), "find a chair"))
+        self.assertEqual(manager.working.state.step_id, -1)
+        self.assertEqual(manager.episodic.events, [])
+        self.assertEqual(manager.scene_graph.nodes, [])
 
 
 if __name__ == "__main__":

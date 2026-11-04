@@ -49,10 +49,25 @@ class MemoryConfig:
     enabled: bool = False
     top_k: int = 5
     max_context_chars: int = 600
+    extractor: str = "null"
+    extractor_model_path: str = ""
+    extractor_device: str = "cpu"
+    extractor_confidence: float = 0.25
+    extract_every_n_steps: int = 5
 
     def __post_init__(self) -> None:
         if self.top_k < 1 or self.max_context_chars < 1:
             raise ValueError("memory.top_k and memory.max_context_chars must be positive")
+        if self.extractor not in {"null", "yolo11"}:
+            raise ValueError("memory.extractor must be 'null' or 'yolo11'")
+        if self.enabled and self.extractor == "yolo11" and not self.extractor_model_path:
+            raise ValueError("memory.extractor_model_path is required for yolo11")
+        if not self.extractor_device:
+            raise ValueError("memory.extractor_device must be nonempty")
+        if not 0.0 < self.extractor_confidence <= 1.0:
+            raise ValueError("memory.extractor_confidence must be in (0, 1]")
+        if not isinstance(self.extract_every_n_steps, int) or self.extract_every_n_steps < 1:
+            raise ValueError("memory.extract_every_n_steps must be a positive integer")
 
 
 @dataclass
@@ -289,7 +304,18 @@ def build_velocity_policy(
     if cfg.memory.enabled:
         from lightnav.memory.manager import MemoryManager
 
+        extractor = None
+        if cfg.memory.extractor == "yolo11":
+            from lightnav.memory.yolo_scene_extractor import YOLOSceneExtractor
+
+            extractor = YOLOSceneExtractor(
+                model_path=cfg.memory.extractor_model_path,
+                device=cfg.memory.extractor_device,
+                confidence=cfg.memory.extractor_confidence,
+                every_n_steps=cfg.memory.extract_every_n_steps,
+            )
         memory_manager = MemoryManager(
+            extractor=extractor,
             top_k=cfg.memory.top_k,
             max_context_chars=cfg.memory.max_context_chars,
         )
@@ -303,6 +329,7 @@ def build_velocity_policy(
         rvq_bundle=rvq_bundle,
         memory_enabled=cfg.memory.enabled,
         memory_manager=memory_manager,
+        memory_verbose=cfg.verbose,
     )
 
 

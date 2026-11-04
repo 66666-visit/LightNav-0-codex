@@ -68,6 +68,9 @@ video = ["opencv-python-headless>=4.10", "imageio>=2.37", "imageio-ffmpeg>=0.6"]
 # Habitat evaluation client (lightnav-eval-habitat talks to the habitat server over ZMQ).
 # habitat-sim / habitat-lab themselves live in a separate conda env; see habitat_server/.
 habitat = ["pyzmq>=25"]
+# Local YOLO11n RGB object detection for the optional Habitat MemoryManager extractor.
+# Only installed when explicitly requested; the default null extractor needs no YOLO package.
+yolo11 = ["ultralytics>=8.3,<9"]
 # CPU-only unit tests (scheduler, decode parsing, protocol, sample builders).
 test = ["pytest>=8", "pytest-asyncio>=0.24"]
 

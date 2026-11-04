@@ -13,6 +13,7 @@ command below its minimum speeds as a stop, so that fallback ends the episode.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -79,6 +80,7 @@ class TrajVocabVLNCEPolicy:
         rvq_bundle: Any = None,
         memory_enabled: bool = False,
         memory_manager: MemoryManager | None = None,
+        memory_verbose: bool = False,
     ) -> None:
         if (centroids is None) == (rvq_bundle is None):
             raise ValueError("pass exactly one of `centroids` (flat) or `rvq_bundle` (rvq).")
@@ -131,6 +133,7 @@ class TrajVocabVLNCEPolicy:
         self.instruction: str = ""
 
         self.memory_enabled = bool(memory_enabled)
+        self.memory_verbose = bool(memory_verbose)
         if self.memory_enabled:
             if memory_manager is None:
                 from lightnav.memory.manager import MemoryManager
@@ -203,12 +206,12 @@ class TrajVocabVLNCEPolicy:
         """Run one inference step and return a Habitat ``velocity_control`` action dict."""
         self.agent.observe(obs["rgb"])
         if self._memory_episode_open:
-            from lightnav.memory.memory_context_builder import inject_memory_context
+            from lightnav.memory.memory_context_builder import build_context_text, inject_memory_context
             from lightnav.memory.schemas import ObservationPacket
 
             # Only robot-visible data enters memory. Habitat ``info`` contains
             # evaluator-only state such as distance_to_goal and oracle_success.
-            self.memory_manager.observe(
+            events = self.memory_manager.observe(
                 ObservationPacket(
                     step_id=self._memory_step,
                     rgb=obs["rgb"],
@@ -224,11 +227,36 @@ class TrajVocabVLNCEPolicy:
                 list(self.agent._history_frame_ids),
                 self.engine.bundle,
             )
+            context = self.memory_manager.get_context()
             sample = inject_memory_context(
                 sample,
-                self.memory_manager.get_context(),
+                context,
                 max_chars=getattr(self.memory_manager, "max_context_chars", 600),
             )
+            if self.memory_verbose:
+                extractor = self.memory_manager.extractor
+                attempted = getattr(extractor, "last_attempt_step", None) == self._memory_step - 1
+                memory_text = build_context_text(
+                    context, max_chars=getattr(self.memory_manager, "max_context_chars", 600),
+                )
+                diagnostic = {
+                    "step": self._memory_step - 1,
+                    "extractor": type(extractor).__name__,
+                    "extraction_attempted": attempted,
+                    "extraction_error": getattr(extractor, "last_error", None) if attempted else None,
+                    "objects": [
+                        {"label": event.description.removeprefix("Observed "),
+                         "confidence": float(event.confidence)}
+                        for event in events if event.kind == "object_observation"
+                    ],
+                    "events_written": len(events),
+                    "graph_nodes": len(self.memory_manager.scene_graph.nodes),
+                    "graph_edges": len(self.memory_manager.scene_graph.edges),
+                    "retrieved_records": len(context.events) + len(context.nodes) + len(context.edges),
+                    "injected_memory_chars": len(memory_text),
+                    "injected_memory_text": memory_text,
+                }
+                print("[memory] " + json.dumps(diagnostic, ensure_ascii=False), flush=True)
             text, _ = self.engine.generate(sample)
         else:
             text, _ = self.engine.generate_from_frames(

@@ -10,6 +10,7 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS = {
+    "DetectedObject": "lightnav.memory.schemas",
     "MemoryManager": "lightnav.memory.manager",
     "MemoryContext": "lightnav.memory.schemas",
     "MemoryEvent": "lightnav.memory.schemas",
@@ -22,6 +23,7 @@ _EXPORTS = {
 }
 
 __all__ = [
+    "DetectedObject",
     "MemoryContext",
     "MemoryEvent",
     "MemoryManager",

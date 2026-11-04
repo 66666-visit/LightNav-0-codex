@@ -1,8 +1,8 @@
 """Convert allowed episode observations into structured memory records.
 
-There is no production semantic RGB extractor in LightNav. The default extractor
-returns no semantic facts; the mock is injectable for tests. A compact RGB color
-histogram supports only an appearance-change signal and is never saved as an image.
+The default extractor returns no semantic facts; an optional local detector can
+report objects. A compact RGB color histogram supports only an appearance-change
+signal and is never saved as an image.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import numpy as np
 
 from lightnav.memory.episodic_memory import EpisodicMemory
 from lightnav.memory.scene_graph import SceneGraph
-from lightnav.memory.schemas import MemoryEvent, ObservationPacket, SceneExtraction
+from lightnav.memory.schemas import DetectedObject, MemoryEvent, ObservationPacket, SceneExtraction
 from lightnav.memory.working_memory import WorkingMemoryStore
 
 _CURRENT_PLACE = object()
@@ -33,7 +33,7 @@ class SceneExtractor(Protocol):
 
 
 class NullSceneExtractor:
-    """Production default until a validated local RGB semantic model is connected."""
+    """Default extractor: intentionally reports no RGB semantic facts."""
 
     def reset_episode(self, episode_id: str, instruction: str) -> None:
         pass
@@ -64,6 +64,7 @@ class MockSceneExtractor:
             landmarks=list(scripted.landmarks),
             confidence=scripted.confidence,
             source="mock_scene_extractor",
+            detections=list(scripted.detections),
         )
 
     def close_episode(self) -> None:
@@ -186,24 +187,40 @@ class MemoryWriter:
             ))
 
         place_id = self.working.state.place_id
-        if extraction.source != "none" and extraction.confidence > 0.0:
-            detections = (("object_observation", extraction.objects), ("landmark", extraction.landmarks))
-            for kind, labels in detections:
-                for label in labels:
-                    label = label.strip()
-                    if not label:
+        if extraction.source != "none":
+            # YOLO supplies one confidence per box. Its compatibility `objects`
+            # labels mirror `detections` and must not be written a second time.
+            object_detections = (
+                extraction.detections
+                if extraction.detections else [
+                    DetectedObject(label=label, confidence=extraction.confidence)
+                    for label in extraction.objects
+                ]
+            )
+            observations = (
+                ("object_observation", object_detections),
+                ("landmark", [
+                    DetectedObject(label=label, confidence=extraction.confidence)
+                    for label in extraction.landmarks
+                ]),
+            )
+            for kind, candidates in observations:
+                for detection in candidates:
+                    label = detection.label.strip()
+                    if not label or detection.confidence <= 0.0:
                         continue
-                    node = None
-                    if place_id:
-                        node = self.graph.add_object(
-                            label, place_id=place_id, confidence=extraction.confidence,
-                            source=extraction.source, step_id=packet.step_id,
-                            evidence=f"extractor output for RGB observation {packet.step_id}",
-                        )
-                    metadata = {"node_id": node.node_id} if node is not None else {}
+                    evidence = f"{extraction.source} RGB detection at step {packet.step_id}"
+                    node = self.graph.add_object(
+                        label, place_id=place_id, confidence=detection.confidence,
+                        source=extraction.source, step_id=packet.step_id,
+                        evidence=evidence,
+                    )
+                    metadata = {"node_id": node.node_id}
+                    if detection.bbox_xyxy is not None:
+                        metadata["bbox_xyxy"] = list(detection.bbox_xyxy)
                     new_events.append(self._event(
                         packet.step_id, kind, f"Observed {label}",
-                        confidence=extraction.confidence, source=extraction.source,
+                        confidence=detection.confidence, source=extraction.source,
                         place_id=place_id, importance=0.8 if kind == "landmark" else 0.6,
                         metadata=metadata,
                     ))
@@ -212,7 +229,7 @@ class MemoryWriter:
                         new_events.append(self._event(
                             packet.step_id, "instruction_match",
                             f"Observed instruction-related {label}",
-                            confidence=extraction.confidence, source=extraction.source,
+                            confidence=detection.confidence, source=extraction.source,
                             place_id=place_id, importance=0.95,
                             metadata=metadata,
                         ))
@@ -317,5 +334,28 @@ class MemoryWriter:
             raise ValueError("extractor source must be a nonempty string")
         if (
             extraction.place_label or extraction.objects or extraction.landmarks
+            or extraction.detections
         ) and extraction.source.strip().casefold() == "none":
             raise ValueError("semantic facts require an extractor source")
+        if not isinstance(extraction.detections, list):
+            raise TypeError("extractor detections must be a list")
+        for detection in extraction.detections:
+            if not isinstance(detection, DetectedObject):
+                raise TypeError("extractor detections must contain DetectedObject values")
+            if not isinstance(detection.label, str) or not detection.label.strip():
+                raise ValueError("detection label must be nonempty")
+            if (
+                not isinstance(detection.confidence, (int, float))
+                or not math.isfinite(detection.confidence)
+                or not 0.0 <= detection.confidence <= 1.0
+            ):
+                raise ValueError("detection confidence must be in [0, 1]")
+            if detection.bbox_xyxy is not None:
+                box = detection.bbox_xyxy
+                if (
+                    not isinstance(box, (tuple, list)) or len(box) != 4
+                    or any(not isinstance(value, (int, float)) or not math.isfinite(value)
+                           for value in box)
+                    or box[2] <= box[0] or box[3] <= box[1]
+                ):
+                    raise ValueError("detection bbox_xyxy must be four finite xyxy coordinates")

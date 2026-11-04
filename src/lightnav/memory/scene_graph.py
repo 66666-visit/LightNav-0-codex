@@ -1,7 +1,8 @@
 """Explicit episode scene graph with conservative place and object identity.
 
-Matching labels alone never merge instances. A visible object is linked to a
-place with ``visible_from``; traversable connections require verified evidence.
+Matching labels alone never merge instances. A visible object is linked to an
+evidenced place with ``visible_from``; otherwise it remains unanchored.
+Traversable connections require verified evidence.
 """
 
 from __future__ import annotations
@@ -53,25 +54,28 @@ class SceneGraph:
         self,
         label: str,
         *,
-        place_id: str,
+        place_id: str | None,
         confidence: float,
         source: str,
         step_id: int,
         evidence: str,
         instance_key: str | None = None,
     ) -> SceneNode:
-        """Reuse an object only with an explicit stable key within this place.
+        """Record a visual object, optionally linked to an evidenced place.
 
         A name is a description, not an instance identifier. In particular, two
-        chairs visible from the same place must not collapse into one node.
+        chairs visible from the same place must not collapse into one node. An
+        object with no place hypothesis remains an unanchored graph node.
         """
         self._validate_observation(confidence, source, evidence)
-        self._require_place(place_id)
+        if place_id is not None:
+            self._require_place(place_id)
         if not label.strip():
             raise ValueError("object label is required")
         if instance_key is not None:
             if not isinstance(instance_key, str) or not instance_key.strip():
                 raise ValueError("instance_key must be a nonempty string")
+        if instance_key is not None and place_id is not None:
             for edge in self.query_edges(relation="visible_from", source_id=place_id):
                 existing = self._nodes[edge.target_id]
                 if existing.attributes.get("instance_key") == instance_key:
@@ -96,10 +100,11 @@ class SceneGraph:
             last_step=step_id, status="observed", attributes=attributes,
         )
         self._nodes[node.node_id] = node
-        self.add_edge(
-            place_id, node.node_id, "visible_from", confidence=confidence,
-            source=source, step_id=step_id, evidence=evidence,
-        )
+        if place_id is not None:
+            self.add_edge(
+                place_id, node.node_id, "visible_from", confidence=confidence,
+                source=source, step_id=step_id, evidence=evidence,
+            )
         return node
 
     def update_node(

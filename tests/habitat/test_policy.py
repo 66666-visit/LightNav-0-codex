@@ -6,6 +6,7 @@ replaced by a tiny zero tensor so the buffer plumbing is exercised without a res
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -22,6 +23,7 @@ from lightnav.inference.samples import build_vln_traj_sample
 from lightnav.memory.manager import MemoryManager
 from lightnav.memory.memory_writer import MockSceneExtractor
 from lightnav.memory.schemas import MemoryContext, SceneExtraction
+from lightnav.memory.yolo_scene_extractor import YOLOSceneExtractor
 from lightnav.traj_vocab import RVQBundle
 
 
@@ -215,6 +217,72 @@ def test_null_memory_keeps_first_prompt_identical_to_original_sample() -> None:
     ):
         assert actual_segment["frame_indices"] == original_segment["frame_indices"]
         assert torch.equal(actual_segment["video"], original_segment["video"])
+    policy.close_episode()
+
+
+def test_local_yolo_memory_reaches_prompt_and_verbose_diagnostics(tmp_path, capsys) -> None:
+    class TwoEpisodeDetector:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def predict(self, *, source, conf, device, verbose, save):
+            self.calls += 1
+            found = self.calls == 1
+            boxes = SimpleNamespace(
+                cls=np.array([0] if found else [], dtype=np.float32),
+                conf=np.array([0.88] if found else [], dtype=np.float32),
+                xyxy=np.array([[1, 1, 8, 8]] if found else [], dtype=np.float32).reshape(-1, 4),
+            )
+            return [SimpleNamespace(boxes=boxes, names={0: "chair"})]
+
+    weights = tmp_path / "yolo11n.pt"
+    weights.write_bytes(b"fake: model_factory supplies the detector")
+    detector = TwoEpisodeDetector()
+    extractor = YOLOSceneExtractor(str(weights), model_factory=lambda path: detector)
+    manager = MemoryManager(extractor=extractor)
+    engine = MemoryStubEngine()
+    policy = TrajVocabVLNCEPolicy(
+        engine, _build_centroids(), dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        memory_enabled=True, memory_manager=manager, memory_verbose=True,
+    )
+
+    policy.reset({"instruction": {"text": "find the chair"}})
+    policy.act({"rgb": _rgb_frame()})
+    first_prompt = engine.samples[-1]["conversations"][0]["value"]
+    diagnostic = json.loads(next(
+        line.removeprefix("[memory] ") for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[memory] ")
+    ))
+    assert "<navigation_task>find the chair</navigation_task>" in first_prompt
+    assert first_prompt.count("<video>") == 1
+    assert "Observed chair" in first_prompt
+    assert diagnostic["extraction_attempted"] is True
+    assert diagnostic["objects"][0]["label"] == "chair"
+    assert diagnostic["objects"][0]["confidence"] == pytest.approx(0.88)
+    assert diagnostic["events_written"] >= 1
+    assert diagnostic["graph_nodes"] == 1 and diagnostic["graph_edges"] == 0
+    assert diagnostic["retrieved_records"] >= 1
+    assert diagnostic["injected_memory_chars"] == len(diagnostic["injected_memory_text"])
+    assert diagnostic["injected_memory_text"] in first_prompt
+
+    policy.act({"rgb": _rgb_frame()})
+    skipped_diagnostic = json.loads(next(
+        line.removeprefix("[memory] ") for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[memory] ")
+    ))
+    assert skipped_diagnostic["step"] == 1
+    assert skipped_diagnostic["extraction_attempted"] is False
+    assert skipped_diagnostic["objects"] == []
+    assert detector.calls == 1
+
+    policy.reset({"instruction": {"text": "turn left"}})
+    policy.act({"rgb": _rgb_frame()})
+    second_prompt = engine.samples[-1]["conversations"][0]["value"]
+    assert "<navigation_task>turn left</navigation_task>" in second_prompt
+    assert "chair" not in second_prompt
+    assert manager.scene_graph.nodes == []
+    assert manager.episodic.events == []
     policy.close_episode()
 
 

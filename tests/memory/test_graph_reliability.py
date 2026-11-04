@@ -66,6 +66,15 @@ class SceneGraphReliabilityTests(unittest.TestCase):
             )
         self.assertEqual(self.graph.query_edges(relation="contains"), [])
 
+    def test_object_without_place_evidence_is_unanchored(self) -> None:
+        object_node = self.graph.add_object(
+            "chair", place_id=None, confidence=0.73, source="yolo11n",
+            step_id=1, evidence="RGB detection at step 1",
+        )
+        self.assertEqual(self.graph.query_nodes(kind="object", label="chair"), [object_node])
+        self.assertEqual(self.graph.query_edges(target_id=object_node.node_id), [])
+        self.assertEqual(len(self.graph.query_nodes(kind="place")), 2)
+
     def test_unverified_movement_cannot_create_connected_to(self) -> None:
         for source in ("issued_command_and_rgb_semantics", "executed_action_and_observation"):
             with self.subTest(source=source):

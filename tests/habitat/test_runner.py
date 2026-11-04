@@ -202,9 +202,18 @@ def test_memory_config_defaults_off_and_cli_maps_nested_settings():
     args = build_parser().parse_args([
         "--model_path", "model", "--memory_enabled", "--memory_top_k", "3",
         "--memory_max_context_chars", "240",
+        "--memory_extractor", "yolo11",
+        "--memory_extractor_model_path", "/tmp/yolo11n.pt",
+        "--memory_extractor_device", "cuda:0",
+        "--memory_extractor_confidence", "0.4",
+        "--memory_extract_every_n_steps", "7",
     ])
     cfg = config_from_args(args)
-    assert cfg.memory == MemoryConfig(enabled=True, top_k=3, max_context_chars=240)
+    assert cfg.memory == MemoryConfig(
+        enabled=True, top_k=3, max_context_chars=240, extractor="yolo11",
+        extractor_model_path="/tmp/yolo11n.pt", extractor_device="cuda:0",
+        extractor_confidence=0.4, extract_every_n_steps=7,
+    )
 
 
 def test_runner_closes_each_episode_memory_even_on_error(tmp_path):
@@ -490,6 +499,48 @@ def test_build_velocity_policy_uses_env_ranges_and_bundle_history(tmp_path):
 
     cfg.num_history_frames = 3
     assert build_velocity_policy(cfg, engine, bundle, info).num_history_frames == 3
+
+
+def test_build_velocity_policy_selects_yolo_only_when_memory_enabled(tmp_path, monkeypatch):
+    from lightnav.memory import yolo_scene_extractor
+
+    created = []
+
+    class FakeExtractor:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+    monkeypatch.setattr(yolo_scene_extractor, "YOLOSceneExtractor", FakeExtractor)
+    engine, bundle = _stub_engine()
+    cfg = _cfg(tmp_path, traj_vocab_path=str(_write_vocab(tmp_path / "vocab")), K=4, horizon=10)
+    cfg.memory = MemoryConfig(
+        enabled=False, extractor="yolo11", extractor_model_path="local/yolo11n.pt",
+        extractor_device="cuda:0", extractor_confidence=0.4, extract_every_n_steps=5,
+    )
+    info = {"habitat_time_step": 0.1, "lin_vel_range": [0, 2.5], "ang_vel_range": [-300, 300]}
+    disabled = build_velocity_policy(cfg, engine, bundle, info)
+    assert disabled.memory_manager is None and created == []
+
+    cfg.memory.enabled = True
+    enabled = build_velocity_policy(cfg, engine, bundle, info)
+    assert enabled.memory_manager is not None
+    assert isinstance(enabled.memory_manager.extractor, FakeExtractor)
+    assert created == [{
+        "model_path": "local/yolo11n.pt", "device": "cuda:0",
+        "confidence": 0.4, "every_n_steps": 5,
+    }]
+
+
+def test_build_velocity_policy_rejects_missing_local_yolo_weights(tmp_path):
+    engine, bundle = _stub_engine()
+    cfg = _cfg(tmp_path, traj_vocab_path=str(_write_vocab(tmp_path / "vocab")), K=4, horizon=10)
+    cfg.memory = MemoryConfig(
+        enabled=True, extractor="yolo11",
+        extractor_model_path=str(tmp_path / "missing_yolo11n.pt"),
+    )
+    info = {"habitat_time_step": 0.1, "lin_vel_range": [0, 2.5], "ang_vel_range": [-300, 300]}
+    with pytest.raises(FileNotFoundError, match="local YOLO model file not found"):
+        build_velocity_policy(cfg, engine, bundle, info)
 
 
 # -- action decoder resolution ------------------------------------------------------------------

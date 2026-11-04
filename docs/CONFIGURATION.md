@@ -77,15 +77,19 @@ wins.
 
 ## Server / CLI parameters
 
-`lightnav-eval-habitat` also accepts `--memory_enabled` (default off), exposed as
+`lightnav-eval-habitat` accepts `--memory_enabled` (default off), exposed as
 `HabitatEvalConfig.memory.enabled`. `--memory_top_k` (default 5) and
-`--memory_max_context_chars` (default 600) control retrieval and text size. This enables episode-local explicit memory in the
-Habitat VLN policy. It adds a bounded text memory context to the existing model
-sample after observing the current RGB frame; the original instruction, video
-segments, and trajectory/RVQ output contract remain intact. With the flag off,
-the original inference call is used. The default extractor does not label RGB
-objects; supplying a validated scene extractor is required for visual semantic
-landmarks. See [MEMORY_MVP.md](MEMORY_MVP.md) for the data flow and evidence rules.
+`--memory_max_context_chars` (default 600) bound the retrieved text. The original
+instruction, video segments, and trajectory/RVQ output contract stay intact.
+With memory off, the original inference call is used. The extractor defaults to
+`--memory_extractor null`, which produces no RGB semantic labels. To detect local
+YOLO11n object classes, install the optional `yolo11` extra and pass
+`--memory_extractor yolo11 --memory_extractor_model_path /local/yolo11n.pt`.
+`--memory_extractor_device` defaults to `cpu`, `--memory_extractor_confidence` to
+`0.25`, and `--memory_extract_every_n_steps` to `5` (steps 0, 5, 10, ...).
+`--verbose` prints a `[memory]` JSON line per policy step with extraction,
+event, graph, retrieval, and injected-prompt diagnostics. See
+[MEMORY_MVP.md](MEMORY_MVP.md) for evidence rules and a one-episode command.
 
 `lightnav-serve` flags (environment names are what `scripts/start_servers.sh` and
 `docker/entrypoint.sh` read):

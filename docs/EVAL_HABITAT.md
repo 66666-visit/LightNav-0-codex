@@ -102,10 +102,15 @@ the client stops when the server's episode iterator cycles back to an already se
 | `--num_history_frames N` | from `eval_config.json` | override the history window (normally leave unset) |
 | `--max_new_tokens N` | `64` | per-step decode cap; raised automatically to grounding prefix + action tokens when smaller |
 | `--zmq_timeout_ms N` | `600000` | receive timeout per attempt (Habitat scene loads are slow) |
-| `--verbose` | off | one line per step with the raw model text and the chosen waypoint |
+| `--verbose` | off | per-step model/action line; with memory enabled, an additional `[memory]` JSON diagnostic line |
 | `--memory_enabled` | off | enable episode-local explicit memory and insert retrieved context into the VLN model prompt |
 | `--memory_top_k N` | `5` | maximum retrieved records in one memory context |
 | `--memory_max_context_chars N` | `600` | character cap for memory text added to the prompt |
+| `--memory_extractor {null,yolo11}` | `null` | optional RGB object detector; `yolo11` loads local weights only when memory is enabled |
+| `--memory_extractor_model_path FILE` | empty | existing local YOLO11n `.pt` file; required for enabled `yolo11` |
+| `--memory_extractor_device DEVICE` | `cpu` | Ultralytics inference device, such as `cpu` or `cuda:0` |
+| `--memory_extractor_confidence F` | `0.25` | minimum YOLO detection confidence |
+| `--memory_extract_every_n_steps N` | `5` | detect on steps 0, N, 2N, ... |
 | `--save_video` | off | write `<output_dir>/videos/<episode_id>.mp4` per episode (predicted trajectory, pointing markers, HUD over the agent's frames; one frame per step). Needs `pip install -e ".[video]"` |
 | `--video_fps N` | `10` | playback frame rate of the saved videos |
 | `--hfov_deg F` | `120.0` | agent camera horizontal FOV for the trajectory overlay (the shipped yamls) |
@@ -129,11 +134,18 @@ processing still run. Retrieved text is bounded and inserted into the existing
 VLN sample before inference, so enabling memory can change trajectory-token
 predictions. The switch defaults to off for baseline-equivalent inference.
 
-The repository does not ship an RGB object/scene semantic detector. The default
-extractor records no semantic place or object labels, so a first RGB frame alone
-does not create a place node or memory text. `MockSceneExtractor` is for CPU tests
-or an explicitly provided observation adapter. A real RGB extractor must be
-integrated and validated before claiming semantic landmark recognition on R2R.
+The default extractor records no semantic place or object labels, so a first RGB
+frame alone does not create a place node or memory text. Select `yolo11` with an
+existing local YOLO11n weights file to detect object classes from RGB. Detections
+write object events and unanchored object nodes, then enter the same retriever
+and prompt adapter. YOLO does not identify places, prove containment, or verify
+traversable connections. `MockSceneExtractor` remains for CPU tests.
+With `--verbose`, each policy step prints a `[memory]` JSON line reporting
+whether detection ran, object labels and confidences, event count, graph size,
+retrieval count, and the exact escaped memory text inserted into the prompt.
+Inference failures emit a warning with step, weights path, device, and traceback
+and yield no semantic labels. A missing or unloadable local `.pt` detection
+model fails clearly during policy construction.
 The memory text has a character limit, not a measured multimodal token budget;
 observe actual context limits during a single-episode AutoDL run. Since the
 checkpoint was not trained with memory text, compare that run against the

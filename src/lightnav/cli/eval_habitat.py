@@ -106,6 +106,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--memory_max_context_chars", type=int, default=_DEFAULTS.memory.max_context_chars,
         help="Character cap for the memory text inserted into the VLN prompt.",
     )
+    p.add_argument(
+        "--memory_extractor", choices=["null", "yolo11"], default=_DEFAULTS.memory.extractor,
+        help="RGB semantic extractor (default: null; yolo11 loads a local model).",
+    )
+    p.add_argument(
+        "--memory_extractor_model_path", default=_DEFAULTS.memory.extractor_model_path,
+        help="Local YOLO11n weights file; required when memory and yolo11 are enabled.",
+    )
+    p.add_argument(
+        "--memory_extractor_device", default=_DEFAULTS.memory.extractor_device,
+        help="Ultralytics inference device, e.g. cpu or cuda:0.",
+    )
+    p.add_argument(
+        "--memory_extractor_confidence", type=float,
+        default=_DEFAULTS.memory.extractor_confidence,
+        help="Minimum YOLO object detection confidence.",
+    )
+    p.add_argument(
+        "--memory_extract_every_n_steps", type=int,
+        default=_DEFAULTS.memory.extract_every_n_steps,
+        help="Run detection at step 0 and every N steps thereafter (default: 5).",
+    )
 
     # Visualisation (docs/VISUALIZATION.md); needs `pip install 'lightnav[video]'`.
     viz = p.add_argument_group("visualisation")
@@ -179,6 +201,11 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
             enabled=args.memory_enabled,
             top_k=args.memory_top_k,
             max_context_chars=args.memory_max_context_chars,
+            extractor=args.memory_extractor,
+            extractor_model_path=args.memory_extractor_model_path,
+            extractor_device=args.memory_extractor_device,
+            extractor_confidence=args.memory_extractor_confidence,
+            extract_every_n_steps=args.memory_extract_every_n_steps,
         ),
         save_video=args.save_video,
         video_fps=args.video_fps,

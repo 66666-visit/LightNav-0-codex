@@ -78,7 +78,7 @@ class SceneEdge:
     edge_id: str
     source_id: str
     target_id: str
-    relation: str  # contains | connected_to
+    relation: str  # visible_from | possible_transition | contains | connected_to
     confidence: float
     source: str
     step_id: int
@@ -155,6 +155,25 @@ class ObservationPacket:
 
 
 @dataclass
+class DetectedObject:
+    """One object detection from an RGB frame, without storing the frame."""
+
+    label: str
+    confidence: float
+    bbox_xyxy: tuple[float, float, float, float] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DetectedObject:
+        values = dict(data)
+        if values.get("bbox_xyxy") is not None:
+            values["bbox_xyxy"] = tuple(values["bbox_xyxy"])
+        return cls(**values)
+
+
+@dataclass
 class SceneExtraction:
     """Optional extractor output; no value here is inferred by MemoryManager."""
 
@@ -163,10 +182,15 @@ class SceneExtraction:
     landmarks: list[str] = field(default_factory=list)
     confidence: float = 0.0
     source: str = "none"
+    detections: list[DetectedObject] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SceneExtraction:
-        return cls(**data)
+        values = dict(data)
+        values["detections"] = [
+            DetectedObject.from_dict(item) for item in values.get("detections", [])
+        ]
+        return cls(**values)
