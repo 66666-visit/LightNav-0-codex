@@ -16,16 +16,33 @@ _DEFAULT_MAX_CHARS = 600
 
 
 def build_context_text(context: MemoryContext, *, max_chars: int = _DEFAULT_MAX_CHARS) -> str:
-    """Return prompt-safe text within a character budget.
+    """Return prompt-safe text within the existing character limit.
 
     Escaping angle brackets prevents remembered text from introducing a Qwen
-    ``<video>`` placeholder or impersonating a navigation/action token.
+    ``<video>`` placeholder or impersonating a navigation/action token. If
+    escaping expands a retrieved context beyond the limit, omit trailing
+    records instead of cutting one record midway.
     """
     if max_chars <= 0 or not context.text.strip():
         return ""
     safe = escape(context.text.strip(), quote=False)
     if len(safe) <= max_chars:
         return safe
+    lines = safe.splitlines()
+    if len(lines) > 1:
+        included: list[str] = []
+        used = 0
+        for line in lines:
+            length = len(line) + (1 if included else 0)
+            if used + length > max_chars:
+                break
+            included.append(line)
+            used += length
+        # A retrieved context starts with a heading. It is not useful to
+        # inject that heading without any complete observation below it.
+        if len(included) == 1 and included[0] == "Episode observations (may be uncertain):":
+            return ""
+        return "\n".join(included)
     if max_chars < 2:
         return ""
     return safe[: max_chars - 1].rstrip() + "…"

@@ -239,6 +239,9 @@ class TrajVocabVLNCEPolicy:
                 memory_text = build_context_text(
                     context, max_chars=getattr(self.memory_manager, "max_context_chars", 600),
                 )
+                injected_lines = memory_text.splitlines()
+                if injected_lines and injected_lines[0] == "Episode observations (may be uncertain):":
+                    injected_lines = injected_lines[1:]
                 diagnostic = {
                     "step": self._memory_step - 1,
                     "extractor": type(extractor).__name__,
@@ -253,6 +256,7 @@ class TrajVocabVLNCEPolicy:
                     "graph_nodes": len(self.memory_manager.scene_graph.nodes),
                     "graph_edges": len(self.memory_manager.scene_graph.edges),
                     "retrieved_records": len(context.events) + len(context.nodes) + len(context.edges),
+                    "injected_records": len(injected_lines),
                     "injected_memory_chars": len(memory_text),
                     "injected_memory_text": memory_text,
                 }

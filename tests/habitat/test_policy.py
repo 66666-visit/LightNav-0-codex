@@ -22,7 +22,7 @@ from lightnav.inference.policies import NavigationPolicy
 from lightnav.inference.samples import build_vln_traj_sample
 from lightnav.memory.manager import MemoryManager
 from lightnav.memory.memory_writer import MockSceneExtractor
-from lightnav.memory.schemas import MemoryContext, SceneExtraction
+from lightnav.memory.schemas import DetectedObject, MemoryContext, SceneExtraction
 from lightnav.memory.yolo_scene_extractor import YOLOSceneExtractor
 from lightnav.traj_vocab import RVQBundle
 
@@ -166,16 +166,22 @@ def test_enabled_memory_reaches_original_vln_sample_without_evaluator_info() -> 
 
 def test_disabled_memory_uses_unchanged_generation_entrypoint() -> None:
     engine = StubEngine("<traj_1>")
-    policy = _build_policy(engine)
+    memory = MemoryStub()
+    policy = TrajVocabVLNCEPolicy(
+        engine, _build_centroids(), dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        num_history_frames=4, memory_enabled=False, memory_manager=memory,
+    )
     _reset_and_act(policy)
     assert engine.calls[-1][0] == "gen_frames"
     assert policy.memory_manager is None
+    assert memory.resets == [] and memory.packets == [] and memory.actions == []
 
 
 def test_mock_rgb_memory_pipeline_reaches_model_sample() -> None:
     engine = MemoryStubEngine()
     manager = MemoryManager(extractor=MockSceneExtractor({
-        0: SceneExtraction("hall", ["blue door"], ["blue door"], 0.9, "test"),
+        0: SceneExtraction("hall", ["blue door"], [], 0.9, "test"),
     }))
     policy = TrajVocabVLNCEPolicy(
         engine, _build_centroids(), dt=1.0,
@@ -187,12 +193,115 @@ def test_mock_rgb_memory_pipeline_reaches_model_sample() -> None:
 
     prompt = engine.samples[0]["conversations"][0]["value"]
     assert "<navigation_task>go through the blue door</navigation_task>" in prompt
-    assert "Observed instruction-related blue door" in prompt
+    assert prompt.count("Observed blue door") == 1
+    assert "Observed instruction-related blue door" not in prompt
     assert "source=mock_scene_extractor" in prompt
     assert len(engine.samples[0]["video_segments"]) == 1
     assert manager.scene_graph.query_nodes(kind="object", label="blue door")
     policy.close_episode()
     assert manager.episodic.events == []
+
+
+def test_current_visual_memory_survives_prior_actions_in_real_policy_sample() -> None:
+    instruction = "continue down the hall"
+    engine = MemoryStubEngine()
+    manager = MemoryManager(extractor=MockSceneExtractor({
+        5: SceneExtraction(
+            detections=[
+                DetectedObject("chair", 0.493, (1, 1, 8, 8)),
+                DetectedObject("chair", 0.330, (11, 1, 18, 8)),
+                DetectedObject("couch", 0.298, (21, 1, 28, 8)),
+            ],
+            confidence=0.493,
+            source="scripted_detection",
+        ),
+    }))
+    policy = TrajVocabVLNCEPolicy(
+        engine, _build_centroids(), dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        memory_enabled=True, memory_manager=manager,
+    )
+
+    policy.reset({"instruction": {"text": instruction}})
+    for _ in range(6):
+        policy.act({"rgb": _rgb_frame()})
+
+    actual = engine.samples[-1]
+    original = build_vln_traj_sample(
+        policy.agent._get_video_tensor(), policy.agent.instruction,
+        list(policy.agent._history_frame_ids), engine.bundle,
+    )
+    prompt = actual["conversations"][0]["value"]
+    base = original["conversations"][0]["value"]
+    task_end = f"<navigation_task>{instruction}</navigation_task>. "
+    assert len(engine.samples) == 6
+    assert task_end in prompt
+    assert prompt.startswith(base.split(task_end, 1)[0] + task_end)
+    assert prompt.endswith(base.split(task_end, 1)[1])
+    assert prompt.count("<video>") == base.count("<video>")
+    assert actual["conversations"][1] == original["conversations"][1]
+    assert actual["video_fps"] == original["video_fps"]
+    assert len(actual["video_segments"]) == len(original["video_segments"])
+    for actual_segment, original_segment in zip(
+        actual["video_segments"], original["video_segments"]
+    ):
+        assert actual_segment["frame_indices"] == original_segment["frame_indices"]
+        assert torch.equal(actual_segment["video"], original_segment["video"])
+    assert prompt.count("Observed chair") == 2
+    assert prompt.count("Observed couch") == 1
+    assert "confidence=0.49" in prompt
+    assert "confidence=0.33" in prompt
+    assert "confidence=0.30" in prompt
+    assert "Issued velocity_control before this view" in prompt
+    assert manager.scene_graph.edges == []
+    policy.close_episode()
+
+
+def test_memory_injection_preserves_rvq_slowfast_prompt_format() -> None:
+    instruction = "find the couch"
+    engine = MemoryStubEngine()
+    engine.bundle.action_method = "rvq"
+    engine.bundle.slowfast_tiers = [
+        {
+            "name": "current", "age_lo": 0, "age_hi": 1, "mode": "dense",
+            "pool_spatial": 1, "pool_mode": "avg",
+        },
+    ]
+    engine._text = "<act_l0_1><act_l1_0>"
+    manager = MemoryManager(extractor=MockSceneExtractor({
+        0: SceneExtraction(detections=[DetectedObject("couch", 0.9)], confidence=0.9),
+    }))
+    policy = TrajVocabVLNCEPolicy(
+        engine, None, dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        rvq_bundle=_build_rvq_bundle(), memory_enabled=True, memory_manager=manager,
+    )
+
+    policy.reset({"instruction": {"text": instruction}})
+    policy.act({"rgb": _rgb_frame()})
+    actual = engine.samples[-1]
+    original = build_vln_traj_sample(
+        policy.agent._get_video_tensor(), policy.agent.instruction,
+        list(policy.agent._history_frame_ids), engine.bundle,
+    )
+    prompt = actual["conversations"][0]["value"]
+    base = original["conversations"][0]["value"]
+    assert f"<navigation_task>{instruction}</navigation_task>" in prompt
+    assert "Observed couch" in prompt
+    assert prompt.count("<video>") == base.count("<video>")
+    assert actual["conversations"][1] == original["conversations"][1]
+    assert len(actual["video_segments"]) == len(original["video_segments"])
+    for actual_segment, original_segment in zip(
+        actual["video_segments"], original["video_segments"]
+    ):
+        assert actual_segment["frame_indices"] == original_segment["frame_indices"]
+        assert torch.equal(actual_segment["video"], original_segment["video"])
+    assert actual["slowfast_abs_frame_indices"] is True
+    assert actual["_allow_vit_cache"] is True
+    assert actual["_skip_normalize"] is True
+    assert "Predict your future trajectory as a sequence of coarse-to-fine trajectory tokens." in prompt
+    assert "Predict your future trajectory as a trajectory id token." not in prompt
+    policy.close_episode()
 
 
 def test_null_memory_keeps_first_prompt_identical_to_original_sample() -> None:
@@ -263,6 +372,7 @@ def test_local_yolo_memory_reaches_prompt_and_verbose_diagnostics(tmp_path, caps
     assert diagnostic["events_written"] >= 1
     assert diagnostic["graph_nodes"] == 1 and diagnostic["graph_edges"] == 0
     assert diagnostic["retrieved_records"] >= 1
+    assert diagnostic["injected_records"] == len(diagnostic["injected_memory_text"].splitlines()) - 1
     assert diagnostic["injected_memory_chars"] == len(diagnostic["injected_memory_text"])
     assert diagnostic["injected_memory_text"] in first_prompt
 

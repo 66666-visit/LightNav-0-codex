@@ -7,7 +7,7 @@ using instruction words, the current place hypothesis, age and record quality.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from lightnav.memory.schemas import MemoryContext, MemoryEvent, MemoryQuery, SceneEdge, SceneNode
 
@@ -21,6 +21,12 @@ _STOP_WORDS = frozenset(
 )
 _HEADER = "Episode observations (may be uncertain):\n"
 _MAX_LINE_CHARS = 200
+_VISUAL_EVENT_KINDS = frozenset({"object_observation", "landmark", "instruction_match"})
+_MOTION_EVENT_KINDS = frozenset({"action", "turn"})
+# A detected object is useful even when its class is absent from the instruction.
+# Instruction matching, confidence and age still determine the order among visuals.
+_CURRENT_VISUAL_BONUS = 0.8
+_HISTORICAL_VISUAL_BONUS = 0.35
 _RELATION_STATUS = {
     "possible_transition": "unverified_hypothesis",
     "visible_from": "visual_observation",
@@ -64,6 +70,42 @@ class _Candidate:
     kind: str
     item: MemoryEvent | SceneNode | SceneEdge
     line: str
+    category: str = "context"
+    observation_key: tuple[str, int] | None = None
+
+
+def _display_priority(candidate: _Candidate) -> int:
+    """Prefer the original observation over its derived match and graph view."""
+    if isinstance(candidate.item, MemoryEvent):
+        if candidate.item.kind in {"object_observation", "landmark"}:
+            return 0
+        if candidate.item.kind == "instruction_match":
+            return 1
+    return 2
+
+
+def _deduplicate_observations(candidates: list[_Candidate]) -> list[_Candidate]:
+    """Collapse representations of one detection, not similarly named objects.
+
+    The step stays in the key because an explicitly tracked node can be observed
+    again later; those are separate observations even when its node id is stable.
+    """
+    unique: list[_Candidate] = []
+    grouped: dict[tuple[str, int], list[_Candidate]] = {}
+    for candidate in candidates:
+        if candidate.observation_key is None:
+            unique.append(candidate)
+        else:
+            grouped.setdefault(candidate.observation_key, []).append(candidate)
+    for representations in grouped.values():
+        canonical = min(
+            representations,
+            key=lambda item: (_display_priority(item), -item.score, item.key),
+        )
+        # An instruction_match adds relevance, but does not consume a second
+        # prompt slot or replace the source observation's provenance.
+        unique.append(replace(canonical, score=max(item.score for item in representations)))
+    return unique
 
 
 class MemoryRetriever:
@@ -101,6 +143,17 @@ class MemoryRetriever:
                 continue
             description = _clean(event.description)
             place = bool(query.place_id and event.place_id == query.place_id)
+            visual = event.kind in _VISUAL_EVENT_KINDS
+            rank = score(description, event.step_id, event.confidence, event.importance, place)
+            if visual:
+                rank += (
+                    _CURRENT_VISUAL_BONUS if event.step_id == query.current_step
+                    else _HISTORICAL_VISUAL_BONUS
+                )
+            node_id = event.metadata.get("node_id") if visual else None
+            observation_key = (
+                (node_id, event.step_id) if isinstance(node_id, str) and node_id else None
+            )
             line = (
                 f"[event:{_clean(event.kind)} step={event.step_id} "
                 f"confidence={event.confidence:.2f} source={_clean(event.source)}] "
@@ -108,12 +161,14 @@ class MemoryRetriever:
             )
             candidates.append(
                 _Candidate(
-                    score(description, event.step_id, event.confidence, event.importance, place),
+                    rank,
                     event.step_id,
                     event.event_id,
                     "event",
                     event,
                     line,
+                    "motion" if event.kind in _MOTION_EVENT_KINDS else "context",
+                    observation_key,
                 )
             )
 
@@ -127,6 +182,13 @@ class MemoryRetriever:
                 label = f"{node.node_id} ({label})"
             else:
                 status = _clean(node.status)
+            visual = node.kind == "object"
+            rank = score(label, node.last_step, node.confidence, 0.5, place)
+            if visual:
+                rank += (
+                    _CURRENT_VISUAL_BONUS if node.last_step == query.current_step
+                    else _HISTORICAL_VISUAL_BONUS
+                )
             line = (
                 f"[{_clean(node.kind)} step={node.last_step} "
                 f"confidence={node.confidence:.2f} source={_clean(node.source)}] "
@@ -134,12 +196,13 @@ class MemoryRetriever:
             )
             candidates.append(
                 _Candidate(
-                    score(label, node.last_step, node.confidence, 0.5, place),
+                    rank,
                     node.last_step,
                     node.node_id,
                     "node",
                     node,
                     line,
+                    observation_key=(node.node_id, node.last_step) if visual else None,
                 )
             )
 
@@ -187,13 +250,26 @@ class MemoryRetriever:
                 )
             )
 
-        candidates.sort(key=lambda item: (-item.score, -item.step, item.kind, item.key))
+        # All issued commands are still in episodic memory, but only the latest
+        # one can enter a prompt. A turn uses the same single motion slot.
+        candidates = _deduplicate_observations(candidates)
+        motion = [item for item in candidates if item.category == "motion"]
+        recent_motion = max(motion, key=lambda item: (item.step, item.score, item.key)) if motion else None
+        ranked = sorted(
+            (item for item in candidates if item.category != "motion"),
+            key=lambda item: (-item.score, -item.step, item.kind, item.key),
+        )
+        if recent_motion is not None:
+            # Keep one recent command when there is room, after up to top_k-1
+            # observation/context facts. With top_k=1, facts take precedence.
+            insert_at = min(max(query.top_k - 1, 1), len(ranked))
+            ranked.insert(insert_at, recent_motion)
         selected_events: list[MemoryEvent] = []
         selected_nodes: list[SceneNode] = []
         selected_edges: list[SceneEdge] = []
         lines: list[str] = []
         used = len(_HEADER)
-        for candidate in candidates:
+        for candidate in ranked:
             if len(lines) >= query.top_k:
                 break
             line = candidate.line
@@ -202,15 +278,9 @@ class MemoryRetriever:
             remaining = query.max_chars - used - (1 if lines else 0)
             if remaining <= 0:
                 break
-            truncated_for_budget = False
             if len(line) > remaining:
-                # Truncation preserves the confidence/source prefix when the
-                # budget allows it; never include a partial marker alone.
-                marker_end = line.find("]")
-                if marker_end < 0 or marker_end + 3 > remaining:
-                    break
-                line = line[: remaining - 1].rstrip() + "…"
-                truncated_for_budget = True
+                # Keep the ranking order and never inject a partial record.
+                break
             lines.append(line)
             used += len(line) + (1 if len(lines) > 1 else 0)
             if candidate.kind == "event":
@@ -219,8 +289,6 @@ class MemoryRetriever:
                 selected_nodes.append(candidate.item)
             else:
                 selected_edges.append(candidate.item)
-            if truncated_for_budget:
-                break
 
         return MemoryContext(
             events=selected_events,

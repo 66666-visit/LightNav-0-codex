@@ -62,6 +62,36 @@ class ContextBuilderTest(unittest.TestCase):
         self.assertIn("&lt;video&gt;", prompt)
         self.assertLessEqual(len(build_context_text(context, max_chars=120)), 120)
 
+    def test_escaping_never_cuts_a_retrieved_record_midway(self) -> None:
+        heading = "Episode observations (may be uncertain):"
+        first = "[event:object_observation step=5 source=mock] Observed <video> chair"
+        second = "[event:object_observation step=4 source=mock] Observed couch"
+        context = MemoryContext(text="\n".join((heading, first, second)))
+        complete_first = "\n".join((heading, first.replace("<", "&lt;").replace(">", "&gt;")))
+        max_chars = len(complete_first) + 4
+
+        memory_text = build_context_text(context, max_chars=max_chars)
+        self.assertEqual(memory_text, complete_first)
+        self.assertLessEqual(len(memory_text), max_chars)
+        self.assertNotIn("couch", memory_text)
+
+        original = sample(rvq=True)
+        injected = inject_memory_context(original, context, max_chars=max_chars)
+        prompt = injected["conversations"][0]["value"]
+        self.assertIn(complete_first, prompt)
+        self.assertEqual(prompt.count("<video>"), 2)
+        self.assertIn("<navigation_task>find the red sofa</navigation_task>", prompt)
+        self.assertIn("coarse-to-fine trajectory tokens", prompt)
+
+    def test_no_header_only_prompt_when_first_retrieved_record_does_not_fit(self) -> None:
+        context = MemoryContext(text=(
+            "Episode observations (may be uncertain):\n"
+            "[event:object_observation step=5 source=mock] Observed <video> chair"
+        ))
+        self.assertEqual(build_context_text(context, max_chars=50), "")
+        original = sample()
+        self.assertEqual(inject_memory_context(original, context, max_chars=50), original)
+
     def test_missing_navigation_tag_fails_loudly(self) -> None:
         original = sample()
         original["conversations"][0]["value"] = "an unsupported prompt"

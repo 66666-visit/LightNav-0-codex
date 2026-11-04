@@ -16,7 +16,7 @@ Habitat RGB + instruction + previous policy command/prediction
     -> ObservationPacket (RGB is transient)
     -> MemoryWriter / NullSceneExtractor or local YOLOSceneExtractor
     -> WorkingMemoryStore + EpisodicMemory + SceneGraph
-    -> MemoryRetriever (instruction, place, recency, quality; top_k/char cap)
+    -> MemoryRetriever (visual priority, instruction, place, recency, quality; top_k/char cap)
     -> MemoryContext
     -> inject_memory_context(original VLN sample)
     -> VLNInferenceEngine.generate -> trajectory/RVQ decoding -> Habitat action
@@ -27,6 +27,11 @@ SlowFast video segments and output sentence. The adapter adds escaped, bounded
 plain text after the original `</navigation_task>` tag when retrieval has a
 record. An empty context adds nothing. It does not modify the original
 instruction, `<video>` placeholders, special action tokens, or RVQ decoder.
+Retrieval shows one representation per detected object and step, while keeping
+the original events and graph nodes. Current visual observations receive a
+ranking bonus; historical observations remain eligible through instruction
+relevance, confidence, importance, and recency. At most one recent action or
+turn is shown alongside retrieved observations.
 The limit is 600 characters by default; it is not a tokenizer or multimodal
 context-length guarantee. Real context-length behavior remains to be checked
 during AutoDL inference. With the switch off, `policy.act` uses its original
@@ -100,7 +105,7 @@ MODEL_PATH=/path/to/LightNav-0 GPU_IDS=0 EPISODES=1 MAX_STEPS=40 \
 The printed output directory contains the client log under `logs/` and episode
 metrics under `shard_0/results.jsonl`. Each `[memory]` JSON line reports `step`,
 `extraction_attempted`, detected `objects` and confidence, `events_written`,
-`graph_nodes`, `graph_edges`, `retrieved_records`, and the actual
+`graph_nodes`, `graph_edges`, `retrieved_records`, `injected_records`, and the actual
 `injected_memory_text` with `injected_memory_chars`. No raw RGB is written by
 MemoryManager. The local weights must really be YOLO11n; the adapter cannot
 verify a renamed weight file's architecture. This command has not been run with
