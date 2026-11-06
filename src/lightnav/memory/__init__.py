@@ -11,27 +11,35 @@ from typing import Any
 
 _EXPORTS = {
     "DetectedObject": "lightnav.memory.schemas",
+    "LayerMemoryItem": "lightnav.memory.schemas",
+    "MemoryFusion": "lightnav.memory.memory_fusion",
     "MemoryManager": "lightnav.memory.manager",
     "MemoryContext": "lightnav.memory.schemas",
     "MemoryEvent": "lightnav.memory.schemas",
     "MemoryQuery": "lightnav.memory.schemas",
     "ObservationPacket": "lightnav.memory.schemas",
+    "ObservationEvidence": "lightnav.memory.schemas",
     "SceneEdge": "lightnav.memory.schemas",
     "SceneExtraction": "lightnav.memory.schemas",
     "SceneNode": "lightnav.memory.schemas",
+    "SemanticIndex": "lightnav.memory.semantic_index",
     "WorkingMemory": "lightnav.memory.schemas",
 }
 
 __all__ = [
     "DetectedObject",
+    "LayerMemoryItem",
     "MemoryContext",
     "MemoryEvent",
+    "MemoryFusion",
     "MemoryManager",
     "MemoryQuery",
     "ObservationPacket",
+    "ObservationEvidence",
     "SceneEdge",
     "SceneExtraction",
     "SceneNode",
+    "SemanticIndex",
     "WorkingMemory",
 ]
 

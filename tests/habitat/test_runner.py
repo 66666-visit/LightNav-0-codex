@@ -216,6 +216,26 @@ def test_memory_config_defaults_off_and_cli_maps_nested_settings():
     )
 
 
+def test_hierarchical_memory_cli_supports_all_layer_ablations():
+    from lightnav.cli.eval_habitat import build_parser, config_from_args
+
+    parser = build_parser()
+    for names in (
+        "short", "mid", "long", "short,mid", "short,long", "mid,long", "short,mid,long",
+    ):
+        args = parser.parse_args([
+            "--model_path", "model", "--memory_enabled", "--memory_strategy", "hierarchical",
+            "--memory_layers", names,
+        ])
+        cfg = config_from_args(args)
+        assert cfg.memory.strategy == "hierarchical"
+        assert cfg.memory.layers == tuple(names.split(","))
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--model_path", "model", "--memory_layers", "chair"])
+    with pytest.raises(ValueError, match="unique subset"):
+        MemoryConfig(strategy="hierarchical", layers=("short", "short"))
+
+
 def test_runner_closes_each_episode_memory_even_on_error(tmp_path):
     class ClosingPolicy(FakePolicy):
         def __init__(self, *, fail: bool = False):
@@ -514,7 +534,8 @@ def test_build_velocity_policy_selects_yolo_only_when_memory_enabled(tmp_path, m
     engine, bundle = _stub_engine()
     cfg = _cfg(tmp_path, traj_vocab_path=str(_write_vocab(tmp_path / "vocab")), K=4, horizon=10)
     cfg.memory = MemoryConfig(
-        enabled=False, extractor="yolo11", extractor_model_path="local/yolo11n.pt",
+        enabled=False, strategy="hierarchical", layers=("mid", "long"),
+        extractor="yolo11", extractor_model_path="local/yolo11n.pt",
         extractor_device="cuda:0", extractor_confidence=0.4, extract_every_n_steps=5,
     )
     info = {"habitat_time_step": 0.1, "lin_vel_range": [0, 2.5], "ang_vel_range": [-300, 300]}
@@ -524,6 +545,8 @@ def test_build_velocity_policy_selects_yolo_only_when_memory_enabled(tmp_path, m
     cfg.memory.enabled = True
     enabled = build_velocity_policy(cfg, engine, bundle, info)
     assert enabled.memory_manager is not None
+    assert enabled.memory_manager.strategy == "hierarchical"
+    assert enabled.memory_manager.layers == ("mid", "long")
     assert isinstance(enabled.memory_manager.extractor, FakeExtractor)
     assert created == [{
         "model_path": "local/yolo11n.pt", "device": "cuda:0",

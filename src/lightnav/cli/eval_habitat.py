@@ -20,6 +20,18 @@ from lightnav.habitat.runner import HabitatEvalConfig, MemoryConfig, run_habitat
 _DEFAULTS = HabitatEvalConfig(model_path="")
 
 
+def _memory_layers(value: str) -> tuple[str, ...]:
+    """Parse a subset of the three independently enabled hierarchy layers."""
+    if value.strip().casefold() == "none":
+        return ()
+    layers = tuple(part.strip().casefold() for part in value.split(","))
+    if not layers or len(set(layers)) != len(layers) or any(
+        layer not in {"short", "mid", "long"} for layer in layers
+    ):
+        raise argparse.ArgumentTypeError("memory layers must be short,mid,long or a subset")
+    return layers
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="lightnav-eval-habitat",
@@ -105,6 +117,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--memory_max_context_chars", type=int, default=_DEFAULTS.memory.max_context_chars,
         help="Character cap for the memory text inserted into the VLN prompt.",
+    )
+    p.add_argument(
+        "--memory_strategy", choices=["flat", "hierarchical"],
+        default=_DEFAULTS.memory.strategy,
+        help="Memory retrieval strategy (default: flat for Retriever V2 reproducibility).",
+    )
+    p.add_argument(
+        "--memory_layers", type=_memory_layers,
+        default=_DEFAULTS.memory.layers,
+        help="Comma-separated hierarchical layers, e.g. short,mid,long or short,long; "
+        "use none to disable all (default: short,mid,long).",
     )
     p.add_argument(
         "--memory_extractor", choices=["null", "yolo11"], default=_DEFAULTS.memory.extractor,
@@ -201,6 +224,8 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
             enabled=args.memory_enabled,
             top_k=args.memory_top_k,
             max_context_chars=args.memory_max_context_chars,
+            strategy=args.memory_strategy,
+            layers=args.memory_layers,
             extractor=args.memory_extractor,
             extractor_model_path=args.memory_extractor_model_path,
             extractor_device=args.memory_extractor_device,

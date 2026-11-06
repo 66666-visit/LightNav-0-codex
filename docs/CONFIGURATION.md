@@ -87,8 +87,15 @@ YOLO11n object classes, install the optional `yolo11` extra and pass
 `--memory_extractor yolo11 --memory_extractor_model_path /local/yolo11n.pt`.
 `--memory_extractor_device` defaults to `cpu`, `--memory_extractor_confidence` to
 `0.25`, and `--memory_extract_every_n_steps` to `5` (steps 0, 5, 10, ...).
+`--memory_strategy` defaults to `flat`, preserving the existing Retriever V2
+path. Set `--memory_strategy hierarchical` to query the independent short,
+mid, and long semantic stores before fusion. `--memory_layers` defaults to
+`short,mid,long`; any nonempty subset is valid (`short`, `mid`, `long`,
+`short,mid`, `short,long`, `mid,long`, or `short,mid,long`). `none` returns an
+empty hierarchical context. These layer flags have no effect while memory is
+off or the strategy is `flat`.
 `--verbose` prints a `[memory]` JSON line per policy step with extraction,
-event, graph, retrieval, and injected-prompt diagnostics. See
+event, graph, retrieval, per-layer, and injected-prompt diagnostics. See
 [MEMORY_MVP.md](MEMORY_MVP.md) for evidence rules and a one-episode command.
 
 `lightnav-serve` flags (environment names are what `scripts/start_servers.sh` and

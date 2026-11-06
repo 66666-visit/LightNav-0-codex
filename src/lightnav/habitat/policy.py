@@ -255,11 +255,20 @@ class TrajVocabVLNCEPolicy:
                     "events_written": len(events),
                     "graph_nodes": len(self.memory_manager.scene_graph.nodes),
                     "graph_edges": len(self.memory_manager.scene_graph.edges),
-                    "retrieved_records": len(context.events) + len(context.nodes) + len(context.edges),
+                    "retrieved_records": (
+                        len(context.events) + len(context.nodes) + len(context.edges)
+                        + len(context.layer_items)
+                    ),
                     "injected_records": len(injected_lines),
                     "injected_memory_chars": len(memory_text),
                     "injected_memory_text": memory_text,
                 }
+                if getattr(self.memory_manager, "strategy", "flat") == "hierarchical":
+                    diagnostic["memory_strategy"] = "hierarchical"
+                    diagnostic["layer_contexts"] = {
+                        layer: [item.to_dict() for item in items]
+                        for layer, items in self.memory_manager.last_layer_results.items()
+                    }
                 print("[memory] " + json.dumps(diagnostic, ensure_ascii=False), flush=True)
             text, _ = self.engine.generate(sample)
         else:

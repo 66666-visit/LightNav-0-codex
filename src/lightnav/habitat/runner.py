@@ -49,6 +49,8 @@ class MemoryConfig:
     enabled: bool = False
     top_k: int = 5
     max_context_chars: int = 600
+    strategy: str = "flat"
+    layers: tuple[str, ...] = ("short", "mid", "long")
     extractor: str = "null"
     extractor_model_path: str = ""
     extractor_device: str = "cpu"
@@ -58,6 +60,12 @@ class MemoryConfig:
     def __post_init__(self) -> None:
         if self.top_k < 1 or self.max_context_chars < 1:
             raise ValueError("memory.top_k and memory.max_context_chars must be positive")
+        if self.strategy not in {"flat", "hierarchical"}:
+            raise ValueError("memory.strategy must be 'flat' or 'hierarchical'")
+        if len(set(self.layers)) != len(self.layers) or any(
+            layer not in {"short", "mid", "long"} for layer in self.layers
+        ):
+            raise ValueError("memory.layers must be a unique subset of short, mid, long")
         if self.extractor not in {"null", "yolo11"}:
             raise ValueError("memory.extractor must be 'null' or 'yolo11'")
         if self.enabled and self.extractor == "yolo11" and not self.extractor_model_path:
@@ -318,6 +326,8 @@ def build_velocity_policy(
             extractor=extractor,
             top_k=cfg.memory.top_k,
             max_context_chars=cfg.memory.max_context_chars,
+            strategy=cfg.memory.strategy,
+            layers=cfg.memory.layers,
         )
     return TrajVocabVLNCEPolicy(
         engine,

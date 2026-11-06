@@ -257,7 +257,8 @@ def test_current_visual_memory_survives_prior_actions_in_real_policy_sample() ->
     policy.close_episode()
 
 
-def test_memory_injection_preserves_rvq_slowfast_prompt_format() -> None:
+@pytest.mark.parametrize("strategy", ["flat", "hierarchical"])
+def test_memory_strategies_preserve_rvq_slowfast_prompt_format(capsys, strategy: str) -> None:
     instruction = "find the couch"
     engine = MemoryStubEngine()
     engine.bundle.action_method = "rvq"
@@ -270,11 +271,12 @@ def test_memory_injection_preserves_rvq_slowfast_prompt_format() -> None:
     engine._text = "<act_l0_1><act_l1_0>"
     manager = MemoryManager(extractor=MockSceneExtractor({
         0: SceneExtraction(detections=[DetectedObject("couch", 0.9)], confidence=0.9),
-    }))
+    }), strategy=strategy)
     policy = TrajVocabVLNCEPolicy(
         engine, None, dt=1.0,
         lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
         rvq_bundle=_build_rvq_bundle(), memory_enabled=True, memory_manager=manager,
+        memory_verbose=True,
     )
 
     policy.reset({"instruction": {"text": instruction}})
@@ -287,7 +289,11 @@ def test_memory_injection_preserves_rvq_slowfast_prompt_format() -> None:
     prompt = actual["conversations"][0]["value"]
     base = original["conversations"][0]["value"]
     assert f"<navigation_task>{instruction}</navigation_task>" in prompt
-    assert "Observed couch" in prompt
+    if strategy == "hierarchical":
+        assert "Current RGB view detected couch" in prompt
+        assert "[short:current_observation" in prompt
+    else:
+        assert "Observed couch" in prompt
     assert prompt.count("<video>") == base.count("<video>")
     assert actual["conversations"][1] == original["conversations"][1]
     assert len(actual["video_segments"]) == len(original["video_segments"])
@@ -301,12 +307,25 @@ def test_memory_injection_preserves_rvq_slowfast_prompt_format() -> None:
     assert actual["_skip_normalize"] is True
     assert "Predict your future trajectory as a sequence of coarse-to-fine trajectory tokens." in prompt
     assert "Predict your future trajectory as a trajectory id token." not in prompt
+    diagnostic = json.loads(next(
+        line.removeprefix("[memory] ") for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[memory] ")
+    ))
+    if strategy == "hierarchical":
+        assert diagnostic["memory_strategy"] == "hierarchical"
+        assert diagnostic["layer_contexts"]["short"]
+        assert diagnostic["layer_contexts"]["mid"]
+        assert diagnostic["layer_contexts"]["long"]
+    else:
+        assert "layer_contexts" not in diagnostic
+    assert diagnostic["injected_memory_text"] in prompt
     policy.close_episode()
 
 
-def test_null_memory_keeps_first_prompt_identical_to_original_sample() -> None:
+@pytest.mark.parametrize("strategy", ["flat", "hierarchical"])
+def test_null_memory_keeps_first_prompt_identical_to_original_sample(strategy: str) -> None:
     engine = MemoryStubEngine()
-    manager = MemoryManager()
+    manager = MemoryManager(strategy=strategy)
     policy = TrajVocabVLNCEPolicy(
         engine, _build_centroids(), dt=1.0,
         lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),

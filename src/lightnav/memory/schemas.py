@@ -109,11 +109,58 @@ class MemoryQuery:
 
 
 @dataclass
+class ObservationEvidence:
+    """Reference to one recorded observation, not a persistent object identity."""
+
+    event_id: str
+    step_id: int
+    label: str
+    confidence: float
+    source: str
+    node_id: str | None = None
+    evidence: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ObservationEvidence:
+        return cls(**data)
+
+
+@dataclass
+class LayerMemoryItem:
+    """One layer's retrievable statement with its original evidence references."""
+
+    layer: str
+    kind: str
+    description: str
+    step_id: int
+    confidence: float
+    source: str
+    evidence_refs: list[ObservationEvidence] = field(default_factory=list)
+    importance: float = 0.5
+    label: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LayerMemoryItem:
+        values = dict(data)
+        values["evidence_refs"] = [
+            ObservationEvidence.from_dict(item) for item in values.get("evidence_refs", [])
+        ]
+        return cls(**values)
+
+
+@dataclass
 class MemoryContext:
     events: list[MemoryEvent] = field(default_factory=list)
     nodes: list[SceneNode] = field(default_factory=list)
     edges: list[SceneEdge] = field(default_factory=list)
     text: str = ""
+    layer_items: list[LayerMemoryItem] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -121,6 +168,7 @@ class MemoryContext:
             "nodes": [node.to_dict() for node in self.nodes],
             "edges": [edge.to_dict() for edge in self.edges],
             "text": self.text,
+            "layer_items": [item.to_dict() for item in self.layer_items],
         }
 
     @classmethod
@@ -130,6 +178,7 @@ class MemoryContext:
             nodes=[SceneNode.from_dict(item) for item in data.get("nodes", [])],
             edges=[SceneEdge.from_dict(item) for item in data.get("edges", [])],
             text=data.get("text", ""),
+            layer_items=[LayerMemoryItem.from_dict(item) for item in data.get("layer_items", [])],
         )
 
 

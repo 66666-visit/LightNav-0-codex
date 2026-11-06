@@ -1,4 +1,4 @@
-# Episode-local MemoryManager MVP
+# Episode-local MemoryManager MVP and Hierarchical V2
 
 ## Scope and call chain
 
@@ -61,6 +61,48 @@ reuse needs a stable instance key. Retrieved relation text labels transition
 hypotheses separately from verified traversal and visual observations.
 `close_episode` clears all records and pending commands; a fresh episode starts
 with empty stores.
+
+## Hierarchical Memory V2
+
+`--memory_strategy flat` is the default and keeps the existing Retriever V2
+path. `--memory_strategy hierarchical` runs one `MemoryWriter.observe` per RGB
+frame, then indexes that writer's events in three distinct episode-local stores:
+
+- **L1 short:** `WorkingMemoryStore` keeps a bounded deque of step-specific
+  detections, their event/node evidence references, recent executed commands,
+  and an uncertain place hypothesis when one is supported. A carried sighting
+  says when it was last detected; it never claims a detection in the live frame.
+- **L2 mid:** `EpisodicMemory` retains every original event and separately
+  indexes key events and time segments. Its own retrieval ranks visual and
+  navigation events, without letting repeated ordinary actions fill the result.
+- **L3 long:** `SemanticIndex` groups independent sightings by **category**,
+  recording their first/latest steps, count, confidence statistics, instruction
+  relevance, and links back to the original events and graph nodes. A shared
+  label is not a physical instance identity. Only existing evidenced graph
+  relations can be retrieved; indexing creates no spatial edge.
+
+`MemoryManager.retrieve_layers()` queries each enabled store independently.
+`MemoryFusion` then presents current observations, historical events, and
+category summaries with layer/step/confidence/source/evidence labels. It uses
+the original observation IDs and node IDs to avoid repeating one detection
+across layers, while preserving observations from different steps. The same
+`inject_memory_context` boundary inserts the fused text after the original
+navigation instruction. The 600-character text setting is unchanged; no visual
+history sampling, token accounting, or action decoding changes are made.
+
+Use `--memory_layers short,mid,long` (default) or any nonempty subset for the
+seven layer ablations. For example, `--memory_layers mid,long` runs without L1.
+The following CPU Mock command prints independent layer records and fused
+results at steps 5 and 20 without loading a model, simulator, or RGB files:
+
+```bash
+PYTHONPATH=src python3 scripts/demo_hierarchical_memory.py --layers short,mid,long
+```
+
+For one AutoDL R2R episode using the existing local YOLO weights, add
+`--memory_strategy hierarchical --memory_layers short,mid,long` to the
+`CLIENT_ARGS` in the YOLO command below. `--verbose` includes `layer_contexts`
+and the final `injected_memory_text` in each `[memory]` JSON line.
 
 `NullSceneExtractor` remains the default and supplies no semantic labels.
 The first RGB frame alone creates no place or object node and may yield an empty
