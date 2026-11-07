@@ -9,7 +9,6 @@ from lightnav.memory.episodic_memory import EpisodicMemory
 from lightnav.memory.memory_context_builder import inject_memory_context
 from lightnav.memory.memory_fusion import MemoryFusion
 from lightnav.memory.scene_graph import SceneGraph
-from lightnav.memory.semantic_index import SemanticIndex
 from lightnav.memory.schemas import (
     LayerMemoryItem,
     MemoryContext,
@@ -17,6 +16,8 @@ from lightnav.memory.schemas import (
     MemoryQuery,
     ObservationEvidence,
 )
+from lightnav.memory.semantic_index import SemanticIndex
+from lightnav.memory.topological_memory import TopologicalMemory
 from lightnav.memory.working_memory import WorkingMemoryStore
 from lightnav.prompts import UNIFIED_TRAJ_PROMPT_TEMPLATE, to_rvq_prompt
 
@@ -89,6 +90,65 @@ class MemoryFusionTest(unittest.TestCase):
         context = self.fusion.build(self.query, [], [], [summary])
         self.assertIn("observation steps=5,10", context.text)
         self.assertEqual(len(context.layer_items[0].evidence_refs), 2)
+
+    def test_place_semantics_keeps_only_uncovered_historical_detection(self) -> None:
+        old = _ref("old", 5, "couch", "object_old")
+        current = _ref("current", 20, "couch", "object_current")
+        summary = LayerMemoryItem(
+            "long", "place_semantics", "couch near visual place", 20, 0.8,
+            "mock_rgb", [old, current], label="couch",
+            metadata={"place_id": "place_000", "current": True},
+        )
+        fused = self.fusion.build(
+            self.query, [_item("short", "current_observation", current)], [], [summary],
+        )
+        self.assertEqual([item.kind for item in fused.layer_items], [
+            "current_observation", "place_semantics",
+        ])
+        self.assertEqual(fused.layer_items[1].evidence_refs, [old])
+        self.assertIn("Historical RGB detections at visual place place_000", fused.text)
+        self.assertEqual(
+            MemoryContext.from_dict(json.loads(json.dumps(fused.to_dict()))), fused,
+        )
+
+    def test_place_semantics_labels_mixed_current_and_historical_sightings(self) -> None:
+        old = _ref("old", 5, "couch", "object_old")
+        current = _ref("current", 20, "couch", "object_current")
+        summary = LayerMemoryItem(
+            "long", "place_semantics", "couch near visual place", 20, 0.8,
+            "mock_rgb", [old, current], label="couch",
+            metadata={"place_id": "place_000", "current": True},
+        )
+        fused = self.fusion.build(self.query, [], [], [summary])
+        self.assertIn("Current and historical RGB detections", fused.text)
+        self.assertEqual(len(fused.layer_items[0].evidence_refs), 2)
+
+    def test_current_place_and_observed_edge_fit_unchanged_character_cap(self) -> None:
+        topology = TopologicalMemory()
+        topology.observe(
+            0, (1.0, 0.0), [], descriptor_source="mock_dino",
+            observation_event_id="place_observation_0",
+        )
+        chair = MemoryEvent(
+            "chair_5", 5, "object_observation", "Observed chair", 0.8,
+            "mock_rgb", metadata={"node_id": "object_5"},
+        )
+        topology.observe(
+            5, (0.0, 1.0), [chair], descriptor_source="mock_dino",
+            observation_event_id="place_observation_5",
+            transition_evidence_ids=tuple(f"action_{step}" for step in range(1, 6)),
+        )
+        query = MemoryQuery("find chair", 5, top_k=5, max_chars=600)
+        current = _item("short", "current_observation", _ref("chair_5", 5, "chair", "object_5"))
+        mid = _item("mid", "object_observation", _ref("old", 0, "table", "object_0"))
+        fused = self.fusion.build(query, [current], [mid], topology.retrieve(query))
+        self.assertEqual(fused.layer_items[0].kind, "current_place")
+        self.assertIn("[short:current_observation", fused.text)
+        self.assertIn("[long:observed_transition", fused.text)
+        self.assertIn("evidence=place_observation_0->place_observation_5", fused.text)
+        self.assertNotIn("place_shift_5", fused.text)
+        self.assertEqual(fused.text.count("chair_5@5"), 1)
+        self.assertLessEqual(len(fused.text), 600)
 
     def test_empty_layer_and_context_roundtrip(self) -> None:
         self.assertEqual(self.fusion.build(self.query, [], [], []).text, "")

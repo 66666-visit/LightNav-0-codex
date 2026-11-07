@@ -6,7 +6,9 @@ Only ``pyzmq`` is required; the environment object is duck-typed (``reset``, ``s
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import pathlib
 import pickle
 import signal
@@ -24,10 +26,11 @@ class RemoteEnvServer:
 
     Wire format (pickle, protocol 4 by default)::
 
-        request  = {"command": "reset" | "step" | "close", "data": ...}
+        request  = {"command": "reset" | "step" | "manifest" | "close", "data": ...}
         reset    -> {"status": "success", "obs": dict, "info": dict}
         step     -> {"status": "success", "obs": dict, "reward": float,
                      "terminated": bool, "truncated": bool, "info": dict}
+        manifest -> {"status": "success", "manifest": dict}
         close    -> {"status": "success"}            (the server loop then exits)
         failure  -> {"status": "error", "message": str}
     """
@@ -118,9 +121,18 @@ class RemoteEnvServer:
             logger.error(f"Close error: {e}")
             return {"status": "error", "message": str(e)}
 
+    def _handle_manifest(self, data: Any) -> dict:
+        if not hasattr(self.env, "get_episode_manifest"):
+            return {"status": "error", "message": "environment has no episode manifest"}
+        try:
+            return {"status": "success", "manifest": self.env.get_episode_manifest()}
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
     _HANDLERS = {
         "reset": _handle_reset,
         "step": _handle_step,
+        "manifest": _handle_manifest,
         "close": _handle_close,
     }
 
@@ -129,8 +141,8 @@ class RemoteEnvServer:
     def start(self, ready_file: Optional[str] = None) -> None:
         """Bind, initialize the environment, then serve until ``close`` or a signal.
 
-        ``ready_file`` (if given) is touched only after ``env.initialize()`` returned,
-        i.e. once the simulator is up and the first ``reset`` will not block on it.
+        ``ready_file`` (if given) is published only after ``env.initialize()``
+        returned. Environments with a manifest publish complete JSON atomically.
         """
         self._setup_socket()
         self._running = True
@@ -141,7 +153,18 @@ class RemoteEnvServer:
             self.env.initialize()
 
         if ready_file is not None:
-            pathlib.Path(ready_file).touch()
+            ready_path = pathlib.Path(ready_file)
+            if hasattr(self.env, "get_episode_manifest"):
+                # The launcher treats the final path as a readiness signal and
+                # parses its JSON immediately. Publish only a fully written file.
+                temporary = ready_path.with_name(f"{ready_path.name}.{os.getpid()}.tmp")
+                temporary.write_text(
+                    json.dumps(self.env.get_episode_manifest(), ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                os.replace(temporary, ready_path)
+            else:
+                ready_path.touch()
             logger.info(f"Ready file written: {ready_file}")
 
         logger.info("Server started, waiting for connections...")

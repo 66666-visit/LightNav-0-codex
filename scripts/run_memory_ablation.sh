@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+# Run the four R2R val_unseen memory conditions with one immutable common setup.
+# Results remain in separate directories; an interrupted condition can be resumed.
+set -euo pipefail
+
+TAG='[memory_ablation]'
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  MODEL_PATH=... YOLO_MODEL_PATH=... DINO_MODEL_PATH=... \
+    bash scripts/run_memory_ablation.sh [--output-root DIR]
+  MODEL_PATH=... YOLO_MODEL_PATH=... DINO_MODEL_PATH=... \
+    bash scripts/run_memory_ablation.sh --resume DIR
+
+Runs all four conditions on the complete R2R val_unseen split, with 500 steps,
+no budget-forced STOP, one common seed, and the same checkpoint/config/shards.
+The first command creates a fresh output directory. --resume preserves prior
+episode results and skips conditions already verified as formally complete.
+
+Optional common settings: GPU_IDS (default 0), SEED (default 42), BACKEND,
+GPU_MEM_UTIL, HABITAT_CONFIG, DATA_PATH, SCENES_DIR, ACTION_TOKENIZER_BUNDLE,
+CLIENT_PYTHON, HABITAT_PYTHON, INFER_VENV, HABITAT_CONDA_ENV, BASE_PORT.
+EOF
+}
+
+die() {
+    echo "$TAG ERROR: $*" >&2
+    exit 1
+}
+
+mode=new
+ablation_root="${ABLATION_ROOT:-$REPO_ROOT/output/memory_ablation_$(date +%Y%m%d_%H%M%S)}"
+while (($#)); do
+    case "$1" in
+        --output-root)
+            [ "$mode" = new ] && [ "$#" -ge 2 ] || die '--output-root needs a directory'
+            ablation_root=$2
+            shift 2
+            ;;
+        --resume)
+            [ "$mode" = new ] && [ "$#" -ge 2 ] || die '--resume needs a directory'
+            mode=resume
+            ablation_root=$2
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+# Reject settings that would silently turn a formal full-split comparison into
+# a small smoke run, change the benchmark, or make the four arms incomparable.
+[ "${TASK:-vlnce}" = vlnce ] || die 'TASK must be vlnce'
+[ "${SPLIT:-val_unseen}" = val_unseen ] || die 'SPLIT must be val_unseen'
+[ "${EPISODES:--1}" = -1 ] || die 'EPISODES must be -1 (the complete split)'
+[ "${MAX_STEPS:-500}" = 500 ] || die 'MAX_STEPS must be 500'
+[ "${NO_FORCE_STOP:-1}" = 1 ] || die 'NO_FORCE_STOP must be 1'
+[ -z "${CLIENT_ARGS:-}" ] || die 'set common settings through this launcher, not CLIENT_ARGS'
+[ -z "${SERVER_ARGS:-}" ] || die 'SERVER_ARGS could change benchmark termination'
+[ -z "${LANGUAGES:-}" ] || die 'LANGUAGES would filter R2R episodes'
+[ -z "${SUCCESS_DISTANCE:-}" ] || die 'SUCCESS_DISTANCE must use the R2R config'
+[ -z "${NAVMESH_CELL_HEIGHT:-}" ] || die 'NAVMESH_CELL_HEIGHT does not apply to R2R'
+[ -z "${LOG_DIR:-}" ] || die 'LOG_DIR would mix logs from different conditions'
+[ "${EXPECTED_EPISODES:-1839}" = 1839 ] || die 'EXPECTED_EPISODES must be 1839 for full R2R val_unseen'
+EXPECTED_EPISODES=1839
+
+MODEL_PATH=${MODEL_PATH:?set MODEL_PATH to the LightNav checkpoint directory}
+YOLO_MODEL_PATH=${YOLO_MODEL_PATH:?set YOLO_MODEL_PATH to an existing YOLO11n .pt file}
+DINO_MODEL_PATH=${DINO_MODEL_PATH:?set DINO_MODEL_PATH to a local DINOv2-Small directory}
+HABITAT_CONFIG=${HABITAT_CONFIG:-$REPO_ROOT/habitat_server/configs/vlnce_r2r.yaml}
+GPU_IDS=${GPU_IDS:-0}
+SEED=${SEED:-42}
+BACKEND=${BACKEND:-vllm_local}
+GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.65}
+YOLO_DEVICE=${YOLO_DEVICE:-cpu}
+DINO_DEVICE=${DINO_DEVICE:-cpu}
+
+[ -d "$MODEL_PATH" ] || die "checkpoint directory not found: $MODEL_PATH"
+[ -s "$YOLO_MODEL_PATH" ] || die "YOLO weights not found or empty: $YOLO_MODEL_PATH"
+[ -d "$DINO_MODEL_PATH" ] || die "DINOv2 directory not found: $DINO_MODEL_PATH"
+[ -f "$DINO_MODEL_PATH/config.json" ] || die 'DINOv2 config.json is missing'
+[ -f "$DINO_MODEL_PATH/preprocessor_config.json" ] || die 'DINOv2 preprocessor_config.json is missing'
+if ! compgen -G "$DINO_MODEL_PATH/*.safetensors" >/dev/null &&
+   ! compgen -G "$DINO_MODEL_PATH/pytorch_model*.bin" >/dev/null; then
+    die 'DINOv2 local weight files are missing'
+fi
+[ -f "$HABITAT_CONFIG" ] || die "Habitat config not found: $HABITAT_CONFIG"
+[[ "$SEED" =~ ^[0-9]+$ ]] || die 'SEED must be a nonnegative integer'
+[[ "$GPU_IDS" =~ ^[0-9]+(\ [0-9]+)*$ ]] || die 'GPU_IDS must be space-separated GPU indices'
+for path in "$YOLO_MODEL_PATH" "$DINO_MODEL_PATH"; do
+    [[ "$path" != *[[:space:]]* ]] || die 'YOLO/DINO paths cannot contain spaces in CLIENT_ARGS'
+done
+
+MODEL_PATH="$(cd "$MODEL_PATH" && pwd -P)"
+YOLO_MODEL_PATH="$(cd "$(dirname "$YOLO_MODEL_PATH")" && pwd -P)/$(basename "$YOLO_MODEL_PATH")"
+DINO_MODEL_PATH="$(cd "$DINO_MODEL_PATH" && pwd -P)"
+HABITAT_CONFIG="$(cd "$(dirname "$HABITAT_CONFIG")" && pwd -P)/$(basename "$HABITAT_CONFIG")"
+INFERENCE_PYTHON=${CLIENT_PYTHON:-}
+if [ -z "$INFERENCE_PYTHON" ]; then
+    INFER_VENV=${INFER_VENV:-$REPO_ROOT/.venv}
+    if [ -x "$INFER_VENV/bin/python" ]; then
+        INFERENCE_PYTHON="$INFER_VENV/bin/python"
+    else
+        INFERENCE_PYTHON=python
+    fi
+fi
+
+if [ "$mode" = new ]; then
+    [ ! -e "$ablation_root" ] || die "output directory already exists: $ablation_root; use --resume"
+    mkdir -p "$(dirname "$ablation_root")"
+    mkdir "$ablation_root"
+else
+    [ -d "$ablation_root" ] || die "resume directory not found: $ablation_root"
+fi
+ablation_root="$(cd "$ablation_root" && pwd -P)"
+export MODEL_PATH YOLO_MODEL_PATH DINO_MODEL_PATH HABITAT_CONFIG GPU_IDS SEED
+export BACKEND GPU_MEM_UTIL YOLO_DEVICE DINO_DEVICE
+
+# An immutable root record prevents a resumed group from silently using a
+# different checkpoint, dataset/config, shard layout, seed, or inference setup.
+python3 - "$ablation_root/ablation_run.json" "$mode" <<'PY'
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+mode = sys.argv[2]
+config = Path(os.environ["HABITAT_CONFIG"])
+snapshot = {
+    "launch_cwd": os.getcwd(),
+    "model_path": os.environ["MODEL_PATH"],
+    "yolo_model_path": os.environ["YOLO_MODEL_PATH"],
+    "dino_model_path": os.environ["DINO_MODEL_PATH"],
+    "habitat_config": str(config),
+    "habitat_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+    "data_path": os.environ.get("DATA_PATH", ""),
+    "scenes_dir": os.environ.get("SCENES_DIR", ""),
+    "action_tokenizer_bundle": os.environ.get("ACTION_TOKENIZER_BUNDLE", ""),
+    "backend": os.environ["BACKEND"],
+    "gpu_memory_utilization": os.environ["GPU_MEM_UTIL"],
+    "gpu_ids": os.environ["GPU_IDS"].split(),
+    "base_port": os.environ.get("BASE_PORT", "5555"),
+    "client_python": os.environ.get("CLIENT_PYTHON", ""),
+    "habitat_python": os.environ.get("HABITAT_PYTHON", ""),
+    "infer_venv": os.environ.get("INFER_VENV", ""),
+    "habitat_conda_env": os.environ.get("HABITAT_CONDA_ENV", "habitat"),
+    "seed": int(os.environ["SEED"]),
+    "task": "vlnce",
+    "split": "val_unseen",
+    "episodes": -1,
+    "max_steps": 500,
+    "force_stop_at_max_steps": False,
+    "yolo_device": os.environ["YOLO_DEVICE"],
+    "dino_device": os.environ["DINO_DEVICE"],
+    "yolo_every_n_steps": 5,
+    "dino_every_n_steps": 5,
+    "place_similarity_threshold": 0.85,
+}
+if mode == "new":
+    with path.open("x", encoding="utf-8") as stream:
+        json.dump(snapshot, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+else:
+    if not path.is_file():
+        raise SystemExit(f"missing resume snapshot: {path}")
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    if saved != snapshot:
+        raise SystemExit("resume settings differ from ablation_run.json; refusing to mix runs")
+PY
+
+manifest="$ablation_root/episode_manifest.json"
+common_args=(
+    --no_force_stop --verbose
+    --memory_top_k 5 --memory_max_context_chars 600
+)
+common_yolo=(
+    --memory_enabled --memory_extractor yolo11
+    --memory_extractor_model_path "$YOLO_MODEL_PATH"
+    --memory_extractor_device "$YOLO_DEVICE"
+    --memory_extractor_confidence 0.25
+    --memory_extract_every_n_steps 5
+)
+hierarchical=(--memory_strategy hierarchical --memory_layers short,mid,long)
+
+# eval_habitat.sh currently accepts one CLIENT_ARGS string and splits it into
+# words. Paths above are checked for whitespace rather than silently mangled.
+for group in baseline_off flat_memory hierarchical_memory hierarchical_topology; do
+    group_dir="$ablation_root/$group"
+    if [ -f "$group_dir/formal_complete.json" ]; then
+        [ -f "$manifest" ] || die "shared manifest missing for completed $group"
+        [ -f "$group_dir/episode_manifest.json" ] || die "group manifest missing for $group"
+        cmp -s "$manifest" "$group_dir/episode_manifest.json" ||
+            die "completed $group has a different episode manifest"
+        PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+            "$INFERENCE_PYTHON" -m lightnav.habitat.experiment_integrity \
+                verify "$group_dir" --shared "$manifest" ||
+            die "completed $group failed the full episode coverage check"
+        echo "$TAG $group already formally complete; skipping"
+        continue
+    fi
+
+    group_resume=0
+    [ -d "$group_dir" ] && group_resume=1
+    case "$group" in
+        baseline_off)
+            arm_args=()
+            ;;
+        flat_memory)
+            arm_args=("${common_yolo[@]}" --memory_strategy flat)
+            ;;
+        hierarchical_memory)
+            arm_args=("${common_yolo[@]}" "${hierarchical[@]}")
+            ;;
+        hierarchical_topology)
+            arm_args=(
+                "${common_yolo[@]}" "${hierarchical[@]}"
+                --memory_place_enabled
+                --memory_place_model_path "$DINO_MODEL_PATH"
+                --memory_place_extract_every_n_steps 5
+                --memory_place_similarity_threshold 0.85
+                --memory_place_device "$DINO_DEVICE"
+            )
+            ;;
+    esac
+    all_args=("${common_args[@]}" "${arm_args[@]}")
+    printf -v group_client_args '%s ' "${all_args[@]}"
+    echo "$TAG running $group (full val_unseen, 500 steps, seed=$SEED, resume=$group_resume)"
+    mkdir -p "$group_dir"
+    timing_file="$group_dir/run_timing.json"
+    timing_attempt="${group}_$(date -u +%Y%m%dT%H%M%SZ)_$$"
+    timing_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    timing_start_ns="$(date +%s%N)"
+    python3 - "$timing_file" "$group" "$timing_attempt" "$timing_started" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+group, attempt_id, started_at = sys.argv[2:]
+data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {
+    "group": group, "attempts": [],
+}
+if data.get("group") != group or not isinstance(data.get("attempts"), list):
+    raise SystemExit(f"invalid prior launcher timing file: {path}")
+data["attempts"].append({
+    "attempt_id": attempt_id, "started_at_utc": started_at,
+    "ended_at_utc": None, "wall_time_sec": None, "exit_code": None,
+})
+path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PY
+    set +e
+    MODEL_PATH="$MODEL_PATH" HABITAT_CONFIG="$HABITAT_CONFIG" TASK=vlnce \
+        SPLIT=val_unseen EPISODES=-1 MAX_STEPS=500 NO_FORCE_STOP=1 \
+        STRICT_FULL_EVAL=1 RESUME="$group_resume" \
+        EXPECTED_EPISODES=1839 \
+        EPISODE_MANIFEST_PATH="$manifest" OUTPUT_ROOT="$group_dir" \
+        SEED="$SEED" GPU_IDS="$GPU_IDS" BACKEND="$BACKEND" \
+        GPU_MEM_UTIL="$GPU_MEM_UTIL" CLIENT_ARGS="$group_client_args" \
+        bash "$REPO_ROOT/scripts/eval_habitat.sh"
+    eval_status=$?
+    set -e
+    timing_end_ns="$(date +%s%N)"
+    timing_ended="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    python3 - "$timing_file" "$timing_attempt" "$timing_ended" \
+        "$timing_start_ns" "$timing_end_ns" "$eval_status" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+attempt_id, ended_at, started_ns, ended_ns, exit_code = sys.argv[2:]
+data = json.loads(path.read_text(encoding="utf-8"))
+attempt = next(
+    (item for item in data["attempts"] if item["attempt_id"] == attempt_id), None
+)
+if attempt is None:
+    raise SystemExit(f"missing launcher timing attempt: {attempt_id}")
+attempt["ended_at_utc"] = ended_at
+attempt["wall_time_sec"] = max(0.0, (int(ended_ns) - int(started_ns)) / 1e9)
+attempt["exit_code"] = int(exit_code)
+path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PY
+    [ "$eval_status" -eq 0 ] || die "$group failed (exit=$eval_status); resume with --resume $ablation_root"
+    [ -f "$group_dir/formal_complete.json" ] ||
+        die "$group finished without formal_complete.json; preserve results and resume later"
+    [ -f "$manifest" ] || die 'shared episode manifest was not created'
+    cmp -s "$manifest" "$group_dir/episode_manifest.json" ||
+        die "$group episode manifest differs from the shared manifest"
+done
+
+"$INFERENCE_PYTHON" "$REPO_ROOT/scripts/compare_memory_ablation.py" "$ablation_root"
+echo "$TAG all four complete: $ablation_root"

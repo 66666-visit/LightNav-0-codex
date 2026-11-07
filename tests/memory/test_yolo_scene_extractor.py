@@ -64,6 +64,7 @@ def test_mock_detection_uses_rgb_and_preserves_per_object_confidence(tmp_path) -
     assert [detection.confidence for detection in extraction.detections] == pytest.approx([0.91, 0.72])
     assert extraction.detections[0].bbox_xyxy == (1.0, 1.0, 5.0, 6.0)
     assert extraction.source == "ultralytics_yolo:yolo11n.pt"
+    assert extractor.last_detection_ms >= 0.0
 
 
 def test_detection_record_json_roundtrip() -> None:
@@ -81,10 +82,15 @@ def test_every_five_steps_and_episode_reset(tmp_path) -> None:
     for step in range(11):
         result = extractor.extract(ObservationPacket(step_id=step, rgb=_rgb()))
         assert bool(result.detections) == (step in {0, 5, 10})
+        if step in {0, 5, 10}:
+            assert extractor.last_detection_ms >= 0.0
+        else:
+            assert extractor.last_detection_ms is None
     assert len(model.calls) == 3
     assert extractor.last_attempt_step == 10
     extractor.reset_episode("second", "find sofa")
     assert extractor.last_attempt_step is None and extractor.last_error is None
+    assert extractor.last_detection_ms is None
     assert extractor.extract(ObservationPacket(step_id=0, rgb=_rgb())).objects == ["chair"]
     assert len(model.calls) == 4
 
@@ -131,6 +137,7 @@ def test_inference_error_is_logged_and_does_not_invent_objects(tmp_path, caplog)
     with caplog.at_level("WARNING"):
         assert manager.observe(ObservationPacket(step_id=0, rgb=_rgb(), instruction="find chair")) == []
     assert "synthetic inference failure" in extractor.last_error
+    assert extractor.last_detection_ms >= 0.0
     assert "YOLO extraction failed" in caplog.text
     assert "step=0" in caplog.text and "yolo11n.pt" in caplog.text
     assert manager.scene_graph.nodes == [] and manager.episodic.events == []

@@ -145,6 +145,27 @@ class BaseHabitatEnv(ABC):
             self._initialized = True
             logger.info("Habitat environment created")
 
+    def get_episode_manifest(self) -> Dict[str, Any]:
+        """Expose loaded episode IDs to the evaluator, never to the policy."""
+        self.initialize()
+        episodes = []
+        seen = set()
+        for episode in self._habitat_env.episodes:
+            scene_id = getattr(episode, "scene_id", None)
+            episode_id = getattr(episode, "episode_id", None)
+            if scene_id is None or episode_id is None or not str(scene_id) or not str(episode_id):
+                raise ValueError("loaded Habitat episode lacks scene_id or episode_id")
+            key = (str(scene_id), str(episode_id))
+            if key in seen:
+                raise ValueError(f"duplicate episode in loaded Habitat dataset: {key}")
+            seen.add(key)
+            episodes.append({"scene_id": key[0], "episode_id": key[1]})
+        return {
+            "split": str(getattr(self, "split", "")),
+            "expected_count": len(episodes),
+            "episodes": episodes,
+        }
+
     def reset(
         self, *, seed: Optional[int] = None, options: Optional[Dict] = None
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:

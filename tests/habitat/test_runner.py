@@ -194,6 +194,147 @@ def test_full_split_runs_until_the_first_repeated_scene_episode_key(tmp_path):
     assert all(a["action"] == "velocity_control" for a in h.env.actions)
 
 
+class ManifestEnv(FakeEnv):
+    def get_episode_manifest(self):
+        return {
+            "split": "val_unseen",
+            "expected_count": len(EPISODES),
+            "episodes": [
+                {"scene_id": scene, "episode_id": episode}
+                for scene, episode, _language, _instruction in EPISODES
+            ],
+        }
+
+
+class TimedFakePolicy(FakePolicy):
+    def __init__(self, *, fail_on_reset: int | None = None) -> None:
+        super().__init__()
+        self.fail_on_reset = fail_on_reset
+        self.last_model_inference_ms = None
+        self.last_prompt_chars = None
+        self.last_memory_diagnostic = None
+
+    def act(self, obs, info):
+        if self.fail_on_reset is not None and len(self.resets) == self.fail_on_reset:
+            raise RuntimeError("interrupted episode")
+        self.last_model_inference_ms = 1.25
+        self.last_prompt_chars = 125
+        return super().act(obs, info)
+
+
+def test_formal_eval_resumes_completed_episode_ids_without_double_counting(tmp_path):
+    cfg = _cfg(
+        tmp_path, episodes=-1, max_steps=500,
+        force_stop_at_max_steps=False, strict_full_eval=True, seed=42,
+    )
+    interrupted = Harness(ManifestEnv())
+    interrupted.policy = TimedFakePolicy(fail_on_reset=2)
+    with pytest.raises(RuntimeError, match="interrupted episode"):
+        interrupted.run(cfg)
+    output = Path(cfg.output_dir)
+    assert len(_read_jsonl(output / "results.jsonl")) == 1
+    assert len(_read_jsonl(output / "memory_diagnostics.jsonl")) == 3
+
+    resumed = Harness(ManifestEnv())
+    resumed.policy = TimedFakePolicy()
+    cfg.resume = True
+    results = resumed.run(cfg)
+    assert len(results) == 3
+    assert len(_read_jsonl(output / "results.jsonl")) == 3
+    assert len(_read_jsonl(output / "memory_diagnostics.jsonl")) == 9
+    assert len({(row["scene_id"], row["habitat_episode_id"]) for row in results}) == 3
+    assert resumed.policy.resets == ["turn around twice", "leave the room"]
+    assert resumed.env.reset_calls == 4
+    assert results[0]["inference_latency_ms_mean"] == pytest.approx(1.25)
+    assert (output / "episode_manifest.json").is_file()
+
+
+def test_formal_resume_repairs_partial_jsonl_tails_without_losing_results(tmp_path):
+    cfg = _cfg(
+        tmp_path, episodes=-1, max_steps=500,
+        force_stop_at_max_steps=False, strict_full_eval=True, seed=42,
+    )
+    interrupted = Harness(ManifestEnv())
+    interrupted.policy = TimedFakePolicy(fail_on_reset=2)
+    with pytest.raises(RuntimeError, match="interrupted episode"):
+        interrupted.run(cfg)
+    output = Path(cfg.output_dir)
+    for name in ("results.jsonl", "memory_diagnostics.jsonl"):
+        with (output / name).open("ab") as stream:
+            stream.write(b'{"scene_id":')
+
+    resumed = Harness(ManifestEnv())
+    resumed.policy = TimedFakePolicy()
+    cfg.resume = True
+    assert len(resumed.run(cfg)) == 3
+    assert len(_read_jsonl(output / "results.jsonl")) == 3
+    assert len(_read_jsonl(output / "memory_diagnostics.jsonl")) == 9
+    assert len(list(output.glob("results.jsonl.interrupted_tail_*"))) == 1
+    assert len(list(output.glob("memory_diagnostics.jsonl.interrupted_tail_*"))) == 1
+
+
+def test_formal_eval_rejects_missing_metrics_and_nonterminal_episode(tmp_path):
+    class MissingMetricEnv(ManifestEnv):
+        def step(self, action):
+            obs, reward, terminated, truncated, info = super().step(action)
+            info.pop("ndtw", None)
+            return obs, reward, terminated, truncated, info
+
+    class NonterminalEnv(ManifestEnv):
+        def step(self, action):
+            obs, reward, _terminated, _truncated, info = super().step(action)
+            obs["rgb"] = None
+            return obs, reward, False, False, info
+
+    for name, env, message in (
+        ("missing", MissingMetricEnv(), "lacks measured ndtw"),
+        ("nonterminal", NonterminalEnv(), "without Habitat termination"),
+    ):
+        harness = Harness(env)
+        harness.policy = TimedFakePolicy()
+        with pytest.raises(ValueError, match=message):
+            harness.run(_cfg(
+                tmp_path / name, episodes=-1, max_steps=500,
+                force_stop_at_max_steps=False, strict_full_eval=True,
+            ))
+        assert env.closed
+
+
+def test_formal_eval_rejects_short_cap_forced_stop_and_missing_manifest(tmp_path):
+    for overrides in (
+        {"max_steps": 40}, {"force_stop_at_max_steps": True},
+        {"episodes": 1}, {"episodes": 0},
+    ):
+        settings = {
+            "episodes": -1, "max_steps": 500,
+            "force_stop_at_max_steps": False, "strict_full_eval": True,
+        }
+        settings.update(overrides)
+        with pytest.raises(ValueError, match="formal R2R"):
+            Harness(ManifestEnv()).run(_cfg(tmp_path, **settings))
+    with pytest.raises(ValueError, match="server manifest"):
+        Harness(FakeEnv()).run(_cfg(
+            tmp_path, episodes=-1, max_steps=500,
+            force_stop_at_max_steps=False, strict_full_eval=True,
+        ))
+
+
+def test_formal_eval_detects_iterator_wrap_before_loaded_manifest_count(tmp_path):
+    class ShortIterator(ManifestEnv):
+        def reset(self):
+            self.i %= 2
+            return super().reset()
+
+    harness = Harness(ShortIterator())
+    harness.policy = TimedFakePolicy()
+    with pytest.raises(ValueError, match="iterator wrapped after 2 of 3"):
+        harness.run(_cfg(
+            tmp_path, episodes=-1, max_steps=500,
+            force_stop_at_max_steps=False, strict_full_eval=True,
+        ))
+    assert harness.env.closed
+
+
 def test_memory_config_defaults_off_and_cli_maps_nested_settings():
     from lightnav.cli.eval_habitat import build_parser, config_from_args
 
@@ -234,6 +375,28 @@ def test_hierarchical_memory_cli_supports_all_layer_ablations():
         parser.parse_args(["--model_path", "model", "--memory_layers", "chair"])
     with pytest.raises(ValueError, match="unique subset"):
         MemoryConfig(strategy="hierarchical", layers=("short", "short"))
+
+
+def test_place_memory_cli_maps_local_descriptor_settings():
+    from lightnav.cli.eval_habitat import build_parser, config_from_args
+
+    args = build_parser().parse_args([
+        "--model_path", "model", "--memory_enabled", "--memory_strategy", "hierarchical",
+        "--memory_place_enabled", "--memory_place_model_path", "/local/dinov2-small",
+        "--memory_place_device", "cuda:0", "--memory_place_extract_every_n_steps", "7",
+        "--memory_place_similarity_threshold", "0.88",
+    ])
+    cfg = config_from_args(args)
+    assert cfg.memory.place_enabled is True
+    assert cfg.memory.place_model_path == "/local/dinov2-small"
+    assert cfg.memory.place_device == "cuda:0"
+    assert cfg.memory.place_extract_every_n_steps == 7
+    assert cfg.memory.place_similarity_threshold == 0.88
+    assert MemoryConfig().place_enabled is False
+    with pytest.raises(ValueError, match="similarity"):
+        MemoryConfig(place_similarity_threshold=1.1)
+    with pytest.raises(ValueError, match="positive"):
+        MemoryConfig(place_extract_every_n_steps=0)
 
 
 def test_runner_closes_each_episode_memory_even_on_error(tmp_path):
@@ -293,8 +456,12 @@ def test_episode_result_record_fields(tmp_path):
         "min_distance",
         "instruction",
         "termination_reason",
+        "terminated",
+        "truncated",
         "forced_stop",
         "termination_details",
+        "episode_time_sec",
+        "inference_latency_ms_mean",
     }
     assert r["rollout_idx"] == 0
     assert r["success"] == 1.0
@@ -307,7 +474,10 @@ def test_episode_result_record_fields(tmp_path):
     assert r["min_distance"] == pytest.approx(2.0)  # min over steps; reset-time 5.0 excluded
     assert r["instruction"] == "go to the sofa"
     assert r["termination_reason"] == "agent_stop"
+    assert r["terminated"] is True and r["truncated"] is False
     assert r["termination_details"] == {"stop_step": 3}
+    assert r["episode_time_sec"] >= 0.0
+    assert r["inference_latency_ms_mean"] is None  # this fake policy has no engine timing
     assert results[2]["success"] == 0.0  # sceneB fails
 
 
@@ -552,6 +722,61 @@ def test_build_velocity_policy_selects_yolo_only_when_memory_enabled(tmp_path, m
         "model_path": "local/yolo11n.pt", "device": "cuda:0",
         "confidence": 0.4, "every_n_steps": 5,
     }]
+
+
+def test_build_velocity_policy_loads_dino_only_for_enabled_long_hierarchy(
+    tmp_path, monkeypatch,
+):
+    from lightnav.memory import place_recognition
+
+    created = []
+
+    class FakeDINO:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+    monkeypatch.setattr(place_recognition, "DINOv2PlaceDescriptorExtractor", FakeDINO)
+    engine, bundle = _stub_engine()
+    cfg = _cfg(tmp_path, traj_vocab_path=str(_write_vocab(tmp_path / "vocab")), K=4, horizon=10)
+    cfg.memory = MemoryConfig(
+        enabled=False, strategy="hierarchical", layers=("short", "mid", "long"),
+        place_enabled=True, place_model_path="/local/dinov2-small", place_device="cpu",
+    )
+    info = {"habitat_time_step": 0.1, "lin_vel_range": [0, 2.5], "ang_vel_range": [-300, 300]}
+    disabled = build_velocity_policy(cfg, engine, bundle, info)
+    assert disabled.memory_manager is None
+    assert created == []
+
+    cfg.memory.enabled = True
+    cfg.memory.strategy = "flat"
+    flat = build_velocity_policy(cfg, engine, bundle, info)
+    assert flat.memory_manager is not None
+    assert created == []
+
+    cfg.memory.strategy = "hierarchical"
+    cfg.memory.layers = ("short", "mid")
+    no_long = build_velocity_policy(cfg, engine, bundle, info)
+    assert no_long.memory_manager is not None
+    assert created == []
+
+    cfg.memory.layers = ("short", "mid", "long")
+    enabled = build_velocity_policy(cfg, engine, bundle, info)
+    assert enabled.memory_manager is not None
+    assert enabled.memory_manager.place_enabled is True
+    assert isinstance(enabled.memory_manager.place_extractor, FakeDINO)
+    assert created == [{"model_path": "/local/dinov2-small", "device": "cpu"}]
+
+
+def test_build_velocity_policy_rejects_missing_local_dino_directory(tmp_path):
+    engine, bundle = _stub_engine()
+    cfg = _cfg(tmp_path, traj_vocab_path=str(_write_vocab(tmp_path / "vocab")), K=4, horizon=10)
+    cfg.memory = MemoryConfig(
+        enabled=True, strategy="hierarchical", place_enabled=True,
+        place_model_path=str(tmp_path / "missing_dinov2_small"),
+    )
+    info = {"habitat_time_step": 0.1, "lin_vel_range": [0, 2.5], "ang_vel_range": [-300, 300]}
+    with pytest.raises(FileNotFoundError, match="local DINOv2 model directory not found"):
+        build_velocity_policy(cfg, engine, bundle, info)
 
 
 def test_build_velocity_policy_rejects_missing_local_yolo_weights(tmp_path):

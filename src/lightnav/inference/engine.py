@@ -105,6 +105,7 @@ class VLNInferenceEngine:
         self._embeds_pin_bufs: dict[int, torch.Tensor] = {}
         self._traj_allowed_token_ids: list[int] | None = None
         self._last_generate_timings: dict[str, float] = {}
+        self.last_prompt_chars: int | None = None
 
     def _get_traj_allowed_token_ids(self) -> list[int]:
         """IDs of {<traj_*>, <tpos_*>, <act_l*>, <apos_*>, <opos_*>, <pos_*>, eos} present
@@ -247,6 +248,15 @@ class VLNInferenceEngine:
         Returns:
             (generated_text, latency_ms)
         """
+        self.last_prompt_chars = next(
+            (
+                len(message["value"])
+                for message in sample.get("conversations", [])
+                if isinstance(message, dict) and message.get("from") == "human"
+                and isinstance(message.get("value"), str)
+            ),
+            None,
+        )
         max_tok = max_new_tokens or self.max_new_tokens
 
         if self.backend == "hf":

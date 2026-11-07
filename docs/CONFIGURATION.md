@@ -94,9 +94,36 @@ mid, and long semantic stores before fusion. `--memory_layers` defaults to
 `short,mid`, `short,long`, `mid,long`, or `short,mid,long`). `none` returns an
 empty hierarchical context. These layer flags have no effect while memory is
 off or the strategy is `flat`.
+`--memory_place_enabled` selects an optional DINOv2-Small visual place graph
+for the hierarchical `long` layer; it is off by default and has no effect when
+memory, hierarchical retrieval, or `long` is off. Supply an existing local Hugging
+Face directory with `--memory_place_model_path`; no model is downloaded. The
+descriptor is extracted at step 0 and every `--memory_place_extract_every_n_steps`
+(default 5). `--memory_place_similarity_threshold` defaults to **0.85**, an
+initial cosine threshold that needs calibration on Habitat RGB observations.
+`--memory_place_device` defaults to `cpu` and accepts `cuda` or `cuda:N` when
+available. The graph records visual place hypotheses and observed transitions,
+not verified rooms, physical object identities, or traversable connections.
 `--verbose` prints a `[memory]` JSON line per policy step with extraction,
 event, graph, retrieval, per-layer, and injected-prompt diagnostics. See
 [MEMORY_MVP.md](MEMORY_MVP.md) for evidence rules and a one-episode command.
+
+For formal R2R validation, use [MEMORY_ABLATION.md](MEMORY_ABLATION.md).
+`scripts/run_memory_ablation.sh` requires `MODEL_PATH`, `YOLO_MODEL_PATH`, and
+`DINO_MODEL_PATH`; `--output-root DIR` creates a new four-arm experiment and
+`--resume DIR` resumes an interrupted one with the same settings. It fixes
+`EPISODES=-1`, `MAX_STEPS=500`, `NO_FORCE_STOP=1`, and `SPLIT=val_unseen`.
+`SEED` defaults to 42 and `GPU_IDS` to 0. The runner checks the actual loaded
+Episode manifest against exactly `EXPECTED_EPISODES=1839`, then verifies
+exact coverage before creating `formal_complete.json`.
+
+The underlying `scripts/eval_habitat.sh` also accepts `STRICT_FULL_EVAL=1`
+for the full-split gate, `RESUME=1` to skip existing completed Episodes,
+`EPISODE_MANIFEST_PATH` to create or compare a shared manifest, `SEED` for
+server and client, and `NO_FORCE_STOP=1` to let the standard Habitat step cap
+truncate. Its matching client flags are `--strict_full_eval`, `--resume`,
+`--seed N`, and `--no_force_stop`; the Habitat server receives `--seed N` and
+`--strict-full-eval`. The ordinary defaults remain available for smoke tests.
 
 `lightnav-serve` flags (environment names are what `scripts/start_servers.sh` and
 `docker/entrypoint.sh` read):

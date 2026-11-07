@@ -6,6 +6,7 @@ pyzmq for this module); the env is a tiny fake, so no simulator is involved.
 
 from __future__ import annotations
 
+import json
 import socket
 import sys
 import threading
@@ -68,6 +69,14 @@ class FakeEnv:
         self.closed = True
 
 
+class ManifestFakeEnv(FakeEnv):
+    def get_episode_manifest(self) -> dict:
+        return {
+            "split": "val_unseen", "expected_count": 1,
+            "episodes": [{"scene_id": "scene", "episode_id": "ep1"}],
+        }
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -123,6 +132,21 @@ def _client(served: _Served, **kwargs) -> RemoteEnvClient:
 def test_ready_file_is_written_after_initialize(served):
     assert served.ready_file.exists()
     assert served.env.initialized is True
+
+
+def test_manifest_ready_file_and_rpc_are_complete(tmp_path):
+    served = _Served(
+        ManifestFakeEnv(), _free_port(), tmp_path / "manifest.ready",
+    ).start()
+    client = _client(served)
+    try:
+        manifest = json.loads(served.ready_file.read_text(encoding="utf-8"))
+        assert manifest["expected_count"] == 1
+        assert client.get_episode_manifest() == manifest
+        assert not list(tmp_path.glob("*.tmp"))
+    finally:
+        client.close()
+        served.stop()
 
 
 def test_reset_step_close_roundtrip(served):

@@ -27,6 +27,12 @@
 #   EPISODES             per shard; -1 = whole shard (default -1)
 #   MAX_STEPS            default 500
 #   SERVER_ARGS          extra lightnav_habitat.serve flags
+#   STRICT_FULL_EVAL     1 = require complete val_unseen, standard 500 steps, exact IDs
+#   NO_FORCE_STOP        1 = let Habitat truncate at the standard step limit
+#   RESUME               1 = skip already completed episode IDs in the same output
+#   SEED                 shared Habitat/client random seed for a controlled run
+#   EPISODE_MANIFEST_PATH shared manifest path to create/compare across experiment arms
+#   EXPECTED_EPISODES    standard R2R val_unseen count (default 1839 in formal mode)
 #   # ---- topology ----
 #   GPU_IDS              GPUs to use, e.g. "0 1 3" (default: all visible GPUs)
 #   NUM_GPUS             alternative to GPU_IDS: use GPUs 0..NUM_GPUS-1
@@ -79,6 +85,24 @@ LANGUAGES=${LANGUAGES:-}
 EPISODES=${EPISODES:--1}
 MAX_STEPS=${MAX_STEPS:-500}
 SERVER_ARGS=${SERVER_ARGS:-}
+STRICT_FULL_EVAL=${STRICT_FULL_EVAL:-0}
+NO_FORCE_STOP=${NO_FORCE_STOP:-0}
+RESUME=${RESUME:-0}
+SEED=${SEED:-}
+EPISODE_MANIFEST_PATH=${EPISODE_MANIFEST_PATH:-}
+EXPECTED_EPISODES=${EXPECTED_EPISODES:-1839}
+if [ "$STRICT_FULL_EVAL" = 1 ]; then
+    if [ "$EXPECTED_EPISODES" != 1839 ]; then
+        echo "$TAG ERROR: formal R2R val_unseen requires EXPECTED_EPISODES=1839" >&2
+        exit 1
+    fi
+    if [ "$TASK" != vlnce ] || [ "$SPLIT" != val_unseen ] || [ "$EPISODES" != -1 ] \
+        || [ "$MAX_STEPS" != 500 ] || [ "$NO_FORCE_STOP" != 1 ] \
+        || [ -z "$SEED" ] || [ -n "$LANGUAGES" ] || [ -n "$SERVER_ARGS" ]; then
+        echo "$TAG ERROR: formal R2R requires vlnce val_unseen, EPISODES=-1, MAX_STEPS=500, NO_FORCE_STOP=1, SEED, no languages/server overrides" >&2
+        exit 1
+    fi
+fi
 
 # ── topology ─────────────────────────────────────────────────────────────────
 if [ -n "${GPU_IDS:-}" ]; then
@@ -152,14 +176,92 @@ PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" "$CLIENT_PYTHON" -c "impo
 
 # ── output ───────────────────────────────────────────────────────────────────
 TS=$(date +%Y%m%d_%H%M%S)
+ATTEMPT_ID="${TS}_$$"
 OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/output/habitat_${TASK}_${TS}}
-LOG_DIR=${LOG_DIR:-$OUTPUT_ROOT/logs}
-READY_DIR="$OUTPUT_ROOT/.ready"
+LOG_DIR=${LOG_DIR:-$OUTPUT_ROOT/logs/$ATTEMPT_ID}
+READY_DIR="$OUTPUT_ROOT/.ready/$ATTEMPT_ID"
 mkdir -p "$OUTPUT_ROOT" "$LOG_DIR" "$READY_DIR"
-rm -f "$READY_DIR"/*.ready
 
 echo "$TAG task=$TASK config=$HABITAT_CONFIG split=${SPLIT:-<yaml>} model=$MODEL_PATH backend=$BACKEND"
 echo "$TAG gpus=(${GPUS[*]}) shards=$N base_port=$BASE_PORT output=$OUTPUT_ROOT"
+
+# A JSON document is valid YAML. Keep the exact run settings in each group's
+# output and refuse a resumed run whose checkpoint or benchmark settings differ.
+SNAPSHOT_OUTPUT_ROOT="$OUTPUT_ROOT" SNAPSHOT_MODEL_PATH="$MODEL_PATH" \
+SNAPSHOT_BACKEND="$BACKEND" SNAPSHOT_TASK="$TASK" SNAPSHOT_SPLIT="$SPLIT" \
+SNAPSHOT_HABITAT_CONFIG="$HABITAT_CONFIG" SNAPSHOT_SEED="$SEED" \
+SNAPSHOT_EPISODES="$EPISODES" SNAPSHOT_MAX_STEPS="$MAX_STEPS" \
+SNAPSHOT_NO_FORCE_STOP="$NO_FORCE_STOP" SNAPSHOT_GPU_IDS="${GPUS[*]}" \
+SNAPSHOT_ACTION_BUNDLE="$ACTION_TOKENIZER_BUNDLE" \
+SNAPSHOT_GPU_MEM_UTIL="$GPU_MEM_UTIL" SNAPSHOT_CLIENT_ARGS="$CLIENT_ARGS" \
+SNAPSHOT_SERVER_ARGS="$SERVER_ARGS" SNAPSHOT_EXPECTED_EPISODES="$EXPECTED_EPISODES" \
+SNAPSHOT_DATA_PATH="$DATA_PATH" SNAPSHOT_SCENES_DIR="$SCENES_DIR" \
+"$CLIENT_PYTHON" - <<'PY'
+import hashlib
+import json
+import os
+import shlex
+from pathlib import Path
+
+env = os.environ
+habitat_config = Path(env["SNAPSHOT_HABITAT_CONFIG"]).resolve()
+model_path = Path(env["SNAPSHOT_MODEL_PATH"]).resolve()
+tokens = shlex.split(env["SNAPSHOT_CLIENT_ARGS"])
+common_tokens, memory_tokens = [], []
+index = 0
+while index < len(tokens):
+    token = tokens[index]
+    group = memory_tokens if token.startswith("--memory_") else common_tokens
+    group.append(token)
+    if token.startswith("--") and index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
+        index += 1
+        group.append(tokens[index])
+    index += 1
+
+def digest_if_file(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+snapshot = {
+    "common": {
+        "model_path": str(model_path),
+        "model_config_sha256": digest_if_file(model_path / "config.json"),
+        "eval_config_sha256": digest_if_file(model_path / "eval_config.json"),
+        "backend": env["SNAPSHOT_BACKEND"],
+        "task": env["SNAPSHOT_TASK"],
+        "split": env["SNAPSHOT_SPLIT"],
+        "habitat_config": str(habitat_config),
+        "habitat_config_sha256": digest_if_file(habitat_config),
+        "data_path": str(Path(env["SNAPSHOT_DATA_PATH"]).resolve()) if env["SNAPSHOT_DATA_PATH"] else "",
+        "scenes_dir": str(Path(env["SNAPSHOT_SCENES_DIR"]).resolve()) if env["SNAPSHOT_SCENES_DIR"] else "",
+        "seed": int(env["SNAPSHOT_SEED"]) if env["SNAPSHOT_SEED"] else None,
+        "episodes": int(env["SNAPSHOT_EPISODES"]),
+        "expected_episodes": int(env["SNAPSHOT_EXPECTED_EPISODES"]),
+        "max_steps": int(env["SNAPSHOT_MAX_STEPS"]),
+        "force_stop_at_max_steps": env["SNAPSHOT_NO_FORCE_STOP"] != "1",
+        "gpu_ids": env["SNAPSHOT_GPU_IDS"].split(),
+        "action_tokenizer_bundle": env["SNAPSHOT_ACTION_BUNDLE"],
+        "gpu_memory_utilization": float(env["SNAPSHOT_GPU_MEM_UTIL"]),
+        "client_non_memory_args": common_tokens,
+        "inference_env": {
+            key: env.get(key, "") for key in (
+                "VLN_EVAL_TEMPERATURE", "VLN_EVAL_TOP_P", "VLN_EVAL_TOP_K",
+                "VLN_EVAL_TRAJ_TOP1",
+            )
+        },
+    },
+    "memory_args": memory_tokens,
+    "client_args": tokens,
+    "server_args": shlex.split(env["SNAPSHOT_SERVER_ARGS"]),
+}
+target = Path(env["SNAPSHOT_OUTPUT_ROOT"]) / "config_snapshot.yaml"
+if target.exists():
+    if json.loads(target.read_text(encoding="utf-8")) != snapshot:
+        raise SystemExit(f"existing config snapshot differs from this run: {target}")
+else:
+    with target.open("x", encoding="utf-8") as stream:
+        json.dump(snapshot, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
+PY
 
 # ── cleanup ──────────────────────────────────────────────────────────────────
 SERVER_PIDS=()
@@ -178,6 +280,8 @@ trap cleanup EXIT INT TERM
 
 # ── 1. env servers ───────────────────────────────────────────────────────────
 server_args=(--task "$TASK" --config "$HABITAT_CONFIG" --max-steps "$MAX_STEPS")
+[ -n "$SEED" ] && server_args+=(--seed "$SEED")
+[ "$STRICT_FULL_EVAL" = 1 ] && server_args+=(--strict-full-eval)
 [ -n "$SPLIT" ] && server_args+=(--split "$SPLIT")
 [ -n "$SUCCESS_DISTANCE" ] && server_args+=(--success-distance "$SUCCESS_DISTANCE")
 [ -n "$NAVMESH_CELL_HEIGHT" ] && server_args+=(--navmesh-cell-height "$NAVMESH_CELL_HEIGHT")
@@ -227,9 +331,28 @@ while :; do
     sleep 3
 done
 
+# The ready files contain the exact IDs loaded by each server after dataset
+# filtering and sharding. A formal run checks this before loading model weights.
+if [ "$STRICT_FULL_EVAL" = 1 ]; then
+    ready_files=()
+    for ((i = 0; i < N; i++)); do ready_files+=("$READY_DIR/shard${i}.ready"); done
+    manifest_args=(
+        collect --output "$OUTPUT_ROOT/episode_manifest.json"
+        --expected-count "$EXPECTED_EPISODES"
+    )
+    [ -n "$EPISODE_MANIFEST_PATH" ] && manifest_args+=(--shared "$EPISODE_MANIFEST_PATH")
+    PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+        "$CLIENT_PYTHON" -m lightnav.habitat.experiment_integrity \
+        "${manifest_args[@]}" "${ready_files[@]}"
+fi
+
 # ── 3. eval clients ──────────────────────────────────────────────────────────
 client_args=(--model_path "$MODEL_PATH" --backend "$BACKEND" --episodes "$EPISODES" \
              --max_steps "$MAX_STEPS" --gpu_memory_utilization "$GPU_MEM_UTIL")
+[ -n "$SEED" ] && client_args+=(--seed "$SEED")
+[ "$NO_FORCE_STOP" = 1 ] && client_args+=(--no_force_stop)
+[ "$STRICT_FULL_EVAL" = 1 ] && client_args+=(--strict_full_eval)
+[ "$RESUME" = 1 ] && client_args+=(--resume)
 [ -n "$ACTION_TOKENIZER_BUNDLE" ] && client_args+=(--action_tokenizer_bundle "$ACTION_TOKENIZER_BUNDLE")
 # shellcheck disable=SC2206
 [ -n "$LANGUAGES" ] && client_args+=(--languages $LANGUAGES)
@@ -264,5 +387,19 @@ done
 PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
     "$CLIENT_PYTHON" -m lightnav.cli.eval_merge "$OUTPUT_ROOT"/shard_* --output "$OUTPUT_ROOT" \
     | tee "$OUTPUT_ROOT/merge.log"
+# Rebuild the derived diagnostics file from all shard logs on every attempt.
+diagnostics_tmp="$OUTPUT_ROOT/memory_diagnostics.jsonl.$ATTEMPT_ID.tmp"
+: > "$diagnostics_tmp"
+for ((i = 0; i < N; i++)); do
+    [ -f "$OUTPUT_ROOT/shard_$i/memory_diagnostics.jsonl" ] \
+        && cat "$OUTPUT_ROOT/shard_$i/memory_diagnostics.jsonl" >> "$diagnostics_tmp"
+done
+mv "$diagnostics_tmp" "$OUTPUT_ROOT/memory_diagnostics.jsonl"
+if [ "$STRICT_FULL_EVAL" = 1 ] && [ "$FAILED" -eq 0 ]; then
+    verify_args=(verify "$OUTPUT_ROOT")
+    [ -n "$EPISODE_MANIFEST_PATH" ] && verify_args+=(--shared "$EPISODE_MANIFEST_PATH")
+    PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+        "$CLIENT_PYTHON" -m lightnav.habitat.experiment_integrity "${verify_args[@]}"
+fi
 echo "$TAG done: $OUTPUT_ROOT/summary.json  (failed shards: $FAILED)"
 [ "$FAILED" -eq 0 ]

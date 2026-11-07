@@ -127,6 +127,8 @@ class VLNCEEnv(BaseHabitatEnv):
         split_num: Optional[int] = None,
         early_stop_rotation: int = 0,
         early_stop_steps: int = 0,
+        seed: Optional[int] = None,
+        strict_full_eval: bool = False,
     ):
         """
         Args:
@@ -149,6 +151,8 @@ class VLNCEEnv(BaseHabitatEnv):
         self.scenes_dir = scenes_dir
         self.split = split
         self.success_distance = success_distance
+        self.seed = seed
+        self.strict_full_eval = strict_full_eval
         self.habitat_time_step: Optional[float] = None
         self.lin_vel_range: Optional[Tuple[float, float]] = None
         self.ang_vel_range: Optional[Tuple[float, float]] = None
@@ -255,6 +259,20 @@ class VLNCEEnv(BaseHabitatEnv):
 
         with read_write(config):
             self._apply_dataset_overrides(config)
+
+            if self.seed is not None:
+                config.habitat.seed = self.seed
+            if self.strict_full_eval:
+                yaml_steps = int(config.habitat.environment.max_episode_steps)
+                if (
+                    str(config.habitat.dataset.split) != "val_unseen"
+                    or self.max_steps != 500 or yaml_steps != 500
+                    or self._early_stop_rotation or self._early_stop_steps
+                ):
+                    raise ValueError(
+                        "formal R2R evaluation requires val_unseen, client/server/yaml "
+                        "500 steps, and disabled early-stop rules"
+                    )
 
             # RxR-only default language filter (en-US + en-IN). habitat-lab's DatasetConfig
             # has no `languages` field, so it is added at runtime unless the yaml sets it.

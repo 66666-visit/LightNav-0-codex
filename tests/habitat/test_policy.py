@@ -22,6 +22,7 @@ from lightnav.inference.policies import NavigationPolicy
 from lightnav.inference.samples import build_vln_traj_sample
 from lightnav.memory.manager import MemoryManager
 from lightnav.memory.memory_writer import MockSceneExtractor
+from lightnav.memory.place_recognition import MockPlaceDescriptorExtractor
 from lightnav.memory.schemas import DetectedObject, MemoryContext, SceneExtraction
 from lightnav.memory.yolo_scene_extractor import YOLOSceneExtractor
 from lightnav.traj_vocab import RVQBundle
@@ -322,6 +323,255 @@ def test_memory_strategies_preserve_rvq_slowfast_prompt_format(capsys, strategy:
     policy.close_episode()
 
 
+def test_topological_place_memory_reaches_rvq_prompt_without_changing_video(capsys) -> None:
+    instruction = "return to the couch"
+    engine = MemoryStubEngine()
+    engine.bundle.action_method = "rvq"
+    engine.bundle.slowfast_tiers = [
+        {"name": "current", "age_lo": 0, "age_hi": 1, "mode": "dense",
+         "pool_spatial": 1, "pool_mode": "avg"},
+    ]
+    engine._text = "<act_l0_1><act_l1_0>"
+    manager = MemoryManager(
+        extractor=MockSceneExtractor({
+            0: SceneExtraction(detections=[DetectedObject("couch", 0.9)], confidence=0.9),
+        }),
+        strategy="hierarchical", place_enabled=True,
+        place_extractor=MockPlaceDescriptorExtractor({0: (1.0, 0.0, 0.0)}),
+    )
+    policy = TrajVocabVLNCEPolicy(
+        engine, None, dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        rvq_bundle=_build_rvq_bundle(), memory_enabled=True, memory_manager=manager,
+        memory_verbose=True,
+    )
+
+    policy.reset({"instruction": {"text": instruction}})
+    policy.act({"rgb": _rgb_frame()})
+    actual = engine.samples[-1]
+    original = build_vln_traj_sample(
+        policy.agent._get_video_tensor(), policy.agent.instruction,
+        list(policy.agent._history_frame_ids), engine.bundle,
+    )
+    prompt = actual["conversations"][0]["value"]
+    base = original["conversations"][0]["value"]
+    assert "[long:current_place" in prompt
+    assert "Current RGB view detected couch" in prompt
+    assert prompt.index("[long:current_place") < prompt.index("[short:current_observation")
+    assert f"<navigation_task>{instruction}</navigation_task>" in prompt
+    assert prompt.count("<video>") == base.count("<video>")
+    assert actual["conversations"][1] == original["conversations"][1]
+    assert len(actual["video_segments"]) == len(original["video_segments"])
+    for actual_segment, original_segment in zip(
+        actual["video_segments"], original["video_segments"]
+    ):
+        assert actual_segment["frame_indices"] == original_segment["frame_indices"]
+        assert torch.equal(actual_segment["video"], original_segment["video"])
+    assert actual["slowfast_abs_frame_indices"] is True
+    assert actual["_allow_vit_cache"] is True
+    assert actual["_skip_normalize"] is True
+    assert "coarse-to-fine trajectory tokens" in prompt
+    diagnostic = json.loads(next(
+        line.removeprefix("[memory] ") for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[memory] ")
+    ))
+    assert diagnostic["place_id"] == manager.topological_memory.current_place_id
+    assert diagnostic["memory_episode_id"] == manager.working.state.episode_id
+    assert diagnostic["place_similarity"] is None
+    assert diagnostic["place_created"] is True
+    assert diagnostic["place_matched"] is False
+    assert diagnostic["place_revisited"] is False
+    assert diagnostic["place_transition"] is None
+    assert diagnostic["place_extraction_attempted"] is True
+    assert diagnostic["place_extraction_ms"] >= 0.0
+    assert diagnostic["graph_nodes"] == 1
+    assert diagnostic["graph_edges"] == 0
+    assert diagnostic["topology_nodes"] == 1
+    assert diagnostic["topology_edges"] == 0
+    assert diagnostic["place_observation_count"] == 1
+    assert diagnostic["place_visit_count"] == 1
+    assert diagnostic["long_memory_retrieved"] >= 1
+    assert diagnostic["injected_memory_chars"] <= 600
+    assert "[long:current_place" in diagnostic["injected_memory_text"]
+    assert policy.last_memory_diagnostic == diagnostic
+    assert policy.last_model_inference_ms >= 0.0
+    assert policy.last_prompt_chars == len(prompt)
+    policy.close_episode()
+
+
+def test_topology_diagnostics_track_actual_extractions_over_seven_policy_steps(capsys) -> None:
+    instruction = "find the couch and then the table"
+    engine = MemoryStubEngine()
+    engine.bundle.action_method = "rvq"
+    engine.bundle.slowfast_tiers = [
+        {"name": "current", "age_lo": 0, "age_hi": 1, "mode": "dense",
+         "pool_spatial": 1, "pool_mode": "avg"},
+    ]
+    engine._text = "<act_l0_1><act_l1_0>"
+    descriptor = MockPlaceDescriptorExtractor({
+        0: (1.0, 0.0), 5: (0.0, 1.0),
+    })
+    manager = MemoryManager(
+        extractor=MockSceneExtractor({
+            0: SceneExtraction(detections=[
+                DetectedObject("couch", 0.9), DetectedObject("chair", 0.7),
+            ], confidence=0.9),
+            5: SceneExtraction(detections=[DetectedObject("table", 0.8)], confidence=0.8),
+        }),
+        strategy="hierarchical", place_enabled=True,
+        place_extractor=descriptor, place_every_n_steps=5,
+    )
+    policy = TrajVocabVLNCEPolicy(
+        engine, None, dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        rvq_bundle=_build_rvq_bundle(), memory_enabled=True, memory_manager=manager,
+        memory_verbose=True,
+    )
+    policy.reset({"instruction": {"text": instruction}})
+    try:
+        for step in range(7):
+            policy.act({"rgb": _rgb_frame()})
+            diagnostic = json.loads(next(
+                line.removeprefix("[memory] ") for line in capsys.readouterr().out.splitlines()
+                if line.startswith("[memory] ")
+            ))
+            assert diagnostic["step"] == step
+            assert policy.last_memory_diagnostic == diagnostic
+            assert diagnostic["place_extraction_attempted"] is (step in {0, 5})
+            if step in {0, 5}:
+                assert diagnostic["place_extraction_ms"] >= 0.0
+            else:
+                assert diagnostic["place_extraction_ms"] is None
+            assert descriptor.calls == [sampled for sampled in (0, 5) if sampled <= step]
+            assert diagnostic["graph_nodes"] == (2 if step < 5 else 3)
+            assert diagnostic["graph_edges"] == 0
+            assert diagnostic["scene_graph_nodes"] == diagnostic["graph_nodes"]
+            assert diagnostic["scene_graph_edges"] == diagnostic["graph_edges"]
+            assert diagnostic["topology_nodes"] == (1 if step < 5 else 2)
+            assert diagnostic["topology_edges"] == (0 if step < 5 else 1)
+            assert diagnostic["place_id"] == ("place_000" if step < 5 else "place_001")
+            assert manager.topological_memory.current_place_id == diagnostic["place_id"]
+            if step not in {0, 5}:
+                assert manager.last_place_result is None
+                assert diagnostic["place_similarity"] is None
+                assert diagnostic["place_transition"] is None
+                assert diagnostic["place_created"] is False
+                assert diagnostic["place_matched"] is False
+                assert diagnostic["place_revisited"] is False
+            if step == 5:
+                assert manager.last_place_result is not None
+                assert diagnostic["place_similarity"] == pytest.approx(0.0)
+                assert diagnostic["place_transition"]["relation_type"] == "observed_transition"
+                assert diagnostic["place_transition"]["source_place_id"] == "place_000"
+                assert diagnostic["place_transition"]["target_place_id"] == "place_001"
+
+            actual = engine.samples[-1]
+            original = build_vln_traj_sample(
+                policy.agent._get_video_tensor(), policy.agent.instruction,
+                list(policy.agent._history_frame_ids), engine.bundle,
+            )
+            prompt = actual["conversations"][0]["value"]
+            assert f"<navigation_task>{instruction}</navigation_task>" in prompt
+            assert prompt.count("<video>") == original["conversations"][0]["value"].count(
+                "<video>"
+            )
+            assert actual["conversations"][1] == original["conversations"][1]
+            assert actual["slowfast_abs_frame_indices"] is True
+            assert len(actual["video_segments"]) == len(original["video_segments"])
+            for actual_segment, original_segment in zip(
+                actual["video_segments"], original["video_segments"]
+            ):
+                assert actual_segment["frame_indices"] == original_segment["frame_indices"]
+                assert torch.equal(actual_segment["video"], original_segment["video"])
+            assert "coarse-to-fine trajectory tokens" in prompt
+            assert policy.get_info()["rvq_codes"] == [1, 0]
+            assert policy.last_prompt_chars == len(prompt)
+    finally:
+        policy.close_episode()
+
+
+def test_topology_extraction_failure_is_diagnosed_without_stale_place_state(
+    capsys, caplog,
+) -> None:
+    class FailsAtFive(MockPlaceDescriptorExtractor):
+        def extract(self, packet):
+            if packet.step_id == 5:
+                self.calls.append(packet.step_id)
+                raise RuntimeError("scheduled descriptor failure")
+            return super().extract(packet)
+
+    descriptor = FailsAtFive({0: (1.0, 0.0), 5: (0.0, 1.0)})
+    manager = MemoryManager(
+        strategy="hierarchical", place_enabled=True,
+        place_extractor=descriptor, place_every_n_steps=5,
+    )
+    engine = MemoryStubEngine()
+    policy = TrajVocabVLNCEPolicy(
+        engine, _build_centroids(), dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        memory_enabled=True, memory_manager=manager, memory_verbose=True,
+    )
+    policy.reset({"instruction": {"text": "return to chair"}})
+    try:
+        with caplog.at_level("WARNING"):
+            for step in range(7):
+                policy.act({"rgb": _rgb_frame()})
+                diagnostic = json.loads(next(
+                    line.removeprefix("[memory] ")
+                    for line in capsys.readouterr().out.splitlines()
+                    if line.startswith("[memory] ")
+                ))
+                if step == 5:
+                    assert diagnostic["place_extraction_attempted"] is True
+                    assert diagnostic["place_extraction_ms"] >= 0.0
+                    assert "scheduled descriptor failure" in diagnostic["place_extraction_error"]
+                    assert diagnostic["place_similarity"] is None
+                    assert diagnostic["place_transition"] is None
+                    assert manager.last_place_result is None
+                    assert diagnostic["place_id"] == "place_000"
+                    assert diagnostic["topology_nodes"] == 1
+                    assert diagnostic["topology_edges"] == 0
+                if step == 6:
+                    assert diagnostic["place_extraction_attempted"] is False
+                    assert diagnostic["place_extraction_ms"] is None
+                    assert diagnostic["place_extraction_error"] is None
+                    assert diagnostic["place_similarity"] is None
+                    assert diagnostic["place_transition"] is None
+                    assert diagnostic["place_id"] == "place_000"
+        assert descriptor.calls == [0, 5]
+        assert "place descriptor/update failed at step=5" in caplog.text
+        assert "scheduled descriptor failure" in caplog.text
+        assert len(manager.topological_memory.nodes) == 1
+        assert len(manager.episodic.query(kind="place_observation")) == 1
+    finally:
+        policy.close_episode()
+
+
+def test_memory_diagnostic_is_available_to_runner_without_verbose(capsys) -> None:
+    engine = MemoryStubEngine()
+    manager = MemoryManager(
+        strategy="hierarchical", place_enabled=True,
+        place_extractor=MockPlaceDescriptorExtractor({0: (1.0, 0.0)}),
+    )
+    policy = TrajVocabVLNCEPolicy(
+        engine, _build_centroids(), dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        memory_enabled=True, memory_manager=manager, memory_verbose=False,
+    )
+    policy.reset({"instruction": {"text": "find the couch"}})
+    try:
+        policy.act({"rgb": _rgb_frame()})
+        assert capsys.readouterr().out == ""
+        assert policy.last_memory_diagnostic["place_extraction_attempted"] is True
+        assert policy.last_memory_diagnostic["topology_nodes"] == 1
+        assert policy.last_memory_diagnostic["graph_nodes"] == 0
+        assert policy.last_model_inference_ms >= 0.0
+        assert policy.last_prompt_chars == len(engine.samples[-1]["conversations"][0]["value"])
+    finally:
+        policy.close_episode()
+    assert policy.last_memory_diagnostic is None
+
+
 @pytest.mark.parametrize("strategy", ["flat", "hierarchical"])
 def test_null_memory_keeps_first_prompt_identical_to_original_sample(strategy: str) -> None:
     engine = MemoryStubEngine()
@@ -386,6 +636,7 @@ def test_local_yolo_memory_reaches_prompt_and_verbose_diagnostics(tmp_path, caps
     assert first_prompt.count("<video>") == 1
     assert "Observed chair" in first_prompt
     assert diagnostic["extraction_attempted"] is True
+    assert diagnostic["yolo_detection_ms"] >= 0.0
     assert diagnostic["objects"][0]["label"] == "chair"
     assert diagnostic["objects"][0]["confidence"] == pytest.approx(0.88)
     assert diagnostic["events_written"] >= 1
@@ -402,6 +653,7 @@ def test_local_yolo_memory_reaches_prompt_and_verbose_diagnostics(tmp_path, caps
     ))
     assert skipped_diagnostic["step"] == 1
     assert skipped_diagnostic["extraction_attempted"] is False
+    assert skipped_diagnostic["yolo_detection_ms"] is None
     assert skipped_diagnostic["objects"] == []
     assert detector.calls == 1
 

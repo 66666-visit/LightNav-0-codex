@@ -141,6 +141,7 @@ class LayerMemoryItem:
     evidence_refs: list[ObservationEvidence] = field(default_factory=list)
     importance: float = 0.5
     label: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

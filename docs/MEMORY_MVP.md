@@ -16,7 +16,7 @@ Habitat RGB + instruction + previous policy command/prediction
     -> ObservationPacket (RGB is transient)
     -> MemoryWriter / NullSceneExtractor or local YOLOSceneExtractor
     -> WorkingMemoryStore + EpisodicMemory + SceneGraph
-    -> MemoryRetriever (visual priority, instruction, place, recency, quality; top_k/char cap)
+    -> MemoryRetriever (flat) OR L1/L2/L3 retrieval + MemoryFusion (hierarchical)
     -> MemoryContext
     -> inject_memory_context(original VLN sample)
     -> VLNInferenceEngine.generate -> trajectory/RVQ decoding -> Habitat action
@@ -81,6 +81,11 @@ frame, then indexes that writer's events in three distinct episode-local stores:
   label is not a physical instance identity. Only existing evidenced graph
   relations can be retrieved; indexing creates no spatial edge.
 
+When `--memory_place_enabled` is set with hierarchical `long`, L3 retrieval
+uses `TopologicalMemory` instead. `SemanticIndex` remains available for the
+existing hierarchical mode without place recognition, so earlier experiments
+retain their original retrieval behavior.
+
 `MemoryManager.retrieve_layers()` queries each enabled store independently.
 `MemoryFusion` then presents current observations, historical events, and
 category summaries with layer/step/confidence/source/evidence labels. It uses
@@ -103,6 +108,67 @@ For one AutoDL R2R episode using the existing local YOLO weights, add
 `--memory_strategy hierarchical --memory_layers short,mid,long` to the
 `CLIENT_ARGS` in the YOLO command below. `--verbose` includes `layer_contexts`
 and the final `injected_memory_text` in each `[memory]` JSON line.
+
+## RGB visual place graph (optional L3)
+
+The optional path is `RGB -> local DINOv2-Small patch tokens -> mean pooling and
+L2 normalization -> cosine place match -> episode-local PlaceNode/PlaceEdge ->
+L3 retrieval -> MemoryFusion -> existing Prompt adapter`. The model loads on
+the first scheduled extraction, never when memory or the long place layer is
+off. The directory must already contain Hugging Face `config.json`,
+`preprocessor_config.json`, and local model weights; processor and model loading
+use `local_files_only=True`. No images are saved. Existing YOLO extraction runs
+once through `MemoryWriter`; the descriptor extractor reads the same current RGB
+only at steps 0, 5, 10, ... by default.
+
+A `PlaceNode` stores a normalized visual descriptor, first/latest observation
+steps, observation and visit counts, YOLO category summaries, and original
+event/node references. The category summary keeps each detection box as a
+separate observation; matching category names never establish physical instance
+identity. A `PlaceEdge` is directed `observed_transition` between two different
+recognized visual places. It requires an intervening executed-action event and
+records the previous/current descriptor observations plus action evidence.
+It **does not** verify a traversable connection or geometric adjacency.
+Without such motion evidence, a changed visual descriptor creates no edge.
+Matching a prior visual place after an unsupported view change updates its
+observation count without asserting a new physical visit.
+The default cosine threshold `0.85` is an initial setting awaiting Habitat
+calibration; visual aliasing and viewpoint changes can cause false matches or
+splits. The original SceneGraph's place hypotheses and spatial relations remain
+separate from these DINO visual clusters.
+
+L3 retrieval marks a descriptor from the current step as `current_place`; a
+carried visual place from an earlier step is `last_recognized_place`. It can
+return observed transition neighbors, evidence-backed historical revisits,
+and YOLO categories tied to the same descriptor-observed RGB step. When YOLO
+detects a class on a step without a place descriptor, that detection remains
+in episodic memory rather than being assigned to an unverified place.
+Fusion prioritizes the current visual place and removes repeated YOLO evidence
+across L1/L2/L3. The existing 600-character text cap is unchanged.
+
+In an inference environment with NumPy, this scripted Mock demo prints the
+step 0/5/10/20 place graph, three layer results, and fused Prompt text without
+loading DINO weights or Habitat:
+
+```bash
+PYTHONPATH=src python3 scripts/demo_topological_memory.py
+```
+
+After placing a real local DINOv2-Small directory and YOLO11n `.pt` file on
+AutoDL, use the existing one-episode Habitat setup with these client flags:
+
+```bash
+MODEL_PATH=/path/to/LightNav-0 GPU_IDS=0 EPISODES=1 MAX_STEPS=40 \
+  CLIENT_ARGS='--memory_enabled --memory_strategy hierarchical --memory_layers short,mid,long --memory_extractor yolo11 --memory_extractor_model_path /path/to/local/yolo11n.pt --memory_place_enabled --memory_place_model_path /path/to/local/dinov2-small --memory_place_extract_every_n_steps 5 --memory_place_similarity_threshold 0.85 --memory_place_device cpu --verbose' \
+  bash scripts/eval_habitat.sh
+```
+
+`[memory]` JSON lines include current `place_id`, top-1 `place_similarity`,
+creation/match/revisit/transition status, topological graph counts, place observation
+and visit counts, L3 retrieval count, errors, and the actual injected text.
+This task has not validated real DINO descriptors or the 0.85 threshold on
+Habitat; compare these logs against observed RGB before interpreting loop
+closures as real locations.
 
 `NullSceneExtractor` remains the default and supplies no semantic labels.
 The first RGB frame alone creates no place or object node and may yield an empty

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -147,6 +148,9 @@ class TrajVocabVLNCEPolicy:
         self._memory_step = 0
         self._last_executed_action: dict | None = None
         self._last_prediction: str | None = None
+        self.last_memory_diagnostic: dict[str, Any] | None = None
+        self.last_model_inference_ms: float | None = None
+        self.last_prompt_chars: int | None = None
 
         self._last_cluster_id: int | None = None
         self._last_rvq_codes: list[int] | None = None
@@ -182,6 +186,9 @@ class TrajVocabVLNCEPolicy:
 
     def close_episode(self) -> None:
         """Release the explicit memory of the current episode, if enabled."""
+        self.last_memory_diagnostic = None
+        self.last_model_inference_ms = None
+        self.last_prompt_chars = None
         if self._memory_episode_open:
             self.memory_manager.close_episode()
             self._memory_episode_open = False
@@ -194,6 +201,9 @@ class TrajVocabVLNCEPolicy:
 
     def stop_action(self) -> dict:
         """The explicit STOP: a zero velocity_control command (sets ``is_stop_called``)."""
+        self.last_memory_diagnostic = None
+        self.last_model_inference_ms = None
+        self.last_prompt_chars = None
         action = first_waypoint_to_velocity_cmd(
             np.zeros(3, dtype=np.float32), self.dt, self.lin_vel_range, self.ang_vel_range
         )
@@ -204,6 +214,10 @@ class TrajVocabVLNCEPolicy:
 
     def act(self, obs: dict[str, Any], info: dict[str, Any] | None = None) -> dict:
         """Run one inference step and return a Habitat ``velocity_control`` action dict."""
+        self.last_memory_diagnostic = None
+        self.last_model_inference_ms = None
+        self.last_prompt_chars = None
+        diagnostic: dict[str, Any] | None = None
         self.agent.observe(obs["rgb"])
         if self._memory_episode_open:
             from lightnav.memory.memory_context_builder import build_context_text, inject_memory_context
@@ -233,7 +247,7 @@ class TrajVocabVLNCEPolicy:
                 context,
                 max_chars=getattr(self.memory_manager, "max_context_chars", 600),
             )
-            if self.memory_verbose:
+            if self.memory_verbose or hasattr(self.memory_manager, "scene_graph"):
                 extractor = self.memory_manager.extractor
                 attempted = getattr(extractor, "last_attempt_step", None) == self._memory_step - 1
                 memory_text = build_context_text(
@@ -247,6 +261,9 @@ class TrajVocabVLNCEPolicy:
                     "extractor": type(extractor).__name__,
                     "extraction_attempted": attempted,
                     "extraction_error": getattr(extractor, "last_error", None) if attempted else None,
+                    "yolo_detection_ms": (
+                        getattr(extractor, "last_detection_ms", None) if attempted else None
+                    ),
                     "objects": [
                         {"label": event.description.removeprefix("Observed "),
                          "confidence": float(event.confidence)}
@@ -269,16 +286,70 @@ class TrajVocabVLNCEPolicy:
                         layer: [item.to_dict() for item in items]
                         for layer, items in self.memory_manager.last_layer_results.items()
                     }
-                print("[memory] " + json.dumps(diagnostic, ensure_ascii=False), flush=True)
-            text, _ = self.engine.generate(sample)
+                    if getattr(self.memory_manager, "topology_active", False):
+                        topology = self.memory_manager.topological_memory
+                        place_result = self.memory_manager.last_place_result
+                        place = (
+                            topology.get_node(topology.current_place_id)
+                            if topology.current_place_id is not None else None
+                        )
+                        diagnostic.update({
+                            "scene_graph_nodes": diagnostic["graph_nodes"],
+                            "scene_graph_edges": diagnostic["graph_edges"],
+                            "topology_nodes": len(topology.nodes),
+                            "topology_edges": len(topology.edges),
+                            "memory_episode_id": self.memory_manager.working.state.episode_id,
+                            "place_id": topology.current_place_id,
+                            "place_extraction_attempted": (
+                                self.memory_manager.last_place_extraction_attempted
+                            ),
+                            "place_extraction_ms": (
+                                self.memory_manager.last_place_extraction_ms
+                            ),
+                            "place_similarity": (
+                                place_result.top1_similarity if place_result else None
+                            ),
+                            "place_created": bool(place_result and place_result.created),
+                            "place_matched": bool(place_result and place_result.matched),
+                            "place_revisited": bool(place_result and place_result.revisited),
+                            "place_transition": (
+                                place_result.transition.to_dict()
+                                if place_result and place_result.transition else None
+                            ),
+                            "place_observation_count": place.observation_count if place else 0,
+                            "place_visit_count": place.visit_count if place else 0,
+                            "long_memory_retrieved": len(
+                                self.memory_manager.last_layer_results.get("long", [])
+                            ),
+                            "place_extraction_error": self.memory_manager.last_place_error,
+                        })
+            started = perf_counter()
+            try:
+                text, _ = self.engine.generate(sample)
+            finally:
+                self.last_model_inference_ms = (perf_counter() - started) * 1000.0
         else:
-            text, _ = self.engine.generate_from_frames(
-                self.agent._get_video_tensor(),
-                self.agent.instruction,
-                predict_horizon=1,
-                frame_ids=list(self.agent._history_frame_ids),
-                task_type="vlnce_traj",
-            )
+            started = perf_counter()
+            try:
+                text, _ = self.engine.generate_from_frames(
+                    self.agent._get_video_tensor(),
+                    self.agent.instruction,
+                    predict_horizon=1,
+                    frame_ids=list(self.agent._history_frame_ids),
+                    task_type="vlnce_traj",
+                )
+            finally:
+                self.last_model_inference_ms = (perf_counter() - started) * 1000.0
+        prompt_chars = getattr(self.engine, "last_prompt_chars", None)
+        if isinstance(prompt_chars, int) and prompt_chars >= 0:
+            self.last_prompt_chars = prompt_chars
+        elif self._memory_episode_open:
+            self.last_prompt_chars = len(sample["conversations"][0]["value"])
+        if diagnostic is not None:
+            diagnostic["prompt_chars"] = self.last_prompt_chars
+            self.last_memory_diagnostic = diagnostic
+            if self.memory_verbose:
+                print("[memory] " + json.dumps(diagnostic, ensure_ascii=False), flush=True)
         self._last_raw_text = text
 
         try:

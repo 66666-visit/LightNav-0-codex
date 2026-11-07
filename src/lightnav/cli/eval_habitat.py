@@ -58,6 +58,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--output_dir", default=_DEFAULTS.output_dir)
     p.add_argument(
+        "--seed", type=int, default=_DEFAULTS.seed,
+        help="Set the client inference random seed; server seed is set separately.",
+    )
+    p.add_argument(
+        "--strict_full_eval", action="store_true",
+        help="Require all loaded val_unseen episodes once with the standard 500-step cap.",
+    )
+    p.add_argument(
+        "--resume", action="store_true",
+        help="Skip completed episode IDs already recorded in this output directory.",
+    )
+    p.add_argument(
         "--languages",
         nargs="+",
         default=None,
@@ -151,6 +163,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=_DEFAULTS.memory.extract_every_n_steps,
         help="Run detection at step 0 and every N steps thereafter (default: 5).",
     )
+    p.add_argument(
+        "--memory_place_enabled", action="store_true",
+        help="Enable DINOv2 visual place graph in hierarchical long memory (default: off).",
+    )
+    p.add_argument(
+        "--memory_place_model_path", default=_DEFAULTS.memory.place_model_path,
+        help="Existing local Hugging Face DINOv2-Small model directory; never downloaded.",
+    )
+    p.add_argument(
+        "--memory_place_extract_every_n_steps", type=int,
+        default=_DEFAULTS.memory.place_extract_every_n_steps,
+        help="Extract a place descriptor at step 0 and every N steps (default: 5).",
+    )
+    p.add_argument(
+        "--memory_place_similarity_threshold", type=float,
+        default=_DEFAULTS.memory.place_similarity_threshold,
+        help="Cosine match threshold (initial 0.85; requires Habitat calibration).",
+    )
+    p.add_argument(
+        "--memory_place_device", default=_DEFAULTS.memory.place_device,
+        help="DINOv2 inference device, e.g. cpu or cuda:0 (default: cpu).",
+    )
 
     # Visualisation (docs/VISUALIZATION.md); needs `pip install 'lightnav[video]'`.
     viz = p.add_argument_group("visualisation")
@@ -231,6 +265,11 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
             extractor_device=args.memory_extractor_device,
             extractor_confidence=args.memory_extractor_confidence,
             extract_every_n_steps=args.memory_extract_every_n_steps,
+            place_enabled=args.memory_place_enabled,
+            place_model_path=args.memory_place_model_path,
+            place_extract_every_n_steps=args.memory_place_extract_every_n_steps,
+            place_similarity_threshold=args.memory_place_similarity_threshold,
+            place_device=args.memory_place_device,
         ),
         save_video=args.save_video,
         video_fps=args.video_fps,
@@ -238,6 +277,9 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
         cam_height=args.cam_height,
         waypoint_dt_s=args.waypoint_dt_s,
         record_dir=args.record_dir,
+        seed=args.seed,
+        strict_full_eval=args.strict_full_eval,
+        resume=args.resume,
     )
 
 

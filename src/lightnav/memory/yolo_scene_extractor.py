@@ -12,6 +12,7 @@ import logging
 import math
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -54,6 +55,7 @@ class YOLOSceneExtractor:
         self.source = f"ultralytics_yolo:{path.name}"
         self.last_attempt_step: int | None = None
         self.last_error: str | None = None
+        self.last_detection_ms: float | None = None
 
         if model_factory is None:
             try:
@@ -74,16 +76,19 @@ class YOLOSceneExtractor:
     def reset_episode(self, episode_id: str, instruction: str) -> None:
         self.last_attempt_step = None
         self.last_error = None
+        self.last_detection_ms = None
 
     def should_extract(self, step_id: int) -> bool:
         """Run on the first frame (step 0) and every N observations thereafter."""
         return step_id >= 0 and step_id % self.every_n_steps == 0
 
     def extract(self, packet: ObservationPacket) -> SceneExtraction:
+        self.last_detection_ms = None
         if not self.should_extract(packet.step_id):
             return SceneExtraction()
         self.last_attempt_step = packet.step_id
         self.last_error = None
+        started = perf_counter()
         try:
             rgb = np.asarray(packet.rgb)
             if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
@@ -113,10 +118,13 @@ class YOLOSceneExtractor:
                 packet.step_id, self.model_path, self.device, exc, exc_info=True,
             )
             return SceneExtraction()
+        finally:
+            self.last_detection_ms = (perf_counter() - started) * 1000.0
 
     def close_episode(self) -> None:
         self.last_attempt_step = None
         self.last_error = None
+        self.last_detection_ms = None
 
     def _parse_results(self, results: Any) -> list[DetectedObject]:
         if not results:

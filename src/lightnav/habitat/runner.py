@@ -16,7 +16,9 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import math
 import os
+import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +27,14 @@ from typing import Any, Callable
 import numpy as np
 
 from lightnav.eval_config import get_task_params, load_eval_config, resolve_asset_path
+from lightnav.habitat.experiment_integrity import (
+    archive_unfinished_diagnostics,
+    check_coverage,
+    read_jsonl,
+    repair_interrupted_jsonl_tail,
+    validate_manifest,
+    write_or_match_manifest,
+)
 from lightnav.habitat.policy import TrajVocabVLNCEPolicy, extract_instruction
 from lightnav.habitat.results import (
     make_json_safe,
@@ -56,6 +66,11 @@ class MemoryConfig:
     extractor_device: str = "cpu"
     extractor_confidence: float = 0.25
     extract_every_n_steps: int = 5
+    place_enabled: bool = False
+    place_model_path: str = ""
+    place_extract_every_n_steps: int = 5
+    place_similarity_threshold: float = 0.85
+    place_device: str = "cpu"
 
     def __post_init__(self) -> None:
         if self.top_k < 1 or self.max_context_chars < 1:
@@ -76,6 +91,20 @@ class MemoryConfig:
             raise ValueError("memory.extractor_confidence must be in (0, 1]")
         if not isinstance(self.extract_every_n_steps, int) or self.extract_every_n_steps < 1:
             raise ValueError("memory.extract_every_n_steps must be a positive integer")
+        if (
+            self.enabled and self.place_enabled and self.strategy == "hierarchical"
+            and "long" in self.layers and not self.place_model_path
+        ):
+            raise ValueError("memory.place_model_path is required for enabled place memory")
+        if (
+            not isinstance(self.place_extract_every_n_steps, int)
+            or self.place_extract_every_n_steps < 1
+        ):
+            raise ValueError("memory.place_extract_every_n_steps must be positive")
+        if not 0.0 < self.place_similarity_threshold <= 1.0:
+            raise ValueError("memory.place_similarity_threshold must be in (0, 1]")
+        if not isinstance(self.place_device, str) or not self.place_device.strip():
+            raise ValueError("memory.place_device must be nonempty")
 
 
 @dataclass
@@ -118,6 +147,9 @@ class HabitatEvalConfig:
     waypoint_dt_s: float = 0.1  # seconds per waypoint row assumed by the HUD readout only
     record_dir: str = ""
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    seed: int | None = None
+    strict_full_eval: bool = False
+    resume: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +345,7 @@ def build_velocity_policy(
         from lightnav.memory.manager import MemoryManager
 
         extractor = None
+        place_extractor = None
         if cfg.memory.extractor == "yolo11":
             from lightnav.memory.yolo_scene_extractor import YOLOSceneExtractor
 
@@ -322,12 +355,26 @@ def build_velocity_policy(
                 confidence=cfg.memory.extractor_confidence,
                 every_n_steps=cfg.memory.extract_every_n_steps,
             )
+        if (
+            cfg.memory.place_enabled and cfg.memory.strategy == "hierarchical"
+            and "long" in cfg.memory.layers
+        ):
+            from lightnav.memory.place_recognition import DINOv2PlaceDescriptorExtractor
+
+            place_extractor = DINOv2PlaceDescriptorExtractor(
+                model_path=cfg.memory.place_model_path,
+                device=cfg.memory.place_device,
+            )
         memory_manager = MemoryManager(
             extractor=extractor,
             top_k=cfg.memory.top_k,
             max_context_chars=cfg.memory.max_context_chars,
             strategy=cfg.memory.strategy,
             layers=cfg.memory.layers,
+            place_enabled=cfg.memory.place_enabled,
+            place_extractor=place_extractor,
+            place_every_n_steps=cfg.memory.place_extract_every_n_steps,
+            place_similarity_threshold=cfg.memory.place_similarity_threshold,
         )
     return TrajVocabVLNCEPolicy(
         engine,
@@ -636,9 +683,34 @@ def run_habitat_eval(
     env_factory = env_factory or _default_env_factory
     policy_factory = policy_factory or build_velocity_policy
 
+    if cfg.strict_full_eval and (
+        cfg.episodes != -1 or cfg.max_steps != 500 or cfg.force_stop_at_max_steps
+        or cfg.languages
+    ):
+        raise ValueError(
+            "formal R2R evaluation requires the full split, 500 steps, no forced STOP "
+            "and no client language filter"
+        )
+    if cfg.resume and not cfg.strict_full_eval:
+        raise ValueError("resume requires strict_full_eval and a loaded episode manifest")
+    if cfg.seed is not None:
+        random.seed(cfg.seed)
+        np.random.seed(cfg.seed)
+        try:
+            import torch
+        except ImportError:
+            pass
+        else:
+            torch.manual_seed(cfg.seed)
+
     output_dir = cfg.output_dir or "output/habitat_eval"
     os.makedirs(output_dir, exist_ok=True)
     results_jsonl = os.path.join(output_dir, "results.jsonl")
+    diagnostics_jsonl = os.path.join(output_dir, "memory_diagnostics.jsonl")
+    if cfg.strict_full_eval and not cfg.resume and os.path.exists(results_jsonl):
+        raise FileExistsError(
+            f"formal output already contains results: {results_jsonl}; use --resume"
+        )
 
     # Before the engine: a missing video dependency should fail in seconds, not after
     # the weights are loaded.
@@ -646,6 +718,47 @@ def run_habitat_eval(
 
     engine, bundle = engine_factory(cfg)
     env = env_factory(cfg)
+
+    try:
+        manifest = None
+        manifest_index: dict[tuple[str, str], int] = {}
+        if hasattr(env, "get_episode_manifest"):
+            manifest = validate_manifest(env.get_episode_manifest())
+            write_or_match_manifest(os.path.join(output_dir, "episode_manifest.json"), manifest)
+            manifest_index = {
+                (row["scene_id"], row["episode_id"]): index
+                for index, row in enumerate(manifest["episodes"])
+            }
+            print(f"Loaded {manifest['expected_count']} episodes on this shard", flush=True)
+        if cfg.strict_full_eval:
+            if manifest is None or manifest["split"] != "val_unseen" or not manifest["episodes"]:
+                raise ValueError("formal evaluation requires a nonempty val_unseen server manifest")
+        if cfg.resume:
+            for path in (results_jsonl, diagnostics_jsonl):
+                if repair_interrupted_jsonl_tail(path):
+                    print(f"Archived an incomplete final JSONL row from {path}", flush=True)
+        existing_results = (
+            read_jsonl(results_jsonl)
+            if cfg.resume and os.path.exists(results_jsonl) else []
+        )
+        if manifest is not None and existing_results:
+            check_coverage(existing_results, manifest, complete=False)
+        completed_keys = {
+            (str(row["scene_id"]), str(row["habitat_episode_id"]))
+            for row in existing_results
+        }
+        if cfg.resume:
+            archived = archive_unfinished_diagnostics(diagnostics_jsonl, completed_keys)
+            if archived:
+                print(f"Archived {archived} unfinished diagnostic steps before resume")
+        Path(diagnostics_jsonl).touch(exist_ok=True)
+    except BaseException:
+        try:
+            if viz is not None:
+                viz.close()
+        finally:
+            env.close()
+        raise
 
     sep = "=" * 60
     print(f"\n{sep}")
@@ -665,7 +778,7 @@ def run_habitat_eval(
         print(f"  Record:   {viz.record_run_dir}")
     print(f"{sep}\n", flush=True)
 
-    results: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = list(existing_results)
     skipped_lang = 0
     seen: set[tuple[Any, Any]] = set()
     n_run = 0
@@ -678,12 +791,19 @@ def run_habitat_eval(
 
             # (scene_id, episode_id): episode ids are scene-local in HM3D ObjectNav, so
             # a repeat of the pair (not the id alone) marks the env cycling back to the start.
-            habitat_ep_id = info.get("episode_id", "")
-            habitat_scene_id = info.get("scene_id", "")
+            habitat_ep_id = str(info.get("episode_id", ""))
+            habitat_scene_id = str(info.get("scene_id", ""))
             ep_key = (habitat_scene_id, habitat_ep_id)
             if ep_key in seen:
                 print(f"Full split completed: {len(seen)} unique episodes seen.", flush=True)
+                if cfg.strict_full_eval and len(seen) != manifest["expected_count"]:
+                    raise ValueError(
+                        f"episode iterator wrapped after {len(seen)} of "
+                        f"{manifest['expected_count']} loaded episodes"
+                    )
                 break
+            if cfg.strict_full_eval and ep_key not in manifest_index:
+                raise ValueError(f"episode iterator returned an unknown episode: {ep_key}")
             seen.add(ep_key)
 
             # Language-filtered episodes are skipped without stepping and do not
@@ -692,12 +812,18 @@ def run_habitat_eval(
                 skipped_lang += 1
                 continue
 
-            episode_id = f"episode_{n_run:03d}"
+            if ep_key in completed_keys:
+                print(f"Skipping already completed episode {ep_key}", flush=True)
+                continue
+
+            episode_number = manifest_index[ep_key] if cfg.strict_full_eval else n_run
+            episode_id = f"episode_{episode_number:03d}"
             print(
                 f"Episode {n_run + 1} ({episode_id}) [{habitat_scene_id} / {habitat_ep_id}]...",
                 flush=True,
             )
 
+            episode_start = time.monotonic()
             instruction = extract_instruction(obs)
             if policy is None:
                 policy = policy_factory(cfg, engine, bundle, info)
@@ -707,9 +833,13 @@ def run_habitat_eval(
 
             final_success: Any = False
             forced_stop_used = False
+            terminated = False
+            truncated = False
             min_distance_to_goal = float("inf")
             step = -1
             video_rel: str | None = None
+            episode_diagnostics: list[dict[str, Any]] = []
+            inference_latencies: list[float] = []
             try:
                 for step in range(cfg.max_steps):
                     if obs.get("rgb") is None:
@@ -753,6 +883,27 @@ def run_habitat_eval(
                         )
                     obs, _reward, terminated, truncated, info = env.step(action)
 
+                    model_ms = getattr(policy, "last_model_inference_ms", None)
+                    if model_ms is not None:
+                        inference_latencies.append(float(model_ms))
+                    diagnostic = getattr(policy, "last_memory_diagnostic", None)
+                    row = dict(diagnostic) if isinstance(diagnostic, dict) else {}
+                    row.update({
+                        "episode_key": {
+                            "scene_id": habitat_scene_id,
+                            "episode_id": habitat_ep_id,
+                        },
+                        "scene_id": habitat_scene_id,
+                        "habitat_episode_id": habitat_ep_id,
+                        "rollout_idx": 0,
+                        "step": step,
+                        "act_latency_ms": act_ms,
+                        "inference_latency_ms": model_ms,
+                        "prompt_chars": getattr(policy, "last_prompt_chars", None),
+                        "memory_enabled": cfg.memory.enabled,
+                    })
+                    episode_diagnostics.append(row)
+
                     dtg = _safe_scalar(info.get("distance_to_goal"), default=float("inf"))
                     if dtg < min_distance_to_goal:
                         min_distance_to_goal = dtg
@@ -769,6 +920,18 @@ def run_habitat_eval(
                 finally:
                     if hasattr(policy, "close_episode"):
                         policy.close_episode()
+
+            if cfg.strict_full_eval:
+                if not (terminated or truncated):
+                    raise ValueError(f"formal episode ended without Habitat termination: {ep_key}")
+                required_metrics = (
+                    "success", "oracle_success", "spl", "ndtw", "distance_to_goal",
+                )
+                for name in required_metrics:
+                    if name not in info or not math.isfinite(
+                        _safe_scalar(info[name], default=float("nan"))
+                    ):
+                        raise ValueError(f"formal episode {ep_key} lacks measured {name}")
 
             oracle_success_metric = info.get("oracle_success")
             if oracle_success_metric is None:
@@ -794,16 +957,31 @@ def run_habitat_eval(
                 "min_distance": min_distance_to_goal,
                 "instruction": instruction,
                 "termination_reason": info.get("termination_reason", "unknown"),
+                "terminated": bool(terminated),
+                "truncated": bool(truncated),
                 "forced_stop": forced_stop_used,
                 "termination_details": info.get("termination_details", {}),
+                "episode_time_sec": time.monotonic() - episode_start,
+                "inference_latency_ms_mean": (
+                    sum(inference_latencies) / len(inference_latencies)
+                    if inference_latencies else None
+                ),
             }
             if video_rel is not None:
                 result["video"] = video_rel
-            results.append(result)
+            if cfg.strict_full_eval and result["steps"] < 1:
+                raise ValueError(f"formal episode has no completed step: {ep_key}")
+            with open(diagnostics_jsonl, "a", encoding="utf-8") as f:
+                for row in episode_diagnostics:
+                    f.write(json.dumps(make_json_safe(row)) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
             with open(results_jsonl, "a", encoding="utf-8") as f:
                 f.write(json.dumps(make_json_safe(result)) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
+            results.append(result)
+            completed_keys.add(ep_key)
 
             status = "OK" if result["success"] else "FAIL"
             print(
@@ -836,10 +1014,20 @@ def run_habitat_eval(
                 env.close()
 
     elapsed = time.time() - start_time
+    if cfg.strict_full_eval:
+        check_coverage(results, manifest, complete=True)
     if skipped_lang > 0:
         print(f"\nSkipped {skipped_lang} episodes due to language filter.")
 
-    extra_info = {"model": cfg.model_path, "backend": cfg.backend}
+    extra_info = {
+        "model": cfg.model_path,
+        "backend": cfg.backend,
+        "total_episode_time_sec": sum(
+            float(row["episode_time_sec"])
+            for row in results if row.get("episode_time_sec") is not None
+        ),
+        "resumed": cfg.resume,
+    }
     if any(r.get("object_category") for r in results):
         print_objectnav_summary(results, elapsed, output_dir, extra_info=extra_info)
     else:

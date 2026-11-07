@@ -51,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--split-id", type=int, default=None, help="Shard index (0-based)")
     parser.add_argument("--split-num", type=int, default=None, help="Number of shards")
+    parser.add_argument("--seed", type=int, default=None, help="Habitat dataset/simulator seed")
+    parser.add_argument(
+        "--strict-full-eval", action="store_true",
+        help="Require R2R val_unseen, 500-step client/server/yaml limits, and no early stop",
+    )
     parser.add_argument(
         "--early-stop-rotation",
         type=int,
@@ -108,6 +113,12 @@ def main(argv: Optional[list] = None) -> None:
         parser.error("--image-height and --image-width must be provided together")
     if (args.split_id is None) != (args.split_num is None):
         parser.error("--split-id and --split-num must be provided together")
+    if args.strict_full_eval and (
+        args.task != "vlnce" or args.max_steps != 500
+        or args.early_stop_rotation or args.early_stop_steps
+        or args.split not in (None, "val_unseen")
+    ):
+        parser.error("formal R2R evaluation requires vlnce val_unseen, 500 steps, no early stop")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -144,6 +155,9 @@ def main(argv: Optional[list] = None) -> None:
         if args.task != "objectnav":
             parser.error("--navmesh-cell-height only applies to --task objectnav")
         kwargs["navmesh_cell_height"] = args.navmesh_cell_height
+    if args.task == "vlnce":
+        kwargs["seed"] = args.seed
+        kwargs["strict_full_eval"] = args.strict_full_eval
 
     logger.info("Starting Habitat server")
     logger.info("task=%s config=%s port=%d gpu=%d", args.task, args.config, args.port, gpu_id)

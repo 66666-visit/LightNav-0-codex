@@ -126,6 +126,10 @@ class RemoteEnvClient:
             response.get("info", {}),
         )
 
+    def get_episode_manifest(self) -> dict:
+        """Read loaded evaluator IDs; this metadata is never sent to a policy."""
+        return self._send_command("manifest")["manifest"]
+
     def close(self) -> None:
         if self._connected:
             try:
