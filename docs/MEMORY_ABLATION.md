@@ -1,10 +1,11 @@
-# Full R2R val_unseen memory ablation
+# Full R2R val_unseen memory ablation and A/B comparison
 
-This is the formal four-condition evaluation path. The earlier one-episode
+This is the formal evaluation path. It runs all four conditions by default, or
+only the conditions named by `--groups`. The earlier one-episode
 commands in [MEMORY_MVP.md](MEMORY_MVP.md) are smoke tests, not formal results.
 The shipped R2R `val_unseen` split contains **1,839 episodes**. The formal
 launcher reads the actual server dataset manifests before starting inference,
-prints the loaded count, requires 1,839 by default, and checks that every
+prints the loaded count, requires exactly 1,839, and checks that every
 loaded `(scene_id, episode_id)` appears exactly once in each condition.
 
 ## Prerequisites and run
@@ -25,6 +26,18 @@ export GPU_IDS=0
 export SEED=42
 bash scripts/run_memory_ablation.sh --output-root output/memory_ablation_001
 ```
+
+For the original LightNav versus the complete hierarchical topology agent:
+
+```bash
+bash scripts/run_memory_ablation.sh \
+  --output-root output/memory_ab_001 \
+  --groups baseline_off,hierarchical_topology
+```
+
+This A/B command runs only those two groups. Omit `--groups` to retain the
+original four-condition experiment. Group names must be unique and selected
+from the table below; the order in `--groups` is the comparison direction.
 
 `--output-root` must name a new directory. If the R2R files are outside the
 paths in `habitat_server/configs/vlnce_r2r.yaml`, set `DATA_PATH` and
@@ -61,8 +74,12 @@ Keep the original output directory and use the **same environment variables**:
 bash scripts/run_memory_ablation.sh --resume output/memory_ablation_001
 ```
 
+For the A/B example, use `--resume output/memory_ab_001`. The saved group list
+is used automatically; supplying `--groups` again is optional and must match
+the original selection exactly.
+
 The immutable `ablation_run.json` rejects changed checkpoint, R2R config
-contents, paths, seed, shard layout, or other common settings. An arm with
+contents, paths, seed, shard layout, group selection, or other common settings. An arm with
 `formal_complete.json` is rechecked against its manifest and skipped. An
 unfinished arm resumes its shard results, skipping already completed Episode
 IDs. Completed JSONL rows remain on disk; duplicate Episode IDs or malformed
@@ -77,14 +94,11 @@ are also archived; previously completed Episode rows remain in place.
 
 ```text
 output/memory_ablation_001/
-  ablation_run.json                 immutable common run settings
+  ablation_run.json                 immutable common run settings and selected groups
   episode_manifest.json            shared loaded R2R Episode IDs
-  comparison.json                  four-arm means, intervals, paired deltas
+  comparison.json                  selected-arm means, intervals, paired deltas
   comparison.csv                   compact metric table
-  baseline_off/
-  flat_memory/
-  hierarchical_memory/
-  hierarchical_topology/
+  <one directory per selected group>/
     config_snapshot.yaml           JSON-formatted YAML of actual CLI/server settings
     episode_manifest.json          same IDs as the shared manifest
     results.jsonl                  one merged row per completed Episode
@@ -103,7 +117,7 @@ events, injected record count, and prompt character count. The baseline has
 per-step inference and prompt diagnostics without memory extraction. Missing
 measurements remain missing; the comparison tool does not invent values.
 
-The formal completion gate requires the four conditions to use the same
+The formal completion gate requires all selected conditions to use the same
 manifest, every shard and merged result to cover its assigned IDs once,
 complete per-step diagnostics, and a summary count equal to the loaded count.
 Formal results also require Habitat termination or truncation and measured SR,
@@ -111,7 +125,7 @@ OS, SPL, nDTW, and navigation error for every Episode.
 It writes `formal_complete.json` only after these checks pass. Output from a
 failed or interrupted arm is retained but is **not** a formal completed result.
 
-The launcher calls the comparison tool after all four arms finish. To inspect
+The launcher calls the comparison tool after all selected arms finish. To inspect
 an incomplete run without labeling it complete:
 
 ```bash
@@ -121,6 +135,9 @@ python3 scripts/compare_memory_ablation.py output/memory_ablation_001 --allow-in
 For a completed run, `comparison.json` includes 95% episode-bootstrap
 intervals and paired per-Episode differences for SR, OS, SPL, nDTW, NE,
 steps, and inference latency, plus measured run time and memory diagnostics.
+For A/B, the paired report also counts SR success-to-failure and
+failure-to-success Episodes; SR, SPL, nDTW, and NE paired differences each
+include a 95% bootstrap interval.
 The bootstrap RNG seed is separate from the Habitat evaluation seed.
 The comparison tool streams step diagnostics so a full validation set does not
 need to keep every Prompt text and layer record in memory at once.

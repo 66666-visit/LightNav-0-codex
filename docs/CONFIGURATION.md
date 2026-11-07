@@ -110,8 +110,10 @@ event, graph, retrieval, per-layer, and injected-prompt diagnostics. See
 
 For formal R2R validation, use [MEMORY_ABLATION.md](MEMORY_ABLATION.md).
 `scripts/run_memory_ablation.sh` requires `MODEL_PATH`, `YOLO_MODEL_PATH`, and
-`DINO_MODEL_PATH`; `--output-root DIR` creates a new four-arm experiment and
-`--resume DIR` resumes an interrupted one with the same settings. It fixes
+`DINO_MODEL_PATH` for the four-arm or topology A/B experiment. `--output-root DIR`
+creates a new run. `--groups baseline_off,hierarchical_topology` selects only
+the formal A/B pair; omitting it runs all four arms. `--resume DIR` restores
+the recorded group selection and rejects changes to it. The launcher fixes
 `EPISODES=-1`, `MAX_STEPS=500`, `NO_FORCE_STOP=1`, and `SPLIT=val_unseen`.
 `SEED` defaults to 42 and `GPU_IDS` to 0. The runner checks the actual loaded
 Episode manifest against exactly `EXPECTED_EPISODES=1839`, then verifies

@@ -102,9 +102,136 @@ class CompareMemoryAblationTest(unittest.TestCase):
                 ).hexdigest(),
             })
 
+    def _prepare_complete_ab(self) -> None:
+        selected = ("baseline_off", "hierarchical_topology")
+        _write_json(self.root / "ablation_run.json", {"groups": list(selected)})
+        manifest = {
+            "split": "val_unseen", "expected_count": 1839,
+            "episodes": [
+                {"scene_id": "scene_a", "episode_id": f"ep_{index}"}
+                for index in range(1839)
+            ],
+        }
+        _write_json(self.root / "episode_manifest.json", manifest)
+        digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        for name in selected:
+            directory = self.root / name
+            _write_json(directory / "episode_manifest.json", manifest)
+            config_path = directory / "config_snapshot.yaml"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["common"]["expected_episodes"] = 1839
+            _write_json(config_path, config)
+            records = []
+            diagnostics = []
+            for index in range(1839):
+                is_topology = name == "hierarchical_topology"
+                success = (index == 1) if is_topology else (index == 0)
+                records.append({
+                    "scene_id": "scene_a", "habitat_episode_id": f"ep_{index}",
+                    "episode_id": f"episode_{index:04d}",
+                    "success": success, "oracle_success": True,
+                    "spl": 0.6 if is_topology else 0.5,
+                    "ndtw": 0.75 if is_topology else 0.7,
+                    "final_distance": 1.8 if is_topology else 2.0,
+                    "steps": 1, "episode_time_sec": 2.0 if is_topology else 1.0,
+                    "inference_latency_ms_mean": 12.0 if is_topology else 10.0,
+                })
+                row = {
+                    "scene_id": "scene_a", "habitat_episode_id": f"ep_{index}",
+                    "step": 0, "inference_latency_ms": 12.0 if is_topology else 10.0,
+                    "prompt_chars": 150 if is_topology else 100,
+                }
+                if is_topology:
+                    row.update({
+                        "extraction_attempted": True, "yolo_detection_ms": 3.0,
+                        "injected_records": 1, "injected_memory_chars": 40,
+                        "place_extraction_attempted": True, "place_extraction_ms": 7.0,
+                        "topology_nodes": 1, "topology_edges": 0,
+                        "place_revisited": False, "place_transition": None,
+                    })
+                diagnostics.append(row)
+            _write_jsonl(directory / "results.jsonl", records)
+            _write_jsonl(directory / "memory_diagnostics.jsonl", diagnostics)
+            _write_json(directory / "summary.json", {
+                "num_episodes": 1839, "total_time_sec": 10.0, "metrics": {},
+            })
+            _write_json(directory / "formal_complete.json", {
+                "expected_count": 1839, "manifest_sha256": digest,
+            })
+
+    def test_selected_ab_comparison_uses_all_1839_paired_episode_ids(self) -> None:
+        self._prepare_complete_ab()
+        report = ablation.compare(self.root, samples=30, seed=7)
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["selected_groups"], [
+            "baseline_off", "hierarchical_topology",
+        ])
+        self.assertEqual(set(report["groups"]), {
+            "baseline_off", "hierarchical_topology",
+        })
+        self.assertEqual(len(report["per_episode"]), 1839)
+        pair = report["paired_differences"][
+            "hierarchical_topology_minus_baseline_off"
+        ]
+        self.assertEqual(pair["paired_count"], 1839)
+        self.assertEqual(pair["sr_flips"], {
+            "success_to_failure": 1, "failure_to_success": 1,
+        })
+        self.assertEqual(pair["per_episode"][0]["delta"]["SR_pct"], -100.0)
+        self.assertEqual(pair["per_episode"][1]["delta"]["SR_pct"], 100.0)
+        self.assertAlmostEqual(pair["metrics"]["SPL_pct"]["mean"], 10.0)
+        self.assertAlmostEqual(pair["metrics"]["nDTW_pct"]["mean"], 5.0)
+        self.assertAlmostEqual(pair["metrics"]["NE_m"]["mean"], -0.2)
+        for metric in ("SR_pct", "SPL_pct", "nDTW_pct", "NE_m"):
+            self.assertEqual(len(pair["metrics"][metric]["ci95"]), 2)
+        topology = report["groups"]["hierarchical_topology"]
+        self.assertEqual(topology["completed_episodes"], 1839)
+        self.assertEqual(topology["metrics"]["avg_steps"]["mean"], 1.0)
+        self.assertEqual(topology["runtime"]["total_episode_time_sec"], 3678.0)
+        self.assertEqual(topology["memory"]["yolo_detection"]["calls"], 1839)
+        self.assertEqual(topology["memory"]["dinov2_extraction"]["calls"], 1839)
+        self.assertEqual(topology["memory"]["topology_nodes_total"], 1839)
+        self.assertEqual(topology["memory"]["topology_edges_total"], 0)
+        ablation.write_report(self.root, report)
+        written = json.loads((self.root / "comparison.json").read_text(encoding="utf-8"))
+        self.assertEqual(written["selected_groups"], [
+            "baseline_off", "hierarchical_topology",
+        ])
+        self.assertTrue((self.root / "comparison.csv").is_file())
+
+    def test_selected_ab_missing_episode_cannot_be_formally_complete(self) -> None:
+        self._prepare_complete_ab()
+        path = self.root / "hierarchical_topology" / "results.jsonl"
+        rows = path.read_text(encoding="utf-8").splitlines()
+        path.write_text("\n".join(rows[:-1]) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "missing 1 manifest Episode"):
+            ablation.compare(self.root, samples=10)
+
+    def test_selected_ab_requires_identical_episode_manifest(self) -> None:
+        self._prepare_complete_ab()
+        path = self.root / "hierarchical_topology" / "episode_manifest.json"
+        changed = json.loads(path.read_text(encoding="utf-8"))
+        changed["episodes"][-1]["episode_id"] = "different_episode"
+        _write_json(path, changed)
+        with self.assertRaisesRegex(ValueError, "differs from the shared manifest"):
+            ablation.compare(self.root, samples=10)
+
+    def test_selected_groups_reject_unknown_duplicates_and_short_manifest(self) -> None:
+        for selected in (None, [], ["unknown"], ["baseline_off", "baseline_off"]):
+            _write_json(self.root / "ablation_run.json", {"groups": selected})
+            with self.subTest(selected=selected):
+                with self.assertRaisesRegex(ValueError, "groups must be"):
+                    ablation.compare(self.root)
+        _write_json(self.root / "ablation_run.json", {
+            "groups": ["baseline_off", "hierarchical_topology"],
+        })
+        with self.assertRaisesRegex(ValueError, "require 1839 Episode IDs"):
+            ablation.compare(self.root)
+
     def test_four_groups_metrics_paired_differences_and_real_diagnostics(self) -> None:
         report = ablation.compare(self.root, samples=100, seed=3)
         self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["selected_groups"], list(ablation.GROUPS))
         baseline = report["groups"]["baseline_off"]
         flat = report["groups"]["flat_memory"]
         topology = report["groups"]["hierarchical_topology"]

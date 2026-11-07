@@ -17,6 +17,38 @@ _EVAL_SCRIPT = _REPO / "scripts" / "eval_habitat.sh"
 
 
 class MemoryAblationLauncherTest(unittest.TestCase):
+    @staticmethod
+    def _fake_assets(temp: Path) -> tuple[Path, Path, Path]:
+        model = temp / "checkpoint"
+        model.mkdir()
+        yolo = temp / "yolo11n.pt"
+        yolo.write_bytes(b"local fake file; model is never loaded")
+        dino = temp / "dinov2-small"
+        dino.mkdir()
+        (dino / "config.json").write_text("{}", encoding="utf-8")
+        (dino / "preprocessor_config.json").write_text("{}", encoding="utf-8")
+        (dino / "model.safetensors").write_bytes(b"fake; model is never loaded")
+        return model, yolo, dino
+
+    def test_groups_reject_empty_unknown_duplicate_and_repeated_option(self) -> None:
+        for arguments, message in (
+            (["--groups", ""], "nonempty"),
+            (["--groups", ",baseline_off"], "nonempty"),
+            (["--groups", "baseline_off,"], "nonempty"),
+            (["--groups", "baseline_off,,hierarchical_topology"], "nonempty"),
+            (["--groups", "unknown"], "invalid --groups entry"),
+            (["--groups", "baseline_off,baseline_off"], "duplicate --groups entry"),
+            (["--groups", "baseline_off", "--groups", "hierarchical_topology"],
+             "--groups needs one comma-separated list"),
+        ):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    ["bash", str(_SCRIPT), *arguments], cwd=_REPO,
+                    text=True, capture_output=True, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
     def test_formal_run_rejects_short_episode_count_and_step_cap(self) -> None:
         for override, message in (
             ({"EPISODES": "1"}, "EPISODES must be -1"),
@@ -104,15 +136,7 @@ class MemoryAblationLauncherTest(unittest.TestCase):
     def test_resume_keeps_partial_files_and_records_measured_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
-            model = temp / "checkpoint"
-            model.mkdir()
-            yolo = temp / "yolo11n.pt"
-            yolo.write_bytes(b"local fake file; model is never loaded")
-            dino = temp / "dinov2-small"
-            dino.mkdir()
-            (dino / "config.json").write_text("{}", encoding="utf-8")
-            (dino / "preprocessor_config.json").write_text("{}", encoding="utf-8")
-            (dino / "model.safetensors").write_bytes(b"fake; model is never loaded")
+            model, yolo, dino = self._fake_assets(temp)
             output = temp / "ablation"
             env = dict(os.environ)
             env.update({
@@ -136,6 +160,9 @@ class MemoryAblationLauncherTest(unittest.TestCase):
             )
             self.assertNotEqual(first.returncode, 0)
             self.assertTrue((output / "ablation_run.json").is_file())
+            self.assertEqual(json.loads((output / "ablation_run.json").read_text())["groups"], [
+                "baseline_off", "flat_memory", "hierarchical_memory", "hierarchical_topology",
+            ])
             timing = output / "baseline_off" / "run_timing.json"
             attempts = json.loads(timing.read_text(encoding="utf-8"))["attempts"]
             self.assertEqual(len(attempts), 1)
@@ -165,6 +192,156 @@ class MemoryAblationLauncherTest(unittest.TestCase):
             self.assertNotEqual(mismatch.returncode, 0)
             self.assertIn("resume settings differ", mismatch.stderr)
             self.assertEqual(len(json.loads(timing.read_text())["attempts"]), 2)
+
+    def test_two_group_selection_and_resume_do_not_start_other_arms(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            model, yolo, dino = self._fake_assets(temp)
+            output = temp / "ablation_ab"
+            env = dict(os.environ)
+            env.update({
+                "MODEL_PATH": str(model), "YOLO_MODEL_PATH": str(yolo),
+                "DINO_MODEL_PATH": str(dino), "HABITAT_PYTHON": "/bin/false",
+                "CLIENT_PYTHON": "/bin/false", "GPU_IDS": "0", "SEED": "42",
+            })
+            for key in (
+                "CLIENT_ARGS", "SERVER_ARGS", "LANGUAGES", "LOG_DIR", "SUCCESS_DISTANCE",
+                "NAVMESH_CELL_HEIGHT", "EPISODES", "MAX_STEPS", "TASK", "SPLIT",
+            ):
+                env.pop(key, None)
+            chosen = "baseline_off,hierarchical_topology"
+            first = subprocess.run(
+                ["bash", str(_SCRIPT), "--output-root", str(output), "--groups", chosen],
+                cwd=_REPO, env=env, text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(first.returncode, 0)  # fake Habitat preflight
+            self.assertEqual(json.loads((output / "ablation_run.json").read_text())["groups"], [
+                "baseline_off", "hierarchical_topology",
+            ])
+            self.assertTrue((output / "baseline_off" / "run_timing.json").is_file())
+            self.assertFalse((output / "flat_memory").exists())
+            self.assertFalse((output / "hierarchical_memory").exists())
+
+            resumed = subprocess.run(
+                ["bash", str(_SCRIPT), "--resume", str(output)],
+                cwd=_REPO, env=env, text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(resumed.returncode, 0)
+            attempts = json.loads((output / "baseline_off" / "run_timing.json").read_text())[
+                "attempts"
+            ]
+            self.assertEqual(len(attempts), 2)
+            self.assertFalse((output / "flat_memory").exists())
+            self.assertFalse((output / "hierarchical_memory").exists())
+
+            mismatch = subprocess.run(
+                ["bash", str(_SCRIPT), "--resume", str(output),
+                 "--groups", "baseline_off,flat_memory"],
+                cwd=_REPO, env=env, text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(mismatch.returncode, 0)
+            self.assertIn("resume settings differ", mismatch.stderr)
+            self.assertEqual(len(json.loads(
+                (output / "baseline_off" / "run_timing.json").read_text()
+            )["attempts"]), 2)
+
+    def test_baseline_only_does_not_require_unused_detector_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            model = temp / "checkpoint"
+            model.mkdir()
+            output = temp / "baseline_only"
+            env = dict(os.environ)
+            env.update({
+                "MODEL_PATH": str(model), "HABITAT_PYTHON": "/bin/false",
+                "CLIENT_PYTHON": "/bin/false", "GPU_IDS": "0", "SEED": "42",
+            })
+            env.pop("YOLO_MODEL_PATH", None)
+            env.pop("DINO_MODEL_PATH", None)
+            for key in ("CLIENT_ARGS", "SERVER_ARGS", "LANGUAGES", "LOG_DIR"):
+                env.pop(key, None)
+            result = subprocess.run(
+                ["bash", str(_SCRIPT), "--output-root", str(output),
+                 "--groups", "baseline_off"],
+                cwd=_REPO, env=env, text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)  # fake Habitat preflight
+            self.assertTrue((output / "baseline_off" / "run_timing.json").is_file())
+            self.assertFalse((output / "hierarchical_topology").exists())
+            self.assertEqual(json.loads((output / "ablation_run.json").read_text())["groups"], [
+                "baseline_off",
+            ])
+
+    def test_legacy_four_group_snapshot_can_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            model, yolo, dino = self._fake_assets(temp)
+            output = temp / "legacy"
+            env = dict(os.environ)
+            env.update({
+                "MODEL_PATH": str(model), "YOLO_MODEL_PATH": str(yolo),
+                "DINO_MODEL_PATH": str(dino), "HABITAT_PYTHON": "/bin/false",
+                "CLIENT_PYTHON": "/bin/false", "GPU_IDS": "0", "SEED": "42",
+            })
+            for key in ("CLIENT_ARGS", "SERVER_ARGS", "LANGUAGES", "LOG_DIR"):
+                env.pop(key, None)
+            subprocess.run(
+                ["bash", str(_SCRIPT), "--output-root", str(output)],
+                cwd=_REPO, env=env, text=True, capture_output=True, check=False,
+            )
+            snapshot_path = output / "ablation_run.json"
+            snapshot = json.loads(snapshot_path.read_text())
+            del snapshot["groups"]
+            snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
+            resumed = subprocess.run(
+                ["bash", str(_SCRIPT), "--resume", str(output)],
+                cwd=_REPO, env=env, text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(resumed.returncode, 0)  # fake Habitat preflight
+            self.assertNotIn("resume settings differ", resumed.stderr)
+            self.assertEqual(len(json.loads(
+                (output / "baseline_off" / "run_timing.json").read_text()
+            )["attempts"]), 2)
+
+    def test_topology_only_keeps_existing_arm_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            model, yolo, dino = self._fake_assets(temp)
+            client = temp / "fake_client_python"
+            client.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = '-c' ]; then exit 0; fi\n"
+                f'exec "{sys.executable}" "$@"\n', encoding="utf-8",
+            )
+            client.chmod(0o755)
+            output = temp / "topology_first"
+            env = dict(os.environ)
+            env.update({
+                "MODEL_PATH": str(model), "YOLO_MODEL_PATH": str(yolo),
+                "DINO_MODEL_PATH": str(dino), "HABITAT_PYTHON": "/bin/true",
+                "CLIENT_PYTHON": str(client), "GPU_IDS": "0", "SEED": "42",
+                "READY_TIMEOUT_S": "0",
+            })
+            for key in ("CLIENT_ARGS", "SERVER_ARGS", "LANGUAGES", "LOG_DIR"):
+                env.pop(key, None)
+            result = subprocess.run(
+                ["bash", str(_SCRIPT), "--output-root", str(output),
+                 "--groups", "hierarchical_topology,baseline_off"],
+                cwd=_REPO, env=env, text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)  # fake server never creates ready file
+            snapshot = json.loads((output / "hierarchical_topology" / "config_snapshot.yaml").read_text())
+            arguments = snapshot["memory_args"]
+            for expected in (
+                "--memory_enabled", "--memory_extractor", "yolo11",
+                "--memory_strategy", "hierarchical", "--memory_layers", "short,mid,long",
+                "--memory_place_enabled", "--memory_place_extract_every_n_steps", "5",
+                "--memory_place_similarity_threshold", "0.85",
+            ):
+                self.assertIn(expected, arguments)
+            self.assertFalse((output / "flat_memory").exists())
+            self.assertFalse((output / "hierarchical_memory").exists())
+            self.assertFalse((output / "baseline_off").exists())
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Validate and compare four paired, full-split R2R memory ablations.
+"""Validate and compare selected, paired, full-split R2R memory ablations.
 
 Reads measured episode results and step diagnostics. Missing measurements remain
 null; the script never substitutes an estimate. A partial run is inspectable
@@ -25,6 +25,7 @@ GROUPS = (
     "hierarchical_memory",
     "hierarchical_topology",
 )
+FORMAL_R2R_EPISODES = 1839
 METRICS = (
     "SR_pct", "OS_pct", "SPL_pct", "nDTW_pct", "NE_m",
     "avg_steps", "mean_inference_latency_ms",
@@ -234,6 +235,24 @@ def load_manifest(root: Path) -> tuple[dict[str, Any], list[EpisodeKey]]:
     if not isinstance(count, int) or count != len(keys) or count < 1:
         raise ValueError("manifest expected_count must equal its nonempty episodes list")
     return manifest, keys
+
+
+def load_selected_groups(root: Path) -> tuple[str, ...]:
+    """Use the launcher's immutable selection; old four-arm runs remain readable."""
+    snapshot_path = root / "ablation_run.json"
+    if not snapshot_path.is_file():
+        return GROUPS
+    snapshot = _read_json(snapshot_path)
+    if "groups" not in snapshot:
+        return GROUPS
+    selected = snapshot["groups"]
+    if (
+        not isinstance(selected, list) or not selected
+        or any(not isinstance(name, str) or name not in GROUPS for name in selected)
+        or len(set(selected)) != len(selected)
+    ):
+        raise ValueError("ablation_run.json groups must be a nonempty unique list of known groups")
+    return tuple(selected)
 
 
 def _load_group(
@@ -605,10 +624,19 @@ def compare(
 ) -> dict[str, Any]:
     if samples < 1:
         raise ValueError("bootstrap samples must be positive")
+    selected_groups = load_selected_groups(root)
     manifest, expected = load_manifest(root)
+    if (root / "ablation_run.json").is_file() and (
+        "groups" in _read_json(root / "ablation_run.json")
+        and len(expected) != FORMAL_R2R_EPISODES
+    ):
+        raise ValueError(
+            f"selected formal R2R groups require {FORMAL_R2R_EPISODES} Episode IDs; "
+            f"manifest has {len(expected)}"
+        )
     groups = {
         name: _load_group(root, name, manifest, expected, allow_incomplete=allow_incomplete)
-        for name in GROUPS
+        for name in selected_groups
     }
     _validate_common_configs(groups, expected_count=len(expected))
     measurement_gaps = {name: _measurement_gaps(group) for name, group in groups.items()}
@@ -618,7 +646,7 @@ def compare(
         for name, group in groups.items()
     )
     if not complete and not allow_incomplete:
-        raise ValueError("the four-group ablation is incomplete")
+        raise ValueError("the selected-group ablation is incomplete")
 
     episode_metrics: dict[str, dict[EpisodeKey, dict[str, float | None]]] = {}
     group_report: dict[str, Any] = {}
@@ -661,11 +689,11 @@ def compare(
     for key in expected:
         per_episode.append({
             **_key_dict(key),
-            "groups": {name: episode_metrics[name].get(key) for name in GROUPS},
+            "groups": {name: episode_metrics[name].get(key) for name in selected_groups},
         })
     paired: dict[str, Any] = {}
-    for first_index, first in enumerate(GROUPS):
-        for second in GROUPS[first_index + 1:]:
+    for first_index, first in enumerate(selected_groups):
+        for second in selected_groups[first_index + 1:]:
             common = [
                 key for key in expected
                 if key in episode_metrics[first] and key in episode_metrics[second]
@@ -683,6 +711,18 @@ def compare(
                 differences.append({**_key_dict(key), "delta": deltas})
             paired[f"{second}_minus_{first}"] = {
                 "paired_count": len(common),
+                "sr_flips": {
+                    "success_to_failure": sum(
+                        episode_metrics[first][key]["SR_pct"] == 100.0
+                        and episode_metrics[second][key]["SR_pct"] == 0.0
+                        for key in common
+                    ),
+                    "failure_to_success": sum(
+                        episode_metrics[first][key]["SR_pct"] == 0.0
+                        and episode_metrics[second][key]["SR_pct"] == 100.0
+                        for key in common
+                    ),
+                },
                 "metrics": _metric_summary(
                     [entry["delta"] for entry in differences], samples=samples, seed=seed,
                 ),
@@ -691,6 +731,7 @@ def compare(
 
     return {
         "status": "complete" if complete else "incomplete",
+        "selected_groups": list(selected_groups),
         "manifest": manifest,
         "bootstrap": {"samples": samples, "seed": seed, "unit": "episode"},
         "groups": group_report,
@@ -715,7 +756,7 @@ def write_report(root: Path, report: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("root", type=Path, help="directory containing the four ablation groups")
+    parser.add_argument("root", type=Path, help="directory containing the selected ablation groups")
     parser.add_argument("--allow-incomplete", action="store_true",
                         help="inspect interrupted runs; output status remains incomplete")
     parser.add_argument("--bootstrap-samples", type=int, default=2000)

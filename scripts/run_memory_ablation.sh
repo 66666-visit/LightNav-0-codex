@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the four R2R val_unseen memory conditions with one immutable common setup.
+# Run selected R2R val_unseen memory conditions with one immutable common setup.
 # Results remain in separate directories; an interrupted condition can be resumed.
 set -euo pipefail
 
@@ -10,14 +10,17 @@ usage() {
     cat <<'EOF'
 Usage:
   MODEL_PATH=... YOLO_MODEL_PATH=... DINO_MODEL_PATH=... \
-    bash scripts/run_memory_ablation.sh [--output-root DIR]
+    bash scripts/run_memory_ablation.sh [--output-root DIR] [--groups NAME,NAME]
   MODEL_PATH=... YOLO_MODEL_PATH=... DINO_MODEL_PATH=... \
-    bash scripts/run_memory_ablation.sh --resume DIR
+    bash scripts/run_memory_ablation.sh --resume DIR [--groups NAME,NAME]
 
-Runs all four conditions on the complete R2R val_unseen split, with 500 steps,
+Defaults to all four conditions. --groups selects from baseline_off, flat_memory,
+hierarchical_memory, hierarchical_topology; the two-arm A/B selection is
+baseline_off,hierarchical_topology. Runs the complete R2R val_unseen split with 500 steps,
 no budget-forced STOP, one common seed, and the same checkpoint/config/shards.
 The first command creates a fresh output directory. --resume preserves prior
 episode results and skips conditions already verified as formally complete.
+Without --groups, --resume uses the selection recorded in the output directory.
 
 Optional common settings: GPU_IDS (default 0), SEED (default 42), BACKEND,
 GPU_MEM_UTIL, HABITAT_CONFIG, DATA_PATH, SCENES_DIR, ACTION_TOKENIZER_BUNDLE,
@@ -32,6 +35,9 @@ die() {
 
 mode=new
 ablation_root="${ABLATION_ROOT:-$REPO_ROOT/output/memory_ablation_$(date +%Y%m%d_%H%M%S)}"
+all_groups=(baseline_off flat_memory hierarchical_memory hierarchical_topology)
+groups_csv=""
+groups_set=0
 while (($#)); do
     case "$1" in
         --output-root)
@@ -45,6 +51,12 @@ while (($#)); do
             ablation_root=$2
             shift 2
             ;;
+        --groups)
+            [ "$groups_set" -eq 0 ] && [ "$#" -ge 2 ] || die '--groups needs one comma-separated list'
+            groups_csv=$2
+            groups_set=1
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -53,8 +65,43 @@ while (($#)); do
     esac
 done
 
+if [ "$mode" = resume ] && [ "$groups_set" -eq 0 ]; then
+    [ -f "$ablation_root/ablation_run.json" ] || die "missing resume snapshot: $ablation_root/ablation_run.json"
+    groups_csv=$(python3 - "$ablation_root/ablation_run.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+saved = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+groups = saved.get("groups", [
+    "baseline_off", "flat_memory", "hierarchical_memory", "hierarchical_topology",
+])
+if not isinstance(groups, list) or not all(isinstance(name, str) for name in groups):
+    raise SystemExit("invalid groups in ablation_run.json")
+print(",".join(groups))
+PY
+    )
+elif [ "$groups_set" -eq 0 ]; then
+    groups_csv=$(IFS=,; echo "${all_groups[*]}")
+fi
+if [ -z "$groups_csv" ] || [[ "$groups_csv" == ,* || "$groups_csv" == *, || "$groups_csv" == *,,* || "$groups_csv" == *$'\n'* ]]; then
+    die '--groups requires a nonempty comma-separated list without empty entries'
+fi
+IFS=, read -ra selected_groups <<< "$groups_csv"
+seen_groups=()
+for group in "${selected_groups[@]}"; do
+    case "$group" in
+        baseline_off|flat_memory|hierarchical_memory|hierarchical_topology) ;;
+        *) die "invalid --groups entry: $group" ;;
+    esac
+    for prior in "${seen_groups[@]}"; do
+        [ "$prior" != "$group" ] || die "duplicate --groups entry: $group"
+    done
+    seen_groups+=("$group")
+done
+
 # Reject settings that would silently turn a formal full-split comparison into
-# a small smoke run, change the benchmark, or make the four arms incomparable.
+# a small smoke run, change the benchmark, or make selected arms incomparable.
 [ "${TASK:-vlnce}" = vlnce ] || die 'TASK must be vlnce'
 [ "${SPLIT:-val_unseen}" = val_unseen ] || die 'SPLIT must be val_unseen'
 [ "${EPISODES:--1}" = -1 ] || die 'EPISODES must be -1 (the complete split)'
@@ -70,8 +117,8 @@ done
 EXPECTED_EPISODES=1839
 
 MODEL_PATH=${MODEL_PATH:?set MODEL_PATH to the LightNav checkpoint directory}
-YOLO_MODEL_PATH=${YOLO_MODEL_PATH:?set YOLO_MODEL_PATH to an existing YOLO11n .pt file}
-DINO_MODEL_PATH=${DINO_MODEL_PATH:?set DINO_MODEL_PATH to a local DINOv2-Small directory}
+YOLO_MODEL_PATH=${YOLO_MODEL_PATH:-}
+DINO_MODEL_PATH=${DINO_MODEL_PATH:-}
 HABITAT_CONFIG=${HABITAT_CONFIG:-$REPO_ROOT/habitat_server/configs/vlnce_r2r.yaml}
 GPU_IDS=${GPU_IDS:-0}
 SEED=${SEED:-42}
@@ -81,13 +128,25 @@ YOLO_DEVICE=${YOLO_DEVICE:-cpu}
 DINO_DEVICE=${DINO_DEVICE:-cpu}
 
 [ -d "$MODEL_PATH" ] || die "checkpoint directory not found: $MODEL_PATH"
-[ -s "$YOLO_MODEL_PATH" ] || die "YOLO weights not found or empty: $YOLO_MODEL_PATH"
-[ -d "$DINO_MODEL_PATH" ] || die "DINOv2 directory not found: $DINO_MODEL_PATH"
-[ -f "$DINO_MODEL_PATH/config.json" ] || die 'DINOv2 config.json is missing'
-[ -f "$DINO_MODEL_PATH/preprocessor_config.json" ] || die 'DINOv2 preprocessor_config.json is missing'
-if ! compgen -G "$DINO_MODEL_PATH/*.safetensors" >/dev/null &&
-   ! compgen -G "$DINO_MODEL_PATH/pytorch_model*.bin" >/dev/null; then
-    die 'DINOv2 local weight files are missing'
+need_yolo=0
+need_dino=0
+for group in "${selected_groups[@]}"; do
+    [ "$group" = baseline_off ] || need_yolo=1
+    [ "$group" = hierarchical_topology ] && need_dino=1
+done
+[ "$need_yolo" -eq 1 ] || YOLO_MODEL_PATH=""
+[ "$need_dino" -eq 1 ] || DINO_MODEL_PATH=""
+if [ "$need_yolo" -eq 1 ]; then
+    [ -s "$YOLO_MODEL_PATH" ] || die "YOLO weights not found or empty: $YOLO_MODEL_PATH"
+fi
+if [ "$need_dino" -eq 1 ]; then
+    [ -d "$DINO_MODEL_PATH" ] || die "DINOv2 directory not found: $DINO_MODEL_PATH"
+    [ -f "$DINO_MODEL_PATH/config.json" ] || die 'DINOv2 config.json is missing'
+    [ -f "$DINO_MODEL_PATH/preprocessor_config.json" ] || die 'DINOv2 preprocessor_config.json is missing'
+    if ! compgen -G "$DINO_MODEL_PATH/*.safetensors" >/dev/null &&
+       ! compgen -G "$DINO_MODEL_PATH/pytorch_model*.bin" >/dev/null; then
+        die 'DINOv2 local weight files are missing'
+    fi
 fi
 [ -f "$HABITAT_CONFIG" ] || die "Habitat config not found: $HABITAT_CONFIG"
 [[ "$SEED" =~ ^[0-9]+$ ]] || die 'SEED must be a nonnegative integer'
@@ -97,8 +156,8 @@ for path in "$YOLO_MODEL_PATH" "$DINO_MODEL_PATH"; do
 done
 
 MODEL_PATH="$(cd "$MODEL_PATH" && pwd -P)"
-YOLO_MODEL_PATH="$(cd "$(dirname "$YOLO_MODEL_PATH")" && pwd -P)/$(basename "$YOLO_MODEL_PATH")"
-DINO_MODEL_PATH="$(cd "$DINO_MODEL_PATH" && pwd -P)"
+[ -n "$YOLO_MODEL_PATH" ] && YOLO_MODEL_PATH="$(cd "$(dirname "$YOLO_MODEL_PATH")" && pwd -P)/$(basename "$YOLO_MODEL_PATH")"
+[ -n "$DINO_MODEL_PATH" ] && DINO_MODEL_PATH="$(cd "$DINO_MODEL_PATH" && pwd -P)"
 HABITAT_CONFIG="$(cd "$(dirname "$HABITAT_CONFIG")" && pwd -P)/$(basename "$HABITAT_CONFIG")"
 INFERENCE_PYTHON=${CLIENT_PYTHON:-}
 if [ -z "$INFERENCE_PYTHON" ]; then
@@ -123,7 +182,7 @@ export BACKEND GPU_MEM_UTIL YOLO_DEVICE DINO_DEVICE
 
 # An immutable root record prevents a resumed group from silently using a
 # different checkpoint, dataset/config, shard layout, seed, or inference setup.
-python3 - "$ablation_root/ablation_run.json" "$mode" <<'PY'
+python3 - "$ablation_root/ablation_run.json" "$mode" "${selected_groups[@]}" <<'PY'
 import hashlib
 import json
 import os
@@ -134,6 +193,7 @@ path = Path(sys.argv[1])
 mode = sys.argv[2]
 config = Path(os.environ["HABITAT_CONFIG"])
 snapshot = {
+    "groups": sys.argv[3:],
     "launch_cwd": os.getcwd(),
     "model_path": os.environ["MODEL_PATH"],
     "yolo_model_path": os.environ["YOLO_MODEL_PATH"],
@@ -171,6 +231,11 @@ else:
     if not path.is_file():
         raise SystemExit(f"missing resume snapshot: {path}")
     saved = json.loads(path.read_text(encoding="utf-8"))
+    if "groups" not in saved and snapshot["groups"] == [
+        "baseline_off", "flat_memory", "hierarchical_memory", "hierarchical_topology",
+    ]:
+        # A four-arm run started before --groups existed remains resumable.
+        snapshot.pop("groups")
     if saved != snapshot:
         raise SystemExit("resume settings differ from ablation_run.json; refusing to mix runs")
 PY
@@ -191,7 +256,7 @@ hierarchical=(--memory_strategy hierarchical --memory_layers short,mid,long)
 
 # eval_habitat.sh currently accepts one CLIENT_ARGS string and splits it into
 # words. Paths above are checked for whitespace rather than silently mangled.
-for group in baseline_off flat_memory hierarchical_memory hierarchical_topology; do
+for group in "${selected_groups[@]}"; do
     group_dir="$ablation_root/$group"
     if [ -f "$group_dir/formal_complete.json" ]; then
         [ -f "$manifest" ] || die "shared manifest missing for completed $group"
@@ -296,4 +361,4 @@ PY
 done
 
 "$INFERENCE_PYTHON" "$REPO_ROOT/scripts/compare_memory_ablation.py" "$ablation_root"
-echo "$TAG all four complete: $ablation_root"
+echo "$TAG all ${#selected_groups[@]} selected groups complete: $ablation_root"
