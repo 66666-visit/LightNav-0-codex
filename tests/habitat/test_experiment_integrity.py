@@ -123,6 +123,51 @@ class ExperimentIntegrityTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate Episode"):
             check_pilot_selection(_manifest(rows), selection)
 
+    def test_pilot_selection_accepts_18_21_21_scene_quotas(self) -> None:
+        scenes = ["pLe4wQe7qrG", *(f"scene_{index:02d}" for index in range(1, 11))]
+        full_counts = {
+            scene: (18 if index == 0 else 187 if index == 1 else 186 if index == 2
+                    else 181)
+            for index, scene in enumerate(scenes)
+        }
+        self.assertEqual(sum(full_counts.values()), 1839)
+        quotas = {
+            scene: (18 if index == 0 else 21 if index in (1, 2) else 20)
+            for index, scene in enumerate(scenes)
+        }
+        rows = [
+            (scene, f"episode_{index:03d}")
+            for scene, quota in quotas.items() for index in range(quota)
+        ]
+        selection = self.root / "adaptive_pilot_manifest.json"
+        data = {
+            "dataset_split": "val_unseen", "expected_count": 220, "per_scene": 20,
+            "full_scene_counts": full_counts, "scene_quotas": quotas,
+            "episodes": [
+                {"scene_id": scene, "habitat_episode_id": episode}
+                for scene, episode in rows
+            ],
+        }
+        selection.write_text(json.dumps(data), encoding="utf-8")
+        check_pilot_selection(_manifest(rows), selection)
+        self.assertEqual(len(rows), 220)
+        data["scene_quotas"]["scene_01"] = 20
+        selection.write_text(json.dumps(data), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "totaling 220"):
+            check_pilot_selection(_manifest(rows), selection)
+        data["scene_quotas"]["scene_03"] = 21
+        wrong_rows = [
+            (scene, f"episode_{index:03d}")
+            for scene, quota in data["scene_quotas"].items() for index in range(quota)
+        ]
+        data["episodes"] = [
+            {"scene_id": scene, "habitat_episode_id": episode}
+            for scene, episode in wrong_rows
+        ]
+        selection.write_text(json.dumps(data), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "deterministic allocation"):
+            check_pilot_selection(_manifest(wrong_rows), selection)
+
     def _complete_pilot_group(self) -> tuple[Path, Path]:
         root = self.root / "pilot_group"
         root.mkdir()

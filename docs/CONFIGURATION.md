@@ -123,7 +123,11 @@ For the fixed R2R Pilot A/B comparison, set `DATA_PATH` to the existing R2R
 dataset root containing `val_unseen/val_unseen.json.gz`, then pass
 `--groups baseline_off,hierarchical_topology --pilot-per-scene 20` to
 `scripts/run_memory_ablation.sh`. The launcher uses sampling seed 42 and
-selects 7 short, 7 medium, and 6 long routes per scene across all 11 scenes.
+targets 20 Episodes in each of 11 scenes. A scene with fewer than 20
+contributes all available Episodes; missing seats go to the scenes with the
+most remaining candidates, with `scene_id` breaking ties. For the confirmed
+val_unseen distribution, quotas are 18/21/21 and 20 in the other eight scenes;
+short/medium/long quotas are 6/6/6, 7/7/7, and 7/7/6 respectively.
 It writes `pilot_manifest.json` once, serves only those 220 Episode IDs, sets
 `EXPECTED_EPISODES=220`, and requires each arm's `pilot_complete.json` after
 exact coverage checks. `--resume DIR` reuses the saved manifest. This mode

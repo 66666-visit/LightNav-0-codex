@@ -230,8 +230,47 @@ def check_pilot_selection(manifest: dict[str, Any], pilot_selection: str | Path)
             raise ValueError(f"duplicate Episode in Pilot selection: {key}")
         selected.add(key)
         scene_counts[scene] = scene_counts.get(scene, 0) + 1
-    if len(scene_counts) != 11 or any(count != 20 for count in scene_counts.values()):
-        raise ValueError("Pilot selection must contain 20 Episodes from each of 11 scenes")
+    quotas = data.get("scene_quotas")
+    if quotas is None:
+        # Fixed 20-per-scene Pilot manifests created before adaptive allocation
+        # remain verifiable. New manifests record their actual scene quotas.
+        quotas = {scene: 20 for scene in scene_counts}
+    elif (
+        not isinstance(quotas, dict) or len(quotas) != 11
+        or any(not isinstance(scene, str) or not scene for scene in quotas)
+        or any(type(quota) is not int or quota < 1 for quota in quotas.values())
+        or sum(quotas.values()) != 220
+    ):
+        raise ValueError("Pilot scene_quotas must contain 11 scenes totaling 220 Episodes")
+    if len(scene_counts) != 11 or scene_counts != quotas:
+        raise ValueError("Pilot selection scene counts differ from scene_quotas")
+    full_counts = data.get("full_scene_counts")
+    if data.get("scene_quotas") is not None and (
+        not isinstance(full_counts, dict) or set(full_counts) != set(quotas)
+        or any(type(count) is not int or count < quotas[scene]
+               for scene, count in full_counts.items())
+    ):
+        raise ValueError("Pilot scene_quotas exceed source scene counts")
+    if data.get("scene_quotas") is not None:
+        expected_quotas = {scene: min(20, count) for scene, count in full_counts.items()}
+        missing_seats = 220 - sum(expected_quotas.values())
+        recipients = sorted(
+            (scene for scene, count in full_counts.items() if count > 20),
+            key=lambda scene: (-(full_counts[scene] - 20), scene),
+        )
+        while missing_seats > 0:
+            added = 0
+            for scene in recipients:
+                if expected_quotas[scene] < full_counts[scene]:
+                    expected_quotas[scene] += 1
+                    missing_seats -= 1
+                    added += 1
+                    if missing_seats == 0:
+                        break
+            if not added:
+                raise ValueError("Pilot source cannot supply 220 distinct Episodes")
+        if quotas != expected_quotas:
+            raise ValueError("Pilot scene_quotas differ from deterministic allocation")
     loaded = {_key(row) for row in canonical["episodes"]}
     if loaded != selected:
         raise ValueError(

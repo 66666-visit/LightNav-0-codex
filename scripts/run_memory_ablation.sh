@@ -23,8 +23,9 @@ no budget-forced STOP, one common seed, and the same checkpoint/config/shards.
 The first command creates a fresh output directory. --resume preserves prior
 episode results and skips conditions already verified as formally complete.
 Without --groups, --resume uses the selection recorded in the output directory.
-Pilot mode requires the A/B groups and DATA_PATH, samples 20 Episodes in each
-of 11 scenes once, and writes pilot_complete.json (never formal_complete.json).
+Pilot mode requires the A/B groups and DATA_PATH. It targets 20 Episodes per
+scene, redistributes any shortage deterministically, and selects 220 total.
+It writes pilot_complete.json (never formal_complete.json).
 On resume, the fixed pilot_manifest.json is reused without resampling.
 
 Optional common settings: GPU_IDS (default 0), SEED (default 42), BACKEND,

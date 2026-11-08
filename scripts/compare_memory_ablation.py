@@ -258,6 +258,34 @@ def load_selected_groups(root: Path) -> tuple[str, ...]:
     return tuple(selected)
 
 
+def _pilot_quota_plan(full_scene_counts: dict[str, int], base: int) -> dict[str, int]:
+    """Reconstruct the deterministic shortfall redistribution from source counts."""
+    quotas = {scene: min(base, count) for scene, count in full_scene_counts.items()}
+    seats = PILOT_EPISODES - sum(quotas.values())
+    recipients = sorted(full_scene_counts, key=lambda scene: (-full_scene_counts[scene], scene))
+    while seats:
+        added = 0
+        for scene in recipients:
+            if seats == 0:
+                break
+            if quotas[scene] < full_scene_counts[scene]:
+                quotas[scene] += 1
+                seats -= 1
+                added += 1
+        if not added:
+            raise ValueError("Pilot dataset cannot supply 220 distinct Episodes")
+    return quotas
+
+
+def _pilot_distance_quotas(size: int) -> dict[str, int]:
+    third, remainder = divmod(size, 3)
+    return {
+        "short": third + (remainder >= 1),
+        "medium": third + (remainder >= 2),
+        "long": third,
+    }
+
+
 def _pilot_manifest(
     root: Path, expected: list[EpisodeKey], *, per_scene: int,
     expected_sha256: str,
@@ -273,13 +301,36 @@ def _pilot_manifest(
         raise ValueError("pilot_manifest.json split, seed or counts disagree with pilot run")
     rows = pilot.get("episodes")
     counts = pilot.get("full_scene_counts")
+    quotas = pilot.get("scene_quotas")
+    allocation = pilot.get("scene_allocation")
     if not isinstance(rows, list) or len(rows) != len(expected):
         raise ValueError("pilot_manifest.json must list every selected Episode")
     if not isinstance(counts, dict) or len(counts) != PILOT_SCENES or (
-        any(type(count) is not int or count < per_scene for count in counts.values())
+        any(type(count) is not int or count < 1 for count in counts.values())
         or sum(counts.values()) != FORMAL_R2R_EPISODES
     ):
         raise ValueError("pilot full_scene_counts must cover 11 scenes and sum to 1839")
+    expected_quotas = _pilot_quota_plan(counts, per_scene)
+    if (
+        not isinstance(quotas, dict) or quotas != expected_quotas
+        or not isinstance(allocation, dict) or set(allocation) != set(counts)
+    ):
+        raise ValueError("pilot scene quotas differ from deterministic shortfall allocation")
+    for scene, full_count in counts.items():
+        detail = allocation[scene]
+        actual_quota = quotas[scene]
+        reason = (
+            "all_available_below_base" if full_count < per_scene else
+            "redistributed_shortfall" if actual_quota > per_scene else "base_quota"
+        )
+        if not isinstance(detail, dict) or detail != {
+            "available_episodes": full_count,
+            "base_quota": per_scene,
+            "selected_quota": actual_quota,
+            "adjustment": actual_quota - per_scene,
+            "reason": reason,
+        }:
+            raise ValueError(f"pilot scene {scene} has inconsistent allocation provenance")
     selected = []
     scene_groups: dict[str, dict[str, int]] = {}
     for row in rows:
@@ -300,10 +351,10 @@ def _pilot_manifest(
     if len(set(selected)) != len(selected) or set(selected) != set(expected):
         raise ValueError("pilot_manifest.json Episode IDs differ from episode_manifest.json")
     if len(scene_groups) != PILOT_SCENES or any(
-        groups != {"short": 7, "medium": 7, "long": 6}
-        for groups in scene_groups.values()
+        scene_groups.get(scene) != _pilot_distance_quotas(quota)
+        for scene, quota in expected_quotas.items()
     ):
-        raise ValueError("pilot must contain 11 scenes with 7/7/6 route groups each")
+        raise ValueError("pilot distance groups differ from each scene's balanced quota")
     actual_sha256 = hashlib.sha256((root / "pilot_manifest.json").read_bytes()).hexdigest()
     if actual_sha256 != expected_sha256:
         raise ValueError("pilot_manifest.json differs from immutable ablation_run.json digest")
@@ -680,7 +731,8 @@ def _check_summary_metrics(group: GroupData, metrics: dict[str, dict[str, Any]])
 
 def _pilot_scene_statistics(
     metrics: dict[EpisodeKey, dict[str, float | None]],
-    full_scene_counts: dict[str, int], *, per_scene: int, samples: int, seed: int,
+    full_scene_counts: dict[str, int], scene_quotas: dict[str, int],
+    *, samples: int, seed: int,
 ) -> dict[str, Any]:
     """Report measured scene means and clearly labelled full-split estimates."""
     scenes: dict[str, Any] = {}
@@ -688,6 +740,7 @@ def _pilot_scene_statistics(
         values = [row for key, row in metrics.items() if key[0] == scene]
         scenes[scene] = {
             "sampled_episodes": len(values),
+            "target_episodes": scene_quotas[scene],
             "full_val_unseen_episodes": full_scene_counts[scene],
             "metrics": _metric_summary(values, samples=samples, seed=seed),
         }
@@ -697,7 +750,7 @@ def _pilot_scene_statistics(
     for metric in (*METRICS, "episode_time_sec"):
         scene_means = [scenes[scene]["metrics"][metric]["mean"] for scene in scenes]
         if any(value is None for value in scene_means) or any(
-            scenes[scene]["sampled_episodes"] != per_scene for scene in scenes
+            scenes[scene]["sampled_episodes"] != scene_quotas[scene] for scene in scenes
         ):
             macro[metric] = None
             weighted[metric] = None
@@ -806,7 +859,7 @@ def compare(
         if pilot_metadata is not None:
             group_report[name]["pilot_scenes"] = _pilot_scene_statistics(
                 metrics, pilot_metadata["full_scene_counts"],
-                per_scene=pilot_per_scene, samples=samples, seed=seed,
+                pilot_metadata["scene_quotas"], samples=samples, seed=seed,
             )
 
     per_episode = []
@@ -868,6 +921,8 @@ def compare(
             "per_scene": pilot_per_scene,
             "sampled_scene_count": PILOT_SCENES,
             "full_scene_counts": pilot_metadata["full_scene_counts"],
+            "scene_quotas": pilot_metadata["scene_quotas"],
+            "scene_allocation": pilot_metadata["scene_allocation"],
             "estimate_note": (
                 "Scene-weighted pilot estimates use measured pilot results and full "
                 "val_unseen scene counts; they are not full-split benchmark scores. "

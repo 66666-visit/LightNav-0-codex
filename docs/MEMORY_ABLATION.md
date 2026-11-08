@@ -144,13 +144,23 @@ need to keep every Prompt text and layer record in memory at once.
 
 ## Fixed 11-scene Pilot A/B experiment
 
-The Pilot runs **220 selected Episodes** from R2R `val_unseen`: 20 from each of
-its 11 scenes. Within each scene, source `geodesic_distance` ranks routes into
-short, medium, and long thirds. Sampling seed 42 selects **7 short, 7 medium,
-and 6 long** routes per scene, favoring distinct `trajectory_id` values. The
-sampler fails if the route-length field, scene count, or a stratum is missing;
-it does not use either agent's scores. Route lengths, trajectories, and the
-fixed selection are evaluation metadata and never enter the navigation policy.
+The Pilot runs **220 selected Episodes** from R2R `val_unseen`. It targets 20
+per scene. A scene with fewer than 20 contributes every available Episode;
+missing seats go one per scene per pass to other scenes, ranked by remaining
+candidate count (descending), then `scene_id` (ascending). The confirmed
+1,839-Episode distribution has one scene, `pLe4wQe7qrG`, with 18 Episodes.
+The resulting quotas are **18 in that scene, 21 in two scenes, and 20 in each
+of the other eight**. The two receiving scenes are determined from the actual
+dataset counts and recorded in the manifest.
+
+Within each scene, source `geodesic_distance` ranks routes into short, medium,
+and long thirds. Sampling seed 42 favors distinct `trajectory_id` values. The
+distance quotas are 6/6/6 for 18, 7/7/6 for 20, and 7/7/7 for 21; other
+quotas split as evenly as possible with extra seats assigned short, then
+medium. The sampler fails if a required route-length field, scene count, or
+distance stratum is unavailable. It does not use either agent's scores.
+Route lengths, trajectories, and the fixed selection are evaluation metadata
+and never enter the navigation policy.
 
 Set `DATA_PATH` to the existing **R2R dataset root** containing
 `val_unseen/val_unseen.json.gz` (for example,
@@ -169,8 +179,9 @@ bash scripts/run_memory_ablation.sh \
 ```
 
 The launcher writes `pilot_manifest.json` once in the new output directory,
-including source dataset SHA-256, scene counts, sampled IDs, route-length
-groups, and trajectory IDs. Each arm's Habitat server filters to those exact
+including source dataset SHA-256, original scene counts, actual scene quotas,
+adjustment reasons, sampled IDs, route-length groups, and trajectory IDs.
+Each arm's Habitat server filters to those exact
 IDs **before sharding or stepping**; `EPISODES=-1` then iterates its selected
 shard, rather than taking the first 220 of the full split. Both arms use the
 same fixed manifest, checkpoint, seed, 500-step limit, normal STOP/truncation,

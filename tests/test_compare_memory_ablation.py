@@ -159,32 +159,58 @@ class CompareMemoryAblationTest(unittest.TestCase):
                 "expected_count": 1839, "manifest_sha256": digest,
             })
 
-    def _prepare_complete_pilot(self) -> None:
+    def _prepare_complete_pilot(self, *, uneven: bool = False) -> None:
         selected = ("baseline_off", "hierarchical_topology")
-        counts = {f"scene_{scene}": 167 for scene in range(11)}
-        counts["scene_10"] = 169
+        if uneven:
+            # 18 + 200 + 199 + (6 * 178) + (2 * 177) = 1839.
+            counts = {"scene_0": 18, "scene_1": 200, "scene_2": 199}
+            counts.update({f"scene_{scene}": 178 for scene in range(3, 9)})
+            counts.update({f"scene_{scene}": 177 for scene in range(9, 11)})
+            quotas = {scene: 20 for scene in counts}
+            quotas.update({"scene_0": 18, "scene_1": 21, "scene_2": 21})
+        else:
+            counts = {f"scene_{scene}": 167 for scene in range(11)}
+            counts["scene_10"] = 169
+            quotas = {scene: 20 for scene in counts}
+        allocation = {}
+        for scene, available in counts.items():
+            quota = quotas[scene]
+            allocation[scene] = {
+                "available_episodes": available,
+                "base_quota": 20,
+                "selected_quota": quota,
+                "adjustment": quota - 20,
+                "reason": (
+                    "all_available_below_base" if available < 20 else
+                    "redistributed_shortfall" if quota > 20 else "base_quota"
+                ),
+            }
         rows = []
         pilot_rows = []
         for scene in range(11):
-            for index in range(20):
-                scene_id, episode_id = f"scene_{scene}", f"episode_{scene}_{index}"
+            scene_id = f"scene_{scene}"
+            short = quotas[scene_id] // 3 + (quotas[scene_id] % 3 >= 1)
+            medium = quotas[scene_id] // 3 + (quotas[scene_id] % 3 >= 2)
+            for index in range(quotas[scene_id]):
+                episode_id = f"episode_{scene}_{index}"
                 rows.append({"scene_id": scene_id, "episode_id": episode_id})
                 pilot_rows.append({
                     "scene_id": scene_id, "habitat_episode_id": episode_id,
                     "episode_id": episode_id, "trajectory_id": f"trajectory_{index}",
-                    "distance_group": ("short" if index < 7 else
-                                       "medium" if index < 14 else "long"),
+                    "distance_group": ("short" if index < short else
+                                       "medium" if index < short + medium else "long"),
                     "route_length": float(index + 1), "sample_seed": 42,
                     "dataset_split": "val_unseen", "source_dataset": "/r2r.json.gz",
-                    "sampling_method": "per_scene_geodesic_tertiles_7_7_6_trajectory_diverse",
+                    "sampling_method": "adaptive_scene_quota_geodesic_tertiles_trajectory_diverse_v2",
                 })
         manifest = {"split": "val_unseen", "expected_count": 220, "episodes": rows}
         _write_json(self.root / "episode_manifest.json", manifest)
         _write_json(self.root / "pilot_manifest.json", {
             "dataset_split": "val_unseen", "sample_seed": 42,
-            "sampling_method": "per_scene_geodesic_tertiles_7_7_6_trajectory_diverse",
+            "sampling_method": "adaptive_scene_quota_geodesic_tertiles_trajectory_diverse_v2",
             "expected_count": 220, "per_scene": 20,
-            "full_scene_counts": counts, "episodes": pilot_rows,
+            "full_scene_counts": counts, "scene_quotas": quotas,
+            "scene_allocation": allocation, "episodes": pilot_rows,
         })
         _write_json(self.root / "ablation_run.json", {
             "groups": list(selected), "pilot_per_scene": 20,
@@ -203,8 +229,9 @@ class CompareMemoryAblationTest(unittest.TestCase):
             results = []
             diagnostics = []
             for scene in range(11):
-                for index in range(20):
-                    scene_id, episode_id = f"scene_{scene}", f"episode_{scene}_{index}"
+                scene_id = f"scene_{scene}"
+                for index in range(quotas[scene_id]):
+                    episode_id = f"episode_{scene}_{index}"
                     is_agent = name == "hierarchical_topology"
                     results.append({
                         "scene_id": scene_id, "habitat_episode_id": episode_id,
@@ -271,6 +298,65 @@ class CompareMemoryAblationTest(unittest.TestCase):
         ablation.write_report(self.root, report)
         self.assertTrue((self.root / "comparison.json").is_file())
 
+    def test_real_distribution_pilot_keeps_220_paired_ids_and_scene_estimates(self) -> None:
+        self._prepare_complete_pilot(uneven=True)
+        report = ablation.compare(self.root, samples=20, seed=42)
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["evaluation_mode"], "pilot")
+        self.assertEqual(len(report["per_episode"]), 220)
+        quotas = report["pilot"]["scene_quotas"]
+        self.assertEqual(sorted(quotas.values()), [18, *([20] * 8), 21, 21])
+        self.assertEqual(report["pilot"]["scene_allocation"]["scene_0"]["reason"],
+                         "all_available_below_base")
+        self.assertEqual(report["pilot"]["scene_allocation"]["scene_1"]["reason"],
+                         "redistributed_shortfall")
+        self.assertEqual(report["groups"]["baseline_off"]["success_count"], 111)
+        agent = report["groups"]["hierarchical_topology"]
+        self.assertEqual(agent["success_count"], 122)
+        self.assertEqual(agent["pilot_scenes"]["by_scene"]["scene_0"]["target_episodes"], 18)
+        self.assertEqual(agent["pilot_scenes"]["by_scene"]["scene_1"]["target_episodes"], 21)
+        self.assertAlmostEqual(agent["metrics"]["SR_pct"]["mean"], 122 / 220 * 100)
+        self.assertIsNotNone(agent["pilot_scenes"]["scene_macro_mean"]["SR_pct"])
+        self.assertIsNotNone(agent["pilot_scenes"][
+            "full_val_scene_weighted_estimate"]["SR_pct"])
+        pair = report["paired_differences"]["hierarchical_topology_minus_baseline_off"]
+        self.assertEqual(pair["paired_count"], 220)
+        self.assertEqual(pair["sr_flips"]["failure_to_success"], 11)
+
+    def test_real_distribution_rejects_wrong_quota_and_unbalanced_distances(self) -> None:
+        self._prepare_complete_pilot(uneven=True)
+        path = self.root / "pilot_manifest.json"
+        original = json.loads(path.read_text(encoding="utf-8"))
+        changed = json.loads(json.dumps(original))
+        changed["scene_quotas"]["scene_1"] = 20
+        _write_json(path, changed)
+        with self.assertRaisesRegex(ValueError, "deterministic shortfall allocation"):
+            ablation.compare(self.root, samples=10)
+        changed = json.loads(json.dumps(original))
+        first_short = next(row for row in changed["episodes"] if row["scene_id"] == "scene_0"
+                           and row["distance_group"] == "short")
+        first_short["distance_group"] = "long"
+        _write_json(path, changed)
+        with self.assertRaisesRegex(ValueError, "balanced quota"):
+            ablation.compare(self.root, samples=10)
+
+    def test_real_distribution_partial_scene_disables_weighted_estimate(self) -> None:
+        self._prepare_complete_pilot(uneven=True)
+        directory = self.root / "hierarchical_topology"
+        result_path = directory / "results.jsonl"
+        records = [json.loads(line) for line in result_path.read_text().splitlines()]
+        records = [row for row in records if not (
+            row["scene_id"] == "scene_1" and row["habitat_episode_id"] == "episode_1_20"
+        )]
+        _write_jsonl(result_path, records)
+        (directory / "pilot_complete.json").unlink()
+        (directory / "summary.json").unlink()
+        report = ablation.compare(self.root, allow_incomplete=True, samples=10)
+        self.assertEqual(report["status"], "incomplete")
+        self.assertEqual(report["groups"]["hierarchical_topology"]["completed_episodes"], 219)
+        self.assertIsNone(report["groups"]["hierarchical_topology"]["pilot_scenes"][
+            "full_val_scene_weighted_estimate"]["SR_pct"])
+
     def test_pilot_missing_duplicate_and_wrong_marker_cannot_complete(self) -> None:
         self._prepare_complete_pilot()
         path = self.root / "hierarchical_topology" / "results.jsonl"
@@ -316,15 +402,14 @@ class CompareMemoryAblationTest(unittest.TestCase):
         pilot["episodes"][0]["habitat_episode_id"] = "episode_0_0"
         pilot["episodes"][0]["distance_group"] = "long"
         _write_json(path, pilot)
-        with self.assertRaisesRegex(ValueError, "7/7/6"):
+        with self.assertRaisesRegex(ValueError, "balanced quota"):
             ablation.compare(self.root, samples=10)
 
     def test_pilot_manifest_valid_metadata_change_rejected_by_immutable_digest(self) -> None:
         self._prepare_complete_pilot()
         path = self.root / "pilot_manifest.json"
         pilot = json.loads(path.read_text(encoding="utf-8"))
-        pilot["full_scene_counts"]["scene_0"] += 1
-        pilot["full_scene_counts"]["scene_1"] -= 1
+        pilot["sampling_method"] = "changed but otherwise valid"
         _write_json(path, pilot)
         with self.assertRaisesRegex(ValueError, "immutable ablation_run.json digest"):
             ablation.compare(self.root, samples=10)
@@ -335,7 +420,8 @@ class CompareMemoryAblationTest(unittest.TestCase):
             ("two", "b"): {"SR_pct": 0.0},
         }
         result = ablation._pilot_scene_statistics(
-            metrics, {"one": 3, "two": 1}, per_scene=1, samples=10, seed=42,
+            metrics, {"one": 3, "two": 1}, {"one": 1, "two": 1},
+            samples=10, seed=42,
         )
         self.assertEqual(result["scene_macro_mean"]["SR_pct"], 50.0)
         self.assertEqual(result["full_val_scene_weighted_estimate"]["SR_pct"], 75.0)

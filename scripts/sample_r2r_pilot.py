@@ -23,8 +23,8 @@ SPLIT = "val_unseen"
 SCENE_COUNT = 11
 PILOT_PER_SCENE = 20
 SEED = 42
-QUOTAS = {"short": 7, "medium": 7, "long": 6}
-SAMPLING_METHOD = "per_scene_geodesic_tertiles_7_7_6_trajectory_diverse"
+DISTANCE_GROUPS = ("short", "medium", "long")
+SAMPLING_METHOD = "adaptive_scene_quota_geodesic_tertiles_trajectory_diverse_v2"
 SCENE_PREFIX = "data/scene_datasets/"
 
 
@@ -85,35 +85,106 @@ def _seed_for(scene_id: str, group: str, seed: int) -> int:
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
 
 
-def _select_scene(rows: list[dict[str, Any]], scene_id: str, seed: int) -> list[dict[str, Any]]:
-    """Choose 7/7/6 among scene-local distance tertiles with trajectory diversity."""
-    ordered = sorted(rows, key=lambda row: (row["route_length"], row["habitat_episode_id"]))
-    if len(ordered) < PILOT_PER_SCENE:
+def _allocate_scene_quotas(
+    full_scene_counts: dict[str, int], per_scene: int,
+) -> tuple[dict[str, int], dict[str, dict[str, Any]]]:
+    """Fill scene deficits by distinct surplus scenes in deterministic rank order."""
+    target = len(full_scene_counts) * per_scene
+    if sum(full_scene_counts.values()) < target:
         raise ValueError(
-            f"scene {scene_id} has only {len(ordered)} Episodes; need 20"
+            f"dataset has only {sum(full_scene_counts.values())} Episodes; "
+            f"Pilot needs {target}"
+        )
+    quotas = {
+        scene_id: min(count, per_scene)
+        for scene_id, count in full_scene_counts.items()
+    }
+    shortfall = target - sum(quotas.values())
+    # Every pass gives at most one extra seat to each scene. This avoids
+    # concentrating two missing seats in the single largest scene. Because
+    # each candidate starts at the same base quota, ranking by remaining
+    # candidate count is equivalent to ranking by original scene size.
+    recipients = sorted(
+        (scene_id for scene_id in quotas if full_scene_counts[scene_id] > per_scene),
+        key=lambda scene_id: (-(full_scene_counts[scene_id] - per_scene), scene_id),
+    )
+    while shortfall:
+        assigned = 0
+        for scene_id in recipients:
+            if quotas[scene_id] >= full_scene_counts[scene_id]:
+                continue
+            quotas[scene_id] += 1
+            shortfall -= 1
+            assigned += 1
+            if not shortfall:
+                break
+        if not assigned:
+            raise ValueError(
+                f"cannot redistribute {shortfall} missing Pilot seats; "
+                "no scenes have spare Episodes"
+            )
+    allocation: dict[str, dict[str, Any]] = {}
+    for scene_id, count in sorted(full_scene_counts.items()):
+        quota = quotas[scene_id]
+        if count < per_scene:
+            reason = "all_available_below_base"
+        elif quota > per_scene:
+            reason = "redistributed_shortfall"
+        else:
+            reason = "base_quota"
+        allocation[scene_id] = {
+            "available_episodes": count,
+            "base_quota": per_scene,
+            "selected_quota": quota,
+            "adjustment": quota - per_scene,
+            "reason": reason,
+        }
+    return quotas, allocation
+
+
+def _distance_quotas(quota: int) -> dict[str, int]:
+    """Balance selected routes across short/medium/long, short first on ties."""
+    base, remainder = divmod(quota, 3)
+    return {
+        group: base + (index < remainder)
+        for index, group in enumerate(DISTANCE_GROUPS)
+    }
+
+
+def _select_scene(
+    rows: list[dict[str, Any]], scene_id: str, seed: int, quota: int,
+) -> list[dict[str, Any]]:
+    """Select a scene's balanced route-length strata with trajectory diversity."""
+    ordered = sorted(rows, key=lambda row: (row["route_length"], row["habitat_episode_id"]))
+    if len(ordered) < quota:
+        raise ValueError(
+            f"scene {scene_id} has only {len(ordered)} Episodes; need {quota}"
         )
     # Rank tertiles keep all source Episodes eligible without arbitrary distance
-    # thresholds or silently shrinking the sample at tied values.
-    first = len(ordered) // 3
-    second = 2 * len(ordered) // 3
+    # thresholds or silently shrinking the sample at tied values. Put the
+    # remainder into shorter strata so 20 candidates form 7/7/6, not 6/7/7.
+    bucket_sizes = _distance_quotas(len(ordered))
+    first = bucket_sizes["short"]
+    second = first + bucket_sizes["medium"]
     buckets = {
         "short": ordered[:first],
         "medium": ordered[first:second],
         "long": ordered[second:],
     }
+    quotas = _distance_quotas(quota)
     counts = Counter(row["trajectory_id"] for row in ordered)
     used_trajectories: set[str] = set()
     selected: list[dict[str, Any]] = []
-    for group, quota in QUOTAS.items():
+    for group, group_quota in quotas.items():
         candidates = list(buckets[group])
-        if len(candidates) < quota:
+        if len(candidates) < group_quota:
             raise ValueError(
                 f"scene {scene_id} {group} stratum has {len(candidates)} "
-                f"Episodes; need {quota}"
+                f"Episodes; need {group_quota}"
             )
         rng = random.Random(_seed_for(scene_id, group, seed))
         rng.shuffle(candidates)
-        while sum(row["distance_group"] == group for row in selected) < quota:
+        for _ in range(group_quota):
             # Prefer a new trajectory, then the rarer trajectory among all
             # source Episodes. The seeded shuffle breaks remaining ties.
             choice = min(
@@ -138,7 +209,7 @@ def sample_pilot(
 ) -> dict[str, Any]:
     """Read source Episodes and return the immutable pilot selection record."""
     if per_scene != PILOT_PER_SCENE:
-        raise ValueError("this pilot protocol requires exactly 20 Episodes per scene")
+        raise ValueError("this pilot protocol requires base target 20 Episodes per scene")
     if seed != SEED:
         raise ValueError("this pilot protocol requires sample seed 42")
     source = resolve_dataset_path(dataset_path)
@@ -181,14 +252,17 @@ def sample_pilot(
     full_scene_counts = {
         scene: len(rows) for scene, rows in sorted(by_scene.items())
     }
+    scene_quotas, scene_allocation = _allocate_scene_quotas(
+        full_scene_counts, per_scene,
+    )
     selected: list[dict[str, Any]] = []
     for scene_id, rows in sorted(by_scene.items()):
-        selected.extend(_select_scene(rows, scene_id, seed))
+        selected.extend(_select_scene(rows, scene_id, seed, scene_quotas[scene_id]))
     selected = sorted(
         selected,
         key=lambda row: (
             row["scene_id"],
-            list(QUOTAS).index(row["distance_group"]),
+            DISTANCE_GROUPS.index(row["distance_group"]),
             row["route_length"],
             row["habitat_episode_id"],
         ),
@@ -214,6 +288,8 @@ def sample_pilot(
         "expected_count": len(selected),
         "per_scene": per_scene,
         "full_scene_counts": full_scene_counts,
+        "scene_quotas": scene_quotas,
+        "scene_allocation": scene_allocation,
         "episodes": selected,
     }
 
