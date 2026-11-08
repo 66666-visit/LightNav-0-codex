@@ -119,13 +119,28 @@ the recorded group selection and rejects changes to it. The launcher fixes
 Episode manifest against exactly `EXPECTED_EPISODES=1839`, then verifies
 exact coverage before creating `formal_complete.json`.
 
+For the fixed R2R Pilot A/B comparison, set `DATA_PATH` to the existing R2R
+dataset root containing `val_unseen/val_unseen.json.gz`, then pass
+`--groups baseline_off,hierarchical_topology --pilot-per-scene 20` to
+`scripts/run_memory_ablation.sh`. The launcher uses sampling seed 42 and
+selects 7 short, 7 medium, and 6 long routes per scene across all 11 scenes.
+It writes `pilot_manifest.json` once, serves only those 220 Episode IDs, sets
+`EXPECTED_EPISODES=220`, and requires each arm's `pilot_complete.json` after
+exact coverage checks. `--resume DIR` reuses the saved manifest. This mode
+does not write `formal_complete.json`; omitting `--pilot-per-scene` retains the
+full 1,839-Episode evaluation. `SCENES_DIR` should match the scene path used
+by the Habitat dataset loader. See [MEMORY_ABLATION.md](MEMORY_ABLATION.md).
+
 The underlying `scripts/eval_habitat.sh` also accepts `STRICT_FULL_EVAL=1`
 for the full-split gate, `RESUME=1` to skip existing completed Episodes,
 `EPISODE_MANIFEST_PATH` to create or compare a shared manifest, `SEED` for
 server and client, and `NO_FORCE_STOP=1` to let the standard Habitat step cap
 truncate. Its matching client flags are `--strict_full_eval`, `--resume`,
 `--seed N`, and `--no_force_stop`; the Habitat server receives `--seed N` and
-`--strict-full-eval`. The ordinary defaults remain available for smoke tests.
+`--strict-full-eval`. For Pilot runs, `PILOT_MANIFEST_PATH` supplies the fixed
+selection to the Habitat server as `--pilot-manifest`; the integrity gate
+checks exact selected IDs and writes `pilot_complete.json`. The ordinary
+defaults remain available for smoke tests.
 
 `lightnav-serve` flags (environment names are what `scripts/start_servers.sh` and
 `docker/entrypoint.sh` read):

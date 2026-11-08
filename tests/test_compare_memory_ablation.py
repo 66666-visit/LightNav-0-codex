@@ -159,6 +159,187 @@ class CompareMemoryAblationTest(unittest.TestCase):
                 "expected_count": 1839, "manifest_sha256": digest,
             })
 
+    def _prepare_complete_pilot(self) -> None:
+        selected = ("baseline_off", "hierarchical_topology")
+        counts = {f"scene_{scene}": 167 for scene in range(11)}
+        counts["scene_10"] = 169
+        rows = []
+        pilot_rows = []
+        for scene in range(11):
+            for index in range(20):
+                scene_id, episode_id = f"scene_{scene}", f"episode_{scene}_{index}"
+                rows.append({"scene_id": scene_id, "episode_id": episode_id})
+                pilot_rows.append({
+                    "scene_id": scene_id, "habitat_episode_id": episode_id,
+                    "episode_id": episode_id, "trajectory_id": f"trajectory_{index}",
+                    "distance_group": ("short" if index < 7 else
+                                       "medium" if index < 14 else "long"),
+                    "route_length": float(index + 1), "sample_seed": 42,
+                    "dataset_split": "val_unseen", "source_dataset": "/r2r.json.gz",
+                    "sampling_method": "per_scene_geodesic_tertiles_7_7_6_trajectory_diverse",
+                })
+        manifest = {"split": "val_unseen", "expected_count": 220, "episodes": rows}
+        _write_json(self.root / "episode_manifest.json", manifest)
+        _write_json(self.root / "pilot_manifest.json", {
+            "dataset_split": "val_unseen", "sample_seed": 42,
+            "sampling_method": "per_scene_geodesic_tertiles_7_7_6_trajectory_diverse",
+            "expected_count": 220, "per_scene": 20,
+            "full_scene_counts": counts, "episodes": pilot_rows,
+        })
+        _write_json(self.root / "ablation_run.json", {
+            "groups": list(selected), "pilot_per_scene": 20,
+            "pilot_manifest_sha256": hashlib.sha256(
+                (self.root / "pilot_manifest.json").read_bytes()
+            ).hexdigest(),
+        })
+        digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        for name in selected:
+            directory = self.root / name
+            _write_json(directory / "episode_manifest.json", manifest)
+            config_path = directory / "config_snapshot.yaml"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["common"]["expected_episodes"] = 220
+            _write_json(config_path, config)
+            results = []
+            diagnostics = []
+            for scene in range(11):
+                for index in range(20):
+                    scene_id, episode_id = f"scene_{scene}", f"episode_{scene}_{index}"
+                    is_agent = name == "hierarchical_topology"
+                    results.append({
+                        "scene_id": scene_id, "habitat_episode_id": episode_id,
+                        "episode_id": f"eval_{scene}_{index}",
+                        "success": index % 2 == 0 or (is_agent and index == 1),
+                        "oracle_success": True,
+                        "spl": 0.6 if is_agent else 0.5,
+                        "ndtw": 0.8 if is_agent else 0.7,
+                        "final_distance": 1.8 if is_agent else 2.0,
+                        "steps": 1, "episode_time_sec": 2.0 if is_agent else 1.0,
+                        "inference_latency_ms_mean": 12.0 if is_agent else 10.0,
+                    })
+                    diagnostic = {
+                        "scene_id": scene_id, "habitat_episode_id": episode_id,
+                        "step": 0, "inference_latency_ms": 12.0 if is_agent else 10.0,
+                        "prompt_chars": 150 if is_agent else 100,
+                    }
+                    if is_agent:
+                        diagnostic.update({
+                            "extraction_attempted": True, "yolo_detection_ms": 3.0,
+                            "injected_records": 1, "injected_memory_chars": 40,
+                            "place_extraction_attempted": True, "place_extraction_ms": 7.0,
+                            "topology_nodes": 1, "topology_edges": 0,
+                            "place_revisited": False, "place_transition": None,
+                        })
+                    diagnostics.append(diagnostic)
+            _write_jsonl(directory / "results.jsonl", results)
+            _write_jsonl(directory / "memory_diagnostics.jsonl", diagnostics)
+            _write_json(directory / "summary.json", {
+                "num_episodes": 220, "total_time_sec": 10.0, "metrics": {},
+            })
+            (directory / "formal_complete.json").unlink()
+            _write_json(directory / "pilot_complete.json", {
+                "expected_count": 220, "manifest_sha256": digest,
+            })
+
+    def test_pilot_ab_report_contains_scene_and_paired_statistics(self) -> None:
+        self._prepare_complete_pilot()
+        report = ablation.compare(self.root, samples=30, seed=42)
+        self.assertEqual(report["evaluation_mode"], "pilot")
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(len(report["per_episode"]), 220)
+        self.assertEqual(report["pilot"]["sampled_scene_count"], 11)
+        baseline = report["groups"]["baseline_off"]
+        agent = report["groups"]["hierarchical_topology"]
+        self.assertEqual(baseline["success_count"], 110)
+        self.assertEqual(agent["success_count"], 121)
+        self.assertEqual(agent["metrics"]["SR_pct"]["mean"], 55.0)
+        self.assertEqual(len(agent["pilot_scenes"]["by_scene"]), 11)
+        self.assertEqual(agent["pilot_scenes"]["by_scene"]["scene_0"]["sampled_episodes"], 20)
+        self.assertEqual(agent["pilot_scenes"]["scene_macro_mean"]["SR_pct"], 55.0)
+        self.assertEqual(agent["pilot_scenes"]["full_val_scene_weighted_estimate"]["SR_pct"], 55.0)
+        self.assertEqual(agent["runtime"]["total_episode_time_sec"], 440.0)
+        self.assertEqual(agent["memory"]["yolo_detection"]["calls"], 220)
+        self.assertEqual(agent["memory"]["dinov2_extraction"]["calls"], 220)
+        pair = report["paired_differences"]["hierarchical_topology_minus_baseline_off"]
+        self.assertEqual(pair["paired_count"], 220)
+        self.assertEqual(pair["sr_flips"], {
+            "success_to_failure": 0, "failure_to_success": 11,
+        })
+        self.assertAlmostEqual(pair["metrics"]["SR_pct"]["mean"], 5.0)
+        self.assertEqual(len(pair["metrics"]["SR_pct"]["ci95"]), 2)
+        self.assertEqual(pair["per_episode"][1]["delta"]["SR_pct"], 100.0)
+        ablation.write_report(self.root, report)
+        self.assertTrue((self.root / "comparison.json").is_file())
+
+    def test_pilot_missing_duplicate_and_wrong_marker_cannot_complete(self) -> None:
+        self._prepare_complete_pilot()
+        path = self.root / "hierarchical_topology" / "results.jsonl"
+        original = path.read_text(encoding="utf-8")
+        path.write_text("\n".join(original.splitlines()[:-1]) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "missing 1 manifest Episode"):
+            ablation.compare(self.root, samples=10)
+        path.write_text(original + original.splitlines()[0] + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "duplicate Episode ID"):
+            ablation.compare(self.root, samples=10)
+        path.write_text(original, encoding="utf-8")
+        directory = self.root / "hierarchical_topology"
+        (directory / "pilot_complete.json").unlink()
+        with self.assertRaisesRegex(ValueError, "ablation is incomplete"):
+            ablation.compare(self.root, samples=10)
+        _write_json(directory / "formal_complete.json", {"expected_count": 220})
+        with self.assertRaisesRegex(ValueError, "wrong evaluation mode"):
+            ablation.compare(self.root, samples=10)
+
+    def test_pilot_interrupted_results_remain_provisional(self) -> None:
+        self._prepare_complete_pilot()
+        directory = self.root / "hierarchical_topology"
+        result_path = directory / "results.jsonl"
+        rows = result_path.read_text(encoding="utf-8").splitlines()
+        result_path.write_text("\n".join(rows[:-1]) + "\n", encoding="utf-8")
+        (directory / "pilot_complete.json").unlink()
+        (directory / "summary.json").unlink()
+        report = ablation.compare(self.root, allow_incomplete=True, samples=10)
+        self.assertEqual(report["status"], "incomplete")
+        self.assertEqual(report["groups"]["hierarchical_topology"]["completed_episodes"], 219)
+        self.assertEqual(len(report["groups"]["hierarchical_topology"]["missing_episode_ids"]), 1)
+        self.assertIsNone(report["groups"]["hierarchical_topology"]["pilot_scenes"][
+            "full_val_scene_weighted_estimate"]["SR_pct"])
+
+    def test_pilot_manifest_must_match_selected_episode_ids_and_scene_quotas(self) -> None:
+        self._prepare_complete_pilot()
+        path = self.root / "pilot_manifest.json"
+        pilot = json.loads(path.read_text(encoding="utf-8"))
+        pilot["episodes"][0]["habitat_episode_id"] = "wrong"
+        _write_json(path, pilot)
+        with self.assertRaisesRegex(ValueError, "Episode IDs differ"):
+            ablation.compare(self.root, samples=10)
+        pilot["episodes"][0]["habitat_episode_id"] = "episode_0_0"
+        pilot["episodes"][0]["distance_group"] = "long"
+        _write_json(path, pilot)
+        with self.assertRaisesRegex(ValueError, "7/7/6"):
+            ablation.compare(self.root, samples=10)
+
+    def test_pilot_manifest_valid_metadata_change_rejected_by_immutable_digest(self) -> None:
+        self._prepare_complete_pilot()
+        path = self.root / "pilot_manifest.json"
+        pilot = json.loads(path.read_text(encoding="utf-8"))
+        pilot["full_scene_counts"]["scene_0"] += 1
+        pilot["full_scene_counts"]["scene_1"] -= 1
+        _write_json(path, pilot)
+        with self.assertRaisesRegex(ValueError, "immutable ablation_run.json digest"):
+            ablation.compare(self.root, samples=10)
+
+    def test_pilot_scene_weighting_uses_full_split_scene_counts(self) -> None:
+        metrics = {
+            ("one", "a"): {"SR_pct": 100.0},
+            ("two", "b"): {"SR_pct": 0.0},
+        }
+        result = ablation._pilot_scene_statistics(
+            metrics, {"one": 3, "two": 1}, per_scene=1, samples=10, seed=42,
+        )
+        self.assertEqual(result["scene_macro_mean"]["SR_pct"], 50.0)
+        self.assertEqual(result["full_val_scene_weighted_estimate"]["SR_pct"], 75.0)
+
     def test_selected_ab_comparison_uses_all_1839_paired_episode_ids(self) -> None:
         self._prepare_complete_ab()
         report = ablation.compare(self.root, samples=30, seed=7)

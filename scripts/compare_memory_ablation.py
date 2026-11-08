@@ -1,4 +1,4 @@
-"""Validate and compare selected, paired, full-split R2R memory ablations.
+"""Validate and compare selected, paired R2R memory ablations.
 
 Reads measured episode results and step diagnostics. Missing measurements remain
 null; the script never substitutes an estimate. A partial run is inspectable
@@ -26,6 +26,9 @@ GROUPS = (
     "hierarchical_topology",
 )
 FORMAL_R2R_EPISODES = 1839
+PILOT_SCENES = 11
+PILOT_PER_SCENE = 20
+PILOT_EPISODES = PILOT_SCENES * PILOT_PER_SCENE
 METRICS = (
     "SR_pct", "OS_pct", "SPL_pct", "nDTW_pct", "NE_m",
     "avg_steps", "mean_inference_latency_ms",
@@ -255,9 +258,61 @@ def load_selected_groups(root: Path) -> tuple[str, ...]:
     return tuple(selected)
 
 
+def _pilot_manifest(
+    root: Path, expected: list[EpisodeKey], *, per_scene: int,
+    expected_sha256: str,
+) -> dict[str, Any]:
+    """Validate that the fixed pilot selection matches the evaluation manifest."""
+    pilot = _read_json(root / "pilot_manifest.json")
+    if (
+        pilot.get("dataset_split") != "val_unseen"
+        or pilot.get("sample_seed") != 42
+        or pilot.get("per_scene") != per_scene
+        or pilot.get("expected_count") != len(expected)
+    ):
+        raise ValueError("pilot_manifest.json split, seed or counts disagree with pilot run")
+    rows = pilot.get("episodes")
+    counts = pilot.get("full_scene_counts")
+    if not isinstance(rows, list) or len(rows) != len(expected):
+        raise ValueError("pilot_manifest.json must list every selected Episode")
+    if not isinstance(counts, dict) or len(counts) != PILOT_SCENES or (
+        any(type(count) is not int or count < per_scene for count in counts.values())
+        or sum(counts.values()) != FORMAL_R2R_EPISODES
+    ):
+        raise ValueError("pilot full_scene_counts must cover 11 scenes and sum to 1839")
+    selected = []
+    scene_groups: dict[str, dict[str, int]] = {}
+    for row in rows:
+        key = _episode_key(row)
+        selected.append(key)
+        if key[0] not in counts:
+            raise ValueError(f"pilot scene {key[0]} absent from full_scene_counts")
+        group = row.get("distance_group")
+        if group not in ("short", "medium", "long"):
+            raise ValueError(f"pilot Episode {key} has invalid distance_group")
+        length = _number(row.get("route_length"), "pilot route_length")
+        if length < 0:
+            raise ValueError("pilot route_length must be nonnegative")
+        if row.get("sample_seed") != 42 or row.get("dataset_split") != "val_unseen":
+            raise ValueError(f"pilot Episode {key} has inconsistent seed or split")
+        groups = scene_groups.setdefault(key[0], {"short": 0, "medium": 0, "long": 0})
+        groups[group] += 1
+    if len(set(selected)) != len(selected) or set(selected) != set(expected):
+        raise ValueError("pilot_manifest.json Episode IDs differ from episode_manifest.json")
+    if len(scene_groups) != PILOT_SCENES or any(
+        groups != {"short": 7, "medium": 7, "long": 6}
+        for groups in scene_groups.values()
+    ):
+        raise ValueError("pilot must contain 11 scenes with 7/7/6 route groups each")
+    actual_sha256 = hashlib.sha256((root / "pilot_manifest.json").read_bytes()).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError("pilot_manifest.json differs from immutable ablation_run.json digest")
+    return pilot
+
+
 def _load_group(
     root: Path, name: str, manifest: dict[str, Any], expected: list[EpisodeKey],
-    *, allow_incomplete: bool,
+    *, allow_incomplete: bool, pilot: bool = False,
 ) -> GroupData:
     directory = root / name
     if not directory.is_dir() and not allow_incomplete:
@@ -349,12 +404,15 @@ def _load_group(
             duration = attempt.get("wall_time_sec")
             if duration is not None and _number(duration, "wall_time_sec") < 0:
                 raise ValueError("wall_time_sec must be nonnegative")
-    marker_path = directory / "formal_complete.json"
+    marker_path = directory / ("pilot_complete.json" if pilot else "formal_complete.json")
+    opposite_marker = directory / ("formal_complete.json" if pilot else "pilot_complete.json")
+    if opposite_marker.is_file():
+        raise ValueError(f"{name} has a completion marker for the wrong evaluation mode")
     if marker_path.is_file():
         marker = _read_json(marker_path)
         digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
         if marker != {"expected_count": len(expected), "manifest_sha256": digest}:
-            raise ValueError(f"{name} formal completion marker disagrees with manifest")
+            raise ValueError(f"{name} completion marker disagrees with manifest")
     artifacts_complete = bool(
         group_manifest.is_file() and config_present and summary_path.is_file()
         and (directory / "results.jsonl").is_file()
@@ -368,7 +426,7 @@ def _load_group(
 
 
 def _validate_common_configs(
-    groups: dict[str, GroupData], *, expected_count: int,
+    groups: dict[str, GroupData], *, expected_count: int, pilot: bool = False,
 ) -> None:
     required = {
         "model_path", "model_config_sha256", "eval_config_sha256",
@@ -392,7 +450,8 @@ def _validate_common_configs(
             or common["expected_episodes"] != expected_count
             or common["force_stop_at_max_steps"] is not False
         ):
-            raise ValueError(f"{name} does not use formal full-split VLN-CE settings")
+            mode = "pilot" if pilot else "formal full-split"
+            raise ValueError(f"{name} does not use {mode} VLN-CE settings")
         comparable = common, group.config.get("server_args")
         if reference is None:
             reference = comparable
@@ -619,6 +678,43 @@ def _check_summary_metrics(group: GroupData, metrics: dict[str, dict[str, Any]])
             )
 
 
+def _pilot_scene_statistics(
+    metrics: dict[EpisodeKey, dict[str, float | None]],
+    full_scene_counts: dict[str, int], *, per_scene: int, samples: int, seed: int,
+) -> dict[str, Any]:
+    """Report measured scene means and clearly labelled full-split estimates."""
+    scenes: dict[str, Any] = {}
+    for scene in sorted(full_scene_counts):
+        values = [row for key, row in metrics.items() if key[0] == scene]
+        scenes[scene] = {
+            "sampled_episodes": len(values),
+            "full_val_unseen_episodes": full_scene_counts[scene],
+            "metrics": _metric_summary(values, samples=samples, seed=seed),
+        }
+    macro: dict[str, float | None] = {}
+    weighted: dict[str, float | None] = {}
+    total_full = sum(full_scene_counts.values())
+    for metric in (*METRICS, "episode_time_sec"):
+        scene_means = [scenes[scene]["metrics"][metric]["mean"] for scene in scenes]
+        if any(value is None for value in scene_means) or any(
+            scenes[scene]["sampled_episodes"] != per_scene for scene in scenes
+        ):
+            macro[metric] = None
+            weighted[metric] = None
+            continue
+        macro[metric] = fmean(scene_means)
+        weighted[metric] = sum(
+            float(scenes[scene]["metrics"][metric]["mean"])
+            * full_scene_counts[scene] / total_full
+            for scene in scenes
+        )
+    return {
+        "by_scene": scenes,
+        "scene_macro_mean": macro,
+        "full_val_scene_weighted_estimate": weighted,
+    }
+
+
 def compare(
     root: Path, *, allow_incomplete: bool = False, samples: int = 2000, seed: int = 0,
 ) -> dict[str, Any]:
@@ -626,19 +722,41 @@ def compare(
         raise ValueError("bootstrap samples must be positive")
     selected_groups = load_selected_groups(root)
     manifest, expected = load_manifest(root)
-    if (root / "ablation_run.json").is_file() and (
-        "groups" in _read_json(root / "ablation_run.json")
-        and len(expected) != FORMAL_R2R_EPISODES
+    snapshot_path = root / "ablation_run.json"
+    snapshot = _read_json(snapshot_path) if snapshot_path.is_file() else {}
+    pilot_per_scene = snapshot.get("pilot_per_scene")
+    if "pilot_per_scene" in snapshot and (
+        type(pilot_per_scene) is not int or pilot_per_scene != PILOT_PER_SCENE
     ):
+        raise ValueError("pilot_per_scene must be 20 for the 11-scene pilot")
+    pilot = pilot_per_scene is not None
+    if not pilot and (root / "pilot_manifest.json").is_file():
+        raise ValueError("pilot_manifest.json exists in a formal ablation directory")
+    if pilot and selected_groups != ("baseline_off", "hierarchical_topology"):
+        raise ValueError("pilot requires baseline_off,hierarchical_topology in that order")
+    pilot_metadata = None
+    if pilot:
+        if len(expected) != PILOT_EPISODES:
+            raise ValueError(
+                f"pilot requires {PILOT_EPISODES} Episode IDs; manifest has {len(expected)}"
+            )
+        digest = snapshot.get("pilot_manifest_sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ValueError("pilot run lacks an immutable pilot_manifest_sha256")
+        pilot_metadata = _pilot_manifest(
+            root, expected, per_scene=pilot_per_scene, expected_sha256=digest,
+        )
+    elif "groups" in snapshot and len(expected) != FORMAL_R2R_EPISODES:
         raise ValueError(
             f"selected formal R2R groups require {FORMAL_R2R_EPISODES} Episode IDs; "
             f"manifest has {len(expected)}"
         )
     groups = {
-        name: _load_group(root, name, manifest, expected, allow_incomplete=allow_incomplete)
+        name: _load_group(root, name, manifest, expected,
+                          allow_incomplete=allow_incomplete, pilot=pilot)
         for name in selected_groups
     }
-    _validate_common_configs(groups, expected_count=len(expected))
+    _validate_common_configs(groups, expected_count=len(expected), pilot=pilot)
     measurement_gaps = {name: _measurement_gaps(group) for name, group in groups.items()}
     complete = all(
         not group.missing and not group.diagnostic_gaps and group.artifacts_complete
@@ -673,6 +791,7 @@ def compare(
         _check_summary_metrics(group, summary)
         group_report[name] = {
             "completed_episodes": len(group.records),
+            "success_count": sum(row["SR_pct"] == 100.0 for row in metrics.values()),
             "missing_episode_ids": [_key_dict(key) for key in group.missing],
             "diagnostic_gaps": [
                 {**_key_dict(key), "missing_steps": steps}
@@ -684,6 +803,11 @@ def compare(
             "runtime": _runtime_stats(group),
             "memory": _memory_stats(group),
         }
+        if pilot_metadata is not None:
+            group_report[name]["pilot_scenes"] = _pilot_scene_statistics(
+                metrics, pilot_metadata["full_scene_counts"],
+                per_scene=pilot_per_scene, samples=samples, seed=seed,
+            )
 
     per_episode = []
     for key in expected:
@@ -729,8 +853,9 @@ def compare(
                 "per_episode": differences,
             }
 
-    return {
+    report = {
         "status": "complete" if complete else "incomplete",
+        "evaluation_mode": "pilot" if pilot else "formal",
         "selected_groups": list(selected_groups),
         "manifest": manifest,
         "bootstrap": {"samples": samples, "seed": seed, "unit": "episode"},
@@ -738,6 +863,19 @@ def compare(
         "per_episode": per_episode,
         "paired_differences": paired,
     }
+    if pilot_metadata is not None:
+        report["pilot"] = {
+            "per_scene": pilot_per_scene,
+            "sampled_scene_count": PILOT_SCENES,
+            "full_scene_counts": pilot_metadata["full_scene_counts"],
+            "estimate_note": (
+                "Scene-weighted pilot estimates use measured pilot results and full "
+                "val_unseen scene counts; they are not full-split benchmark scores. "
+                "Episode bootstrap intervals condition on this 220-Episode selection "
+                "and do not fully quantify between-scene uncertainty (11 scenes)."
+            ),
+        }
+    return report
 
 
 def write_report(root: Path, report: dict[str, Any]) -> None:

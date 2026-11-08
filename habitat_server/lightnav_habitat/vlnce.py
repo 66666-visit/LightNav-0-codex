@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -129,6 +131,7 @@ class VLNCEEnv(BaseHabitatEnv):
         early_stop_steps: int = 0,
         seed: Optional[int] = None,
         strict_full_eval: bool = False,
+        pilot_manifest_path: Optional[str] = None,
     ):
         """
         Args:
@@ -153,6 +156,7 @@ class VLNCEEnv(BaseHabitatEnv):
         self.success_distance = success_distance
         self.seed = seed
         self.strict_full_eval = strict_full_eval
+        self.pilot_manifest_path = pilot_manifest_path
         self.habitat_time_step: Optional[float] = None
         self.lin_vel_range: Optional[Tuple[float, float]] = None
         self.ang_vel_range: Optional[Tuple[float, float]] = None
@@ -224,7 +228,7 @@ class VLNCEEnv(BaseHabitatEnv):
         """Scene-sorted contiguous slicing for parallel evaluation (last shard takes the rest)."""
         if self.split_num is None or self.split_id is None:
             return
-        all_episodes = list(env._dataset.episodes)
+        all_episodes = list(env.episodes if self.pilot_manifest_path else env._dataset.episodes)
         all_episodes.sort(key=lambda ep: ep.scene_id)
         total_episodes = len(all_episodes)
         chunk_size = total_episodes // self.split_num
@@ -241,6 +245,45 @@ class VLNCEEnv(BaseHabitatEnv):
             f"[Parallel] Split {self.split_id}/{self.split_num}: "
             f"{len(split_episodes)}/{total_episodes} episodes, {n_scenes} scenes (scene-sorted)"
         )
+
+    def _apply_pilot_selection(self, env: Any) -> None:
+        """Keep only fixed Pilot IDs before sharding; metadata never reaches the policy."""
+        if not self.pilot_manifest_path:
+            return
+        data = json.loads(Path(self.pilot_manifest_path).read_text(encoding="utf-8"))
+        rows = data.get("episodes")
+        if (
+            data.get("dataset_split") != "val_unseen"
+            or data.get("expected_count") != 220
+            or not isinstance(rows, list) or len(rows) != 220
+        ):
+            raise ValueError("Pilot manifest must contain exactly 220 val_unseen episodes")
+        wanted = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("Pilot manifest has a non-object episode")
+            key = (str(row.get("scene_id", "")), str(row.get("habitat_episode_id", "")))
+            if not all(key) or key in wanted:
+                raise ValueError(f"Pilot manifest has an invalid or duplicate Episode: {key}")
+            wanted.add(key)
+        available = list(env.episodes)
+        if len(available) != 1839:
+            raise ValueError(f"Pilot requires 1839 loaded val_unseen episodes; got {len(available)}")
+        selected = [
+            ep for ep in available
+            if (str(ep.scene_id), str(ep.episode_id)) in wanted
+        ]
+        actual = [(str(ep.scene_id), str(ep.episode_id)) for ep in selected]
+        if len(actual) != len(wanted) or len(set(actual)) != len(wanted):
+            missing = sorted(wanted - set(actual))
+            raise ValueError(
+                f"Pilot IDs differ from loaded Habitat dataset (scene path/ID mismatch): "
+                f"missing={missing[:5]}"
+            )
+        # Habitat's episode property setter rebuilds its iterator. Only selected
+        # episodes can subsequently be reset or stepped by the evaluation client.
+        env.episodes = selected
+        logger.info("Pilot selected %d/%d loaded episodes before sharding", len(selected), len(available))
 
     def _create_habitat_env(self) -> Any:
         try:
@@ -327,6 +370,7 @@ class VLNCEEnv(BaseHabitatEnv):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Could not summarize dataset size: {e}")
 
+        self._apply_pilot_selection(env)
         self._apply_episode_split(env)
         return env
 

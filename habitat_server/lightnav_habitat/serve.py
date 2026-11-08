@@ -82,6 +82,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--scenes-dir", default=None, help="Scene datasets directory override")
     parser.add_argument(
+        "--pilot-manifest", default=None,
+        help="Fixed evaluator-only Episode selection; filter before GPU sharding",
+    )
+    parser.add_argument(
         "--success-distance",
         type=float,
         default=None,
@@ -119,6 +123,8 @@ def main(argv: Optional[list] = None) -> None:
         or args.split not in (None, "val_unseen")
     ):
         parser.error("formal R2R evaluation requires vlnce val_unseen, 500 steps, no early stop")
+    if args.pilot_manifest and (args.task != "vlnce" or not args.strict_full_eval):
+        parser.error("--pilot-manifest requires strict VLN-CE evaluation")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -158,6 +164,7 @@ def main(argv: Optional[list] = None) -> None:
     if args.task == "vlnce":
         kwargs["seed"] = args.seed
         kwargs["strict_full_eval"] = args.strict_full_eval
+        kwargs["pilot_manifest_path"] = args.pilot_manifest
 
     logger.info("Starting Habitat server")
     logger.info("task=%s config=%s port=%d gpu=%d", args.task, args.config, args.port, gpu_id)

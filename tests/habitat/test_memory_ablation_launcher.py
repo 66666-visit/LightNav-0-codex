@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import subprocess
@@ -17,6 +18,24 @@ _EVAL_SCRIPT = _REPO / "scripts" / "eval_habitat.sh"
 
 
 class MemoryAblationLauncherTest(unittest.TestCase):
+    @staticmethod
+    def _fake_pilot_dataset(temp: Path) -> Path:
+        root = temp / "R2R_VLNCE_v1-3_preprocessed"
+        split = root / "val_unseen"
+        split.mkdir(parents=True)
+        episodes = [
+            {
+                "scene_id": f"data/scene_datasets/scene_{scene:02d}/scene.glb",
+                "episode_id": str(scene * 1000 + index),
+                "trajectory_id": str(scene * 1000 + index),
+                "geodesic_distance": float(index + 1),
+            }
+            for scene in range(11) for index in range(21)
+        ]
+        with gzip.open(split / "val_unseen.json.gz", "wt", encoding="utf-8") as stream:
+            json.dump({"episodes": episodes}, stream)
+        return root
+
     @staticmethod
     def _fake_assets(temp: Path) -> tuple[Path, Path, Path]:
         model = temp / "checkpoint"
@@ -48,6 +67,82 @@ class MemoryAblationLauncherTest(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message, result.stderr)
+
+    def test_pilot_option_rejects_wrong_groups_and_sample_size(self) -> None:
+        for arguments, message in (
+            (["--pilot-per-scene", ""], "requires 20"),
+            (["--pilot-per-scene", "19"], "must be 20"),
+            (["--pilot-per-scene", "20", "--groups", "baseline_off"],
+             "Pilot requires --groups baseline_off,hierarchical_topology"),
+        ):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    ["bash", str(_SCRIPT), *arguments], cwd=_REPO,
+                    text=True, capture_output=True, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+    def test_pilot_manifest_is_fixed_and_resume_does_not_resample(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            model, yolo, dino = self._fake_assets(temp)
+            dataset = self._fake_pilot_dataset(temp)
+            output = temp / "pilot"
+            env = dict(os.environ)
+            env.update({
+                "MODEL_PATH": str(model), "YOLO_MODEL_PATH": str(yolo),
+                "DINO_MODEL_PATH": str(dino), "DATA_PATH": str(dataset),
+                "HABITAT_PYTHON": "/bin/false", "CLIENT_PYTHON": "/bin/false",
+                "GPU_IDS": "0", "SEED": "42",
+            })
+            for key in (
+                "CLIENT_ARGS", "SERVER_ARGS", "LANGUAGES", "LOG_DIR", "SUCCESS_DISTANCE",
+                "NAVMESH_CELL_HEIGHT", "EPISODES", "MAX_STEPS", "TASK", "SPLIT",
+                "EXPECTED_EPISODES", "SCENES_DIR",
+            ):
+                env.pop(key, None)
+            command = [
+                "bash", str(_SCRIPT), "--output-root", str(output),
+                "--groups", "baseline_off,hierarchical_topology",
+                "--pilot-per-scene", "20",
+            ]
+            first = subprocess.run(command, cwd=_REPO, env=env, text=True,
+                                   capture_output=True, check=False)
+            self.assertNotEqual(first.returncode, 0)  # fake Habitat preflight
+            manifest_path = output / "pilot_manifest.json"
+            self.assertTrue(manifest_path.is_file(), first.stderr)
+            before = manifest_path.read_bytes()
+            pilot = json.loads(before)
+            self.assertEqual(pilot["expected_count"], 220)
+            self.assertEqual(len(pilot["full_scene_counts"]), 11)
+            self.assertEqual(json.loads((output / "ablation_run.json").read_text())[
+                "pilot_per_scene"], 20)
+            self.assertFalse((output / "baseline_off" / "formal_complete.json").exists())
+            self.assertFalse((output / "flat_memory").exists())
+
+            second = subprocess.run(
+                ["bash", str(_SCRIPT), "--resume", str(output)], cwd=_REPO,
+                env=env, text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(second.returncode, 0)
+            self.assertEqual(manifest_path.read_bytes(), before)
+            self.assertEqual(len(json.loads(
+                (output / "baseline_off" / "run_timing.json").read_text()
+            )["attempts"]), 2)
+
+            with gzip.open(dataset / "val_unseen" / "val_unseen.json.gz", "at",
+                           encoding="utf-8") as stream:
+                stream.write(" ")
+            changed = subprocess.run(
+                ["bash", str(_SCRIPT), "--resume", str(output)], cwd=_REPO,
+                env=env, text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(changed.returncode, 0)
+            self.assertIn("Pilot source dataset differs", changed.stderr)
+            self.assertEqual(len(json.loads(
+                (output / "baseline_off" / "run_timing.json").read_text()
+            )["attempts"]), 2)
 
     def test_formal_run_rejects_short_episode_count_and_step_cap(self) -> None:
         for override, message in (

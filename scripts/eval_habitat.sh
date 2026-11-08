@@ -33,6 +33,7 @@
 #   SEED                 shared Habitat/client random seed for a controlled run
 #   EPISODE_MANIFEST_PATH shared manifest path to create/compare across experiment arms
 #   EXPECTED_EPISODES    standard R2R val_unseen count (default 1839 in formal mode)
+#   PILOT_MANIFEST_PATH  fixed 220-Episode Pilot selection; only those IDs are served
 #   # ---- topology ----
 #   GPU_IDS              GPUs to use, e.g. "0 1 3" (default: all visible GPUs)
 #   NUM_GPUS             alternative to GPU_IDS: use GPUs 0..NUM_GPUS-1
@@ -91,8 +92,21 @@ RESUME=${RESUME:-0}
 SEED=${SEED:-}
 EPISODE_MANIFEST_PATH=${EPISODE_MANIFEST_PATH:-}
 EXPECTED_EPISODES=${EXPECTED_EPISODES:-1839}
+PILOT_MANIFEST_PATH=${PILOT_MANIFEST_PATH:-}
+if [ -n "$PILOT_MANIFEST_PATH" ]; then
+    [ "$STRICT_FULL_EVAL" = 1 ] || {
+        echo "$TAG ERROR: Pilot selection requires STRICT_FULL_EVAL=1" >&2; exit 1;
+    }
+    [ "$EXPECTED_EPISODES" = 220 ] || {
+        echo "$TAG ERROR: Pilot selection requires EXPECTED_EPISODES=220" >&2; exit 1;
+    }
+    [ -f "$PILOT_MANIFEST_PATH" ] || {
+        echo "$TAG ERROR: Pilot manifest not found: $PILOT_MANIFEST_PATH" >&2; exit 1;
+    }
+    PILOT_MANIFEST_PATH="$(cd "$(dirname "$PILOT_MANIFEST_PATH")" && pwd -P)/$(basename "$PILOT_MANIFEST_PATH")"
+fi
 if [ "$STRICT_FULL_EVAL" = 1 ]; then
-    if [ "$EXPECTED_EPISODES" != 1839 ]; then
+    if [ -z "$PILOT_MANIFEST_PATH" ] && [ "$EXPECTED_EPISODES" != 1839 ]; then
         echo "$TAG ERROR: formal R2R val_unseen requires EXPECTED_EPISODES=1839" >&2
         exit 1
     fi
@@ -196,6 +210,7 @@ SNAPSHOT_ACTION_BUNDLE="$ACTION_TOKENIZER_BUNDLE" \
 SNAPSHOT_GPU_MEM_UTIL="$GPU_MEM_UTIL" SNAPSHOT_CLIENT_ARGS="$CLIENT_ARGS" \
 SNAPSHOT_SERVER_ARGS="$SERVER_ARGS" SNAPSHOT_EXPECTED_EPISODES="$EXPECTED_EPISODES" \
 SNAPSHOT_DATA_PATH="$DATA_PATH" SNAPSHOT_SCENES_DIR="$SCENES_DIR" \
+SNAPSHOT_PILOT_MANIFEST="$PILOT_MANIFEST_PATH" \
 "$CLIENT_PYTHON" - <<'PY'
 import hashlib
 import json
@@ -253,6 +268,10 @@ snapshot = {
     "client_args": tokens,
     "server_args": shlex.split(env["SNAPSHOT_SERVER_ARGS"]),
 }
+if env["SNAPSHOT_PILOT_MANIFEST"]:
+    pilot_path = Path(env["SNAPSHOT_PILOT_MANIFEST"])
+    snapshot["pilot_manifest_path"] = str(pilot_path)
+    snapshot["pilot_manifest_sha256"] = digest_if_file(pilot_path)
 target = Path(env["SNAPSHOT_OUTPUT_ROOT"]) / "config_snapshot.yaml"
 if target.exists():
     if json.loads(target.read_text(encoding="utf-8")) != snapshot:
@@ -287,6 +306,7 @@ server_args=(--task "$TASK" --config "$HABITAT_CONFIG" --max-steps "$MAX_STEPS")
 [ -n "$NAVMESH_CELL_HEIGHT" ] && server_args+=(--navmesh-cell-height "$NAVMESH_CELL_HEIGHT")
 [ -n "$DATA_PATH" ] && server_args+=(--data-path "$DATA_PATH")
 [ -n "$SCENES_DIR" ] && server_args+=(--scenes-dir "$SCENES_DIR")
+[ -n "$PILOT_MANIFEST_PATH" ] && server_args+=(--pilot-manifest "$PILOT_MANIFEST_PATH")
 # shellcheck disable=SC2206
 [ -n "$SERVER_ARGS" ] && server_args+=($SERVER_ARGS)
 
@@ -341,6 +361,7 @@ if [ "$STRICT_FULL_EVAL" = 1 ]; then
         --expected-count "$EXPECTED_EPISODES"
     )
     [ -n "$EPISODE_MANIFEST_PATH" ] && manifest_args+=(--shared "$EPISODE_MANIFEST_PATH")
+    [ -n "$PILOT_MANIFEST_PATH" ] && manifest_args+=(--pilot-selection "$PILOT_MANIFEST_PATH")
     PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
         "$CLIENT_PYTHON" -m lightnav.habitat.experiment_integrity \
         "${manifest_args[@]}" "${ready_files[@]}"
@@ -398,6 +419,7 @@ mv "$diagnostics_tmp" "$OUTPUT_ROOT/memory_diagnostics.jsonl"
 if [ "$STRICT_FULL_EVAL" = 1 ] && [ "$FAILED" -eq 0 ]; then
     verify_args=(verify "$OUTPUT_ROOT")
     [ -n "$EPISODE_MANIFEST_PATH" ] && verify_args+=(--shared "$EPISODE_MANIFEST_PATH")
+    [ -n "$PILOT_MANIFEST_PATH" ] && verify_args+=(--pilot-selection "$PILOT_MANIFEST_PATH")
     PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
         "$CLIENT_PYTHON" -m lightnav.habitat.experiment_integrity "${verify_args[@]}"
 fi

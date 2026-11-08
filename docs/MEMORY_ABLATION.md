@@ -142,13 +142,77 @@ The bootstrap RNG seed is separate from the Habitat evaluation seed.
 The comparison tool streams step diagnostics so a full validation set does not
 need to keep every Prompt text and layer record in memory at once.
 
+## Fixed 11-scene Pilot A/B experiment
+
+The Pilot runs **220 selected Episodes** from R2R `val_unseen`: 20 from each of
+its 11 scenes. Within each scene, source `geodesic_distance` ranks routes into
+short, medium, and long thirds. Sampling seed 42 selects **7 short, 7 medium,
+and 6 long** routes per scene, favoring distinct `trajectory_id` values. The
+sampler fails if the route-length field, scene count, or a stratum is missing;
+it does not use either agent's scores. Route lengths, trajectories, and the
+fixed selection are evaluation metadata and never enter the navigation policy.
+
+Set `DATA_PATH` to the existing **R2R dataset root** containing
+`val_unseen/val_unseen.json.gz` (for example,
+`/path/to/R2R_VLNCE_v1-3_preprocessed`). Set `SCENES_DIR` when the Habitat
+configuration uses a scene root other than `data/scene_datasets/`; the sampler
+must produce the same scene IDs as the Habitat loader. With the checkpoint and
+local YOLO/DINO assets set as above, launch only the Pilot A/B pair:
+
+```bash
+export DATA_PATH=/path/to/R2R_VLNCE_v1-3_preprocessed
+export SCENES_DIR=/path/to/scene_datasets
+bash scripts/run_memory_ablation.sh \
+  --groups baseline_off,hierarchical_topology \
+  --pilot-per-scene 20 \
+  --output-root output/r2r_pilot_220
+```
+
+The launcher writes `pilot_manifest.json` once in the new output directory,
+including source dataset SHA-256, scene counts, sampled IDs, route-length
+groups, and trajectory IDs. Each arm's Habitat server filters to those exact
+IDs **before sharding or stepping**; `EPISODES=-1` then iterates its selected
+shard, rather than taking the first 220 of the full split. Both arms use the
+same fixed manifest, checkpoint, seed, 500-step limit, normal STOP/truncation,
+SlowFast, and RVQ path. The loaded shard manifests must exactly match the
+selection before inference starts. Pilot mode accepts only the A/B pair; omit
+`--pilot-per-scene` for the unchanged full 1,839-Episode, four-arm default.
+
+To continue an interrupted Pilot with the same environment variables:
+
+```bash
+bash scripts/run_memory_ablation.sh --resume output/r2r_pilot_220
+```
+
+Resume reuses `pilot_manifest.json` without drawing another sample. It rejects
+changed settings, source dataset bytes, or sample manifest bytes, and skips
+already completed Episode IDs without counting them twice. An arm is complete
+only after its shard results, merged results, summary, and per-step diagnostics
+pass exact coverage checks. Pilot completion writes **`pilot_complete.json`**
+in each arm; it never writes `formal_complete.json` or labels Pilot metrics as
+the full `val_unseen` score. A partial run retains its JSONL results and has
+no completion marker.
+
+The Pilot output has the same per-arm logs, `config_snapshot.yaml`,
+`episode_manifest.json`, `results.jsonl`, `summary.json`,
+`memory_diagnostics.jsonl`, and `run_timing.json` described above. The root
+also contains `ablation_run.json`, the shared `episode_manifest.json`, fixed
+`pilot_manifest.json`, `comparison.json`, and `comparison.csv` after both arms
+complete. The comparison reports measured A/B SR, OS, SPL, nDTW, NE, success
+counts and paired changes, per-Episode paired differences and bootstrap 95%
+intervals, per-scene results, a scene macro mean, and an estimate weighted by
+each scene's **full** validation-set Episode count. The weighted estimate is a
+Pilot extrapolation, not an evaluated full-set result. Runtime and YOLO,
+DINOv2, and topology diagnostics come from recorded logs. With only 11 scenes,
+Pilot confidence intervals have substantial scene-sampling uncertainty.
+
 ## Verification before AutoDL execution
 
 In the Python 3.11 inference environment:
 
 ```bash
-PYTHONPATH=src python -m pytest -q tests/memory tests/habitat/test_policy.py tests/habitat/test_runner.py tests/habitat/test_memory_ablation_launcher.py tests/test_compare_memory_ablation.py
-python -B -m compileall -q src tests scripts
+PYTHONPATH=src python -m pytest -q tests/memory tests/habitat/test_policy.py tests/habitat/test_runner.py tests/habitat/test_memory_ablation_launcher.py tests/habitat/test_experiment_integrity.py tests/habitat/test_pilot_server_selection.py tests/test_sample_r2r_pilot.py tests/test_compare_memory_ablation.py
+python -B -m compileall -q src tests scripts habitat_server
 git diff --check
 ```
 

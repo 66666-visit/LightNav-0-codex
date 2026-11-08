@@ -204,9 +204,45 @@ def combine_shard_manifests(paths: list[str | Path]) -> dict[str, Any]:
     return {"split": split, "expected_count": len(episodes), "episodes": episodes}
 
 
+def check_pilot_selection(manifest: dict[str, Any], pilot_selection: str | Path) -> None:
+    """Require server-loaded IDs to match the fixed, evaluator-only Pilot sample."""
+    canonical = validate_manifest(manifest)
+    data = json.loads(Path(pilot_selection).read_text(encoding="utf-8"))
+    rows = data.get("episodes") if isinstance(data, dict) else None
+    if (
+        not isinstance(data, dict) or data.get("dataset_split") != "val_unseen"
+        or data.get("expected_count") != 220 or data.get("per_scene") != 20
+        or not isinstance(rows, list) or len(rows) != 220
+        or canonical["split"] != "val_unseen" or canonical["expected_count"] != 220
+    ):
+        raise ValueError("Pilot selection requires exactly 220 val_unseen Episode IDs")
+    selected = set()
+    scene_counts: dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("Pilot selection contains a non-object Episode")
+        scene = row.get("scene_id")
+        episode = row.get("habitat_episode_id")
+        if not isinstance(scene, str) or not scene or not isinstance(episode, str) or not episode:
+            raise ValueError("Pilot selection contains an invalid scene or Episode ID")
+        key = (scene, episode)
+        if key in selected:
+            raise ValueError(f"duplicate Episode in Pilot selection: {key}")
+        selected.add(key)
+        scene_counts[scene] = scene_counts.get(scene, 0) + 1
+    if len(scene_counts) != 11 or any(count != 20 for count in scene_counts.values()):
+        raise ValueError("Pilot selection must contain 20 Episodes from each of 11 scenes")
+    loaded = {_key(row) for row in canonical["episodes"]}
+    if loaded != selected:
+        raise ValueError(
+            "loaded Episode IDs differ from fixed Pilot selection: "
+            f"missing={sorted(selected - loaded)[:5]}, extra={sorted(loaded - selected)[:5]}"
+        )
+
+
 def collect_ready_manifests(
     ready_files: list[str | Path], output: str | Path, shared: str | Path | None = None,
-    expected_count: int | None = None,
+    expected_count: int | None = None, pilot_selection: str | Path | None = None,
 ) -> dict[str, Any]:
     combined = combine_shard_manifests(ready_files)
     if expected_count is not None and combined["expected_count"] != expected_count:
@@ -214,6 +250,8 @@ def collect_ready_manifests(
             f"loaded {combined['expected_count']} episodes; expected {expected_count} "
             "for this split"
         )
+    if pilot_selection is not None:
+        check_pilot_selection(combined, pilot_selection)
     write_or_match_manifest(output, combined)
     if shared is not None:
         write_or_match_manifest(shared, combined)
@@ -222,10 +260,13 @@ def collect_ready_manifests(
 
 def verify_group(
     root: str | Path, *, shared: str | Path | None = None,
+    pilot_selection: str | Path | None = None,
 ) -> dict[str, Any]:
     """Require exact shard and merged result coverage before marking completion."""
     root = Path(root)
     manifest = read_manifest(root / "episode_manifest.json")
+    if pilot_selection is not None:
+        check_pilot_selection(manifest, pilot_selection)
     if shared is not None and read_manifest(shared) != manifest:
         raise ValueError("group episode manifest differs from shared manifest")
     shards = sorted(
@@ -331,7 +372,10 @@ def verify_group(
             raise ValueError(f"summary {name} disagrees with Episode results")
     digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
     complete = {"expected_count": manifest["expected_count"], "manifest_sha256": digest}
-    marker = root / "formal_complete.json"
+    marker = root / ("pilot_complete.json" if pilot_selection is not None else "formal_complete.json")
+    opposite = root / ("formal_complete.json" if pilot_selection is not None else "pilot_complete.json")
+    if opposite.exists():
+        raise ValueError(f"conflicting evaluation completion marker: {opposite}")
     if marker.exists():
         if json.loads(marker.read_text(encoding="utf-8")) != complete:
             raise ValueError("existing completion marker does not match this evaluation")
@@ -349,19 +393,25 @@ def main(argv: list[str] | None = None) -> int:
     collect.add_argument("--output", required=True)
     collect.add_argument("--shared")
     collect.add_argument("--expected-count", type=int)
+    collect.add_argument("--pilot-selection", help="fixed Pilot sample; compare exact loaded IDs")
     collect.add_argument("ready_files", nargs="+")
     verify = sub.add_parser("verify", help="verify every loaded episode completed once")
     verify.add_argument("root")
     verify.add_argument("--shared")
+    verify.add_argument("--pilot-selection", help="write pilot_complete.json after exact coverage")
     args = parser.parse_args(argv)
     if args.command == "collect":
         manifest = collect_ready_manifests(
             args.ready_files, args.output, args.shared, args.expected_count,
+            args.pilot_selection,
         )
         print(f"Loaded {manifest['expected_count']} episodes from {len(args.ready_files)} shards")
     else:
-        complete = verify_group(args.root, shared=args.shared)
-        print(f"Formal evaluation complete: {complete['expected_count']} unique episodes")
+        complete = verify_group(
+            args.root, shared=args.shared, pilot_selection=args.pilot_selection,
+        )
+        label = "Pilot" if args.pilot_selection else "Formal"
+        print(f"{label} evaluation complete: {complete['expected_count']} unique episodes")
     return 0
 
 
