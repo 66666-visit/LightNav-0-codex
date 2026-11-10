@@ -16,6 +16,11 @@ from .constants import ACTION_NAMES
 logger = logging.getLogger(__name__)
 
 
+def _normalize_pilot_scene_id(scene_id: str) -> str:
+    """Resolve relative paths and symlinks to the same scene-file identity."""
+    return str(Path(scene_id).resolve())
+
+
 def _action_label(action: Any) -> str:
     """Human-readable label for a discrete-int or velocity-dict action."""
     if isinstance(action, (int, np.integer)):
@@ -268,8 +273,14 @@ class VLNCEEnv(BaseHabitatEnv):
         for row in rows:
             if not isinstance(row, dict):
                 raise ValueError("Pilot manifest has a non-object episode")
-            key = (str(row.get("scene_id", "")), str(row.get("habitat_episode_id", "")))
-            if not all(key) or key in wanted:
+            scene_id = str(row.get("scene_id", ""))
+            episode_id = str(row.get("habitat_episode_id", ""))
+            if not scene_id or not episode_id:
+                raise ValueError(
+                    f"Pilot manifest has an invalid or duplicate Episode: {(scene_id, episode_id)}"
+                )
+            key = (_normalize_pilot_scene_id(scene_id), episode_id)
+            if key in wanted:
                 raise ValueError(f"Pilot manifest has an invalid or duplicate Episode: {key}")
             wanted.add(key)
             if is_rgm_88:
@@ -292,9 +303,12 @@ class VLNCEEnv(BaseHabitatEnv):
             raise ValueError(f"Pilot requires 1839 loaded val_unseen episodes; got {len(available)}")
         selected = [
             ep for ep in available
-            if (str(ep.scene_id), str(ep.episode_id)) in wanted
+            if (_normalize_pilot_scene_id(str(ep.scene_id)), str(ep.episode_id)) in wanted
         ]
-        actual = [(str(ep.scene_id), str(ep.episode_id)) for ep in selected]
+        actual = [
+            (_normalize_pilot_scene_id(str(ep.scene_id)), str(ep.episode_id))
+            for ep in selected
+        ]
         if len(actual) != len(wanted) or len(set(actual)) != len(wanted):
             missing = sorted(wanted - set(actual))
             raise ValueError(
