@@ -33,7 +33,8 @@
 #   SEED                 shared Habitat/client random seed for a controlled run
 #   EPISODE_MANIFEST_PATH shared manifest path to create/compare across experiment arms
 #   EXPECTED_EPISODES    standard R2R val_unseen count (default 1839 in formal mode)
-#   PILOT_MANIFEST_PATH  fixed 220-Episode Pilot selection; only those IDs are served
+#   PILOT_MANIFEST_PATH  fixed 220-Episode legacy or 88-Episode RGM selection
+#   Client progress is streamed to the terminal and saved in client shard logs.
 #   # ---- topology ----
 #   GPU_IDS              GPUs to use, e.g. "0 1 3" (default: all visible GPUs)
 #   NUM_GPUS             alternative to GPU_IDS: use GPUs 0..NUM_GPUS-1
@@ -97,11 +98,21 @@ if [ -n "$PILOT_MANIFEST_PATH" ]; then
     [ "$STRICT_FULL_EVAL" = 1 ] || {
         echo "$TAG ERROR: Pilot selection requires STRICT_FULL_EVAL=1" >&2; exit 1;
     }
-    [ "$EXPECTED_EPISODES" = 220 ] || {
-        echo "$TAG ERROR: Pilot selection requires EXPECTED_EPISODES=220" >&2; exit 1;
-    }
     [ -f "$PILOT_MANIFEST_PATH" ] || {
         echo "$TAG ERROR: Pilot manifest not found: $PILOT_MANIFEST_PATH" >&2; exit 1;
+    }
+    PILOT_EXPECTED_EPISODES="$(python3 - "$PILOT_MANIFEST_PATH" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(88 if manifest.get("protocol_version") == "rgm_pilot_88_v1" else 220)
+PY
+)"
+    [ "$EXPECTED_EPISODES" = "$PILOT_EXPECTED_EPISODES" ] || {
+        echo "$TAG ERROR: Pilot selection requires EXPECTED_EPISODES=$PILOT_EXPECTED_EPISODES" >&2
+        exit 1
     }
     PILOT_MANIFEST_PATH="$(cd "$(dirname "$PILOT_MANIFEST_PATH")" && pwd -P)/$(basename "$PILOT_MANIFEST_PATH")"
 fi
@@ -211,12 +222,17 @@ SNAPSHOT_GPU_MEM_UTIL="$GPU_MEM_UTIL" SNAPSHOT_CLIENT_ARGS="$CLIENT_ARGS" \
 SNAPSHOT_SERVER_ARGS="$SERVER_ARGS" SNAPSHOT_EXPECTED_EPISODES="$EXPECTED_EPISODES" \
 SNAPSHOT_DATA_PATH="$DATA_PATH" SNAPSHOT_SCENES_DIR="$SCENES_DIR" \
 SNAPSHOT_PILOT_MANIFEST="$PILOT_MANIFEST_PATH" \
+SNAPSHOT_REPO_ROOT="$REPO_ROOT" \
+PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
 "$CLIENT_PYTHON" - <<'PY'
 import hashlib
 import json
 import os
 import shlex
+from dataclasses import asdict
 from pathlib import Path
+
+from lightnav.memory.rgm_config import RGMConfig
 
 env = os.environ
 habitat_config = Path(env["SNAPSHOT_HABITAT_CONFIG"]).resolve()
@@ -226,7 +242,7 @@ common_tokens, memory_tokens = [], []
 index = 0
 while index < len(tokens):
     token = tokens[index]
-    group = memory_tokens if token.startswith("--memory_") else common_tokens
+    group = memory_tokens if token.startswith(("--memory_", "--rgm_", "--no-rgm_")) else common_tokens
     group.append(token)
     if token.startswith("--") and index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
         index += 1
@@ -236,11 +252,53 @@ while index < len(tokens):
 def digest_if_file(path):
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 
+def digest_tree(root, suffixes=None):
+    if not root.is_dir():
+        return None
+    files = sorted(path for path in root.rglob("*") if path.is_file()
+                   and (suffixes is None or path.suffix in suffixes))
+    if not files:
+        return None
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(root)).encode())
+        with path.open("rb") as stream:
+            while chunk := stream.read(8 * 1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+repo = Path(env["SNAPSHOT_REPO_ROOT"])
+code_digest = hashlib.sha256()
+for directory in (repo / "src" / "lightnav", repo / "habitat_server" / "lightnav_habitat"):
+    for path in sorted(directory.rglob("*.py")):
+        code_digest.update(str(path.relative_to(repo)).encode())
+        code_digest.update(path.read_bytes())
+bundle = Path(env["SNAPSHOT_ACTION_BUNDLE"]) if env["SNAPSHOT_ACTION_BUNDLE"] else model_path / "action_tokenizer"
+rgm_values = asdict(RGMConfig())
+for index, token in enumerate(tokens):
+    negative = token.startswith("--no-rgm_")
+    if not (token.startswith("--rgm_") or negative):
+        continue
+    name = token.removeprefix("--no-rgm_" if negative else "--rgm_")
+    if name not in rgm_values:
+        raise SystemExit(f"unknown RGM setting in snapshot: {token}")
+    default = rgm_values[name]
+    if isinstance(default, bool):
+        rgm_values[name] = not negative
+    elif negative or index + 1 >= len(tokens):
+        raise SystemExit(f"missing value for RGM setting: {token}")
+    else:
+        rgm_values[name] = type(default)(tokens[index + 1])
+rgm_effective = asdict(RGMConfig(**rgm_values))
+
 snapshot = {
     "common": {
         "model_path": str(model_path),
         "model_config_sha256": digest_if_file(model_path / "config.json"),
         "eval_config_sha256": digest_if_file(model_path / "eval_config.json"),
+        "source_python_sha256": code_digest.hexdigest(),
+        "model_weights_sha256": digest_tree(model_path, {".safetensors", ".bin"}),
+        "action_bundle_sha256": digest_tree(bundle),
         "backend": env["SNAPSHOT_BACKEND"],
         "task": env["SNAPSHOT_TASK"],
         "split": env["SNAPSHOT_SPLIT"],
@@ -265,6 +323,10 @@ snapshot = {
         },
     },
     "memory_args": memory_tokens,
+    "memory_effective": {
+        "enabled": "--memory_enabled" in memory_tokens,
+        "rgm": rgm_effective,
+    },
     "client_args": tokens,
     "server_args": shlex.split(env["SNAPSHOT_SERVER_ARGS"]),
 }
@@ -385,12 +447,24 @@ for ((i = 0; i < N; i++)); do
     port=$((BASE_PORT + i))
     shard_dir="$OUTPUT_ROOT/shard_$i"
     log="$LOG_DIR/client_gpu${g}_shard${i}.log"
+    progress_log="$LOG_DIR/client_progress_gpu${g}_shard${i}.log"
     echo "$TAG client shard $i/$N on GPU $g -> $shard_dir  (log: $log)"
+    # Both descriptors append to the same client log: stdout stays on disk,
+    # while progress (stderr) is also streamed live through tee. Each shard
+    # labels its own counts; no per-shard count is presented as global.
+    : > "$log"
+    progress_tty_args=()
+    if [ "$N" -eq 1 ] && [ -t 2 ]; then
+        progress_tty_args=(--progress_tty)
+    fi
     CUDA_VISIBLE_DEVICES=$g PYTHONUNBUFFERED=1 \
     PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
     LD_LIBRARY_PATH="${CLIENT_LD}${CLIENT_LD:+:}${LD_LIBRARY_PATH:-}" \
         "$CLIENT_PYTHON" -m lightnav.cli.eval_habitat "${client_args[@]}" \
-            --server "tcp://localhost:$port" --output_dir "$shard_dir" >"$log" 2>&1 &
+            --progress_shard_index "$i" --progress_shard_count "$N" \
+            "${progress_tty_args[@]}" \
+            --server "tcp://localhost:$port" --output_dir "$shard_dir" \
+            >>"$log" 2> >(tee -a "$log" "$progress_log" >&2) &
     CLIENT_PIDS+=("$!")
 done
 

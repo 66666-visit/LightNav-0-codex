@@ -194,6 +194,8 @@ class TopologicalMemory:
         descriptor_source: str,
         observation_event_id: str,
         transition_evidence_ids: Sequence[str] = (),
+        force_match_place_id: str | None = None,
+        force_new: bool = False,
     ) -> PlaceObservationResult:
         """Match one sampled RGB descriptor and bind same-frame YOLO sightings.
 
@@ -203,6 +205,8 @@ class TopologicalMemory:
         """
         if not isinstance(step_id, int) or step_id < 0:
             raise ValueError("step_id must be a nonnegative integer")
+        if force_match_place_id is not None and force_new:
+            raise ValueError("cannot force both a place match and a new place")
         if self._last_observation_step is not None and step_id <= self._last_observation_step:
             raise ValueError("place observation steps must increase")
         if not isinstance(descriptor_source, str) or not descriptor_source.strip():
@@ -229,7 +233,16 @@ class TopologicalMemory:
             if top1_similarity is None or similarity > top1_similarity:
                 top_node = node
                 top1_similarity = similarity
-        matched = top_node is not None and top1_similarity >= self.similarity_threshold
+        matched_similarity = top1_similarity
+        if force_match_place_id is not None:
+            if force_match_place_id not in self._nodes:
+                raise ValueError("forced place is not an existing visual node")
+            top_node = self._nodes[force_match_place_id]
+            matched_similarity = sum(a * b for a, b in zip(values, top_node.visual_descriptor))
+        matched = (force_match_place_id is not None or (
+            not force_new and top_node is not None
+            and top1_similarity >= self.similarity_threshold
+        ))
         previous_id = self._current_place_id
         if matched:
             assert top_node is not None
@@ -246,7 +259,7 @@ class TopologicalMemory:
             if revisited:
                 node.visit_count += 1
                 node.revisit_steps.append(step_id)
-            node.last_similarity = top1_similarity
+            node.last_similarity = matched_similarity
         else:
             place_id = f"place_{len(self._nodes):03d}"
             node = PlaceNode(
@@ -260,7 +273,7 @@ class TopologicalMemory:
         node.evidence_event_ids.append(observation_event_id)
         node.descriptor_event_ids.append(observation_event_id)
         node.descriptor_steps.append(step_id)
-        node.descriptor_similarities.append(top1_similarity if matched else None)
+        node.descriptor_similarities.append(matched_similarity if matched else None)
         seen_event_ids: set[str] = set()
         for event in events:
             if event.kind not in _OBJECT_KINDS or event.event_id in seen_event_ids:
@@ -291,7 +304,7 @@ class TopologicalMemory:
         transition: PlaceEdge | None = None
         if previous_id is not None and previous_id != node.place_id and motion_ids:
             key = (previous_id, node.place_id)
-            confidence = min(0.7, max(0.0, top1_similarity)) if matched else 0.5
+            confidence = min(0.7, max(0.0, matched_similarity)) if matched else 0.5
             previous_descriptor_id = self._nodes[previous_id].descriptor_event_ids[-1]
             previous_descriptor_step = self._nodes[previous_id].descriptor_steps[-1]
             evidence_ids = list(dict.fromkeys([

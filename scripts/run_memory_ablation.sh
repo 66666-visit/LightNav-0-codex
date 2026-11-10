@@ -5,6 +5,10 @@ set -euo pipefail
 
 TAG='[memory_ablation]'
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ "${1:-}" = --rgm-88 ]; then
+    shift
+    exec bash "$REPO_ROOT/scripts/run_rgm_pilot_88.sh" "$@"
+fi
 
 usage() {
     cat <<'EOF'

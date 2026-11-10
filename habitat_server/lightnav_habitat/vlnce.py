@@ -252,13 +252,19 @@ class VLNCEEnv(BaseHabitatEnv):
             return
         data = json.loads(Path(self.pilot_manifest_path).read_text(encoding="utf-8"))
         rows = data.get("episodes")
+        is_rgm_88 = data.get("protocol_version") == "rgm_pilot_88_v1"
+        expected = 88 if is_rgm_88 else 220
         if (
             data.get("dataset_split") != "val_unseen"
-            or data.get("expected_count") != 220
-            or not isinstance(rows, list) or len(rows) != 220
+            or data.get("expected_count") != expected
+            or not isinstance(rows, list) or len(rows) != expected
+            or (is_rgm_88 and (data.get("per_scene") != 8
+                               or data.get("sample_seed") != 42))
         ):
-            raise ValueError("Pilot manifest must contain exactly 220 val_unseen episodes")
+            raise ValueError(f"Pilot manifest must contain exactly {expected} val_unseen episodes")
         wanted = set()
+        scene_counts = {}
+        distance_counts = {}
         for row in rows:
             if not isinstance(row, dict):
                 raise ValueError("Pilot manifest has a non-object episode")
@@ -266,6 +272,21 @@ class VLNCEEnv(BaseHabitatEnv):
             if not all(key) or key in wanted:
                 raise ValueError(f"Pilot manifest has an invalid or duplicate Episode: {key}")
             wanted.add(key)
+            if is_rgm_88:
+                scene_counts[key[0]] = scene_counts.get(key[0], 0) + 1
+                group = row.get("distance_group")
+                if group not in ("short", "medium", "long"):
+                    raise ValueError("RGM Pilot requires route distance groups")
+                counts = distance_counts.setdefault(key[0], {
+                    "short": 0, "medium": 0, "long": 0,
+                })
+                counts[group] += 1
+        if is_rgm_88 and (
+            len(scene_counts) != 11 or any(count != 8 for count in scene_counts.values())
+            or any(counts != {"short": 3, "medium": 3, "long": 2}
+                   for counts in distance_counts.values())
+        ):
+            raise ValueError("RGM Pilot requires 11 scenes with 8 Episodes and 3/3/2 groups")
         available = list(env.episodes)
         if len(available) != 1839:
             raise ValueError(f"Pilot requires 1839 loaded val_unseen episodes; got {len(available)}")

@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.sample_r2r_pilot import sample_pilot
+
 
 _REPO = Path(__file__).resolve().parents[2]
 _SCRIPT = _REPO / "scripts" / "run_memory_ablation.sh"
@@ -18,6 +20,57 @@ _EVAL_SCRIPT = _REPO / "scripts" / "eval_habitat.sh"
 
 
 class MemoryAblationLauncherTest(unittest.TestCase):
+    def test_rgm_88_entrypoint_has_only_a_c_d_protocol(self) -> None:
+        help_result = subprocess.run(
+            ["bash", str(_SCRIPT), "--rgm-88", "--help"], cwd=_REPO,
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(help_result.returncode, 0)
+        self.assertIn("--parent-manifest", help_result.stdout)
+        rejected = subprocess.run(
+            ["bash", str(_SCRIPT), "--rgm-88", "--groups", "B"], cwd=_REPO,
+            text=True, capture_output=True, check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("unknown option", rejected.stderr)
+
+    def test_rgm_wrapper_selects_88_and_resume_keeps_immutable_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            model, yolo, dino = self._fake_assets(temp)
+            dataset = self._fake_pilot_dataset(temp)
+            parent = temp / "parent_220.json"
+            parent.write_text(json.dumps(sample_pilot(dataset)), encoding="utf-8")
+            output = temp / "rgm_88"
+            env = dict(os.environ)
+            env.update({
+                "MODEL_PATH": str(model), "YOLO_MODEL_PATH": str(yolo),
+                "DINO_MODEL_PATH": str(dino), "DATA_PATH": str(dataset),
+                "HABITAT_PYTHON": "/bin/false", "CLIENT_PYTHON": "/bin/false",
+                "GPU_IDS": "0", "SEED": "42",
+            })
+            for key in ("CLIENT_ARGS", "SERVER_ARGS", "LANGUAGES", "SCENES_DIR",
+                        "SUCCESS_DISTANCE", "NAVMESH_CELL_HEIGHT"):
+                env.pop(key, None)
+            command = ["bash", str(_SCRIPT), "--rgm-88", "--parent-manifest",
+                       str(parent), "--output-root", str(output)]
+            first = subprocess.run(command, cwd=_REPO, env=env, text=True,
+                                   capture_output=True, check=False)
+            self.assertNotEqual(first.returncode, 0)
+            self.assertIn("cannot import habitat", first.stderr)
+            pilot_path = output / "pilot_manifest.json"
+            before = pilot_path.read_bytes()
+            pilot = json.loads(before)
+            self.assertEqual(pilot["expected_count"], 88)
+            self.assertEqual(len(pilot["episodes"]), 88)
+            self.assertEqual(json.loads((output / "ablation_run.json").read_text())["groups"],
+                             ["baseline_off", "rgm_gates", "rgm_full"])
+            resumed = subprocess.run([*command, "--resume"], cwd=_REPO, env=env,
+                                     text=True, capture_output=True, check=False)
+            self.assertNotEqual(resumed.returncode, 0)
+            self.assertIn("cannot import habitat", resumed.stderr)
+            self.assertEqual(pilot_path.read_bytes(), before)
+
     @staticmethod
     def _fake_pilot_dataset(temp: Path) -> Path:
         root = temp / "R2R_VLNCE_v1-3_preprocessed"
@@ -179,6 +232,39 @@ class MemoryAblationLauncherTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("formal R2R val_unseen requires EXPECTED_EPISODES=1839", result.stderr)
 
+    def test_direct_eval_accepts_88_and_220_pilot_counts_before_habitat_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            model = temp / "checkpoint"
+            model.mkdir()
+            manifest_88 = temp / "pilot_88.json"
+            manifest_220 = temp / "pilot_220.json"
+            manifest_88.write_text(json.dumps({"protocol_version": "rgm_pilot_88_v1",
+                                               "expected_count": 88, "episodes": []}))
+            manifest_220.write_text(json.dumps({"expected_count": 220, "episodes": []}))
+            base = dict(os.environ)
+            base.update({
+                "MODEL_PATH": str(model), "HABITAT_PYTHON": "/bin/false",
+                "HABITAT_CONFIG": str(_REPO / "habitat_server/configs/vlnce_r2r.yaml"),
+                "STRICT_FULL_EVAL": "1", "GPU_IDS": "0", "TASK": "vlnce",
+                "SPLIT": "val_unseen", "EPISODES": "-1", "MAX_STEPS": "500",
+                "NO_FORCE_STOP": "1", "SEED": "42", "SERVER_ARGS": "", "LANGUAGES": "",
+            })
+            for manifest, count in ((manifest_88, "88"), (manifest_220, "220")):
+                with self.subTest(count=count):
+                    env = dict(base, PILOT_MANIFEST_PATH=str(manifest),
+                               EXPECTED_EPISODES=count)
+                    result = subprocess.run(["bash", str(_EVAL_SCRIPT)], cwd=_REPO,
+                                            env=env, text=True, capture_output=True,
+                                            check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("cannot import habitat", result.stderr)
+                    env["EXPECTED_EPISODES"] = "220" if count == "88" else "88"
+                    rejected = subprocess.run(["bash", str(_EVAL_SCRIPT)], cwd=_REPO,
+                                              env=env, text=True, capture_output=True,
+                                              check=False)
+                    self.assertIn(f"EXPECTED_EPISODES={count}", rejected.stderr)
+
     def test_formal_snapshot_records_dataset_paths_and_refuses_changed_resume(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
@@ -219,6 +305,7 @@ class MemoryAblationLauncherTest(unittest.TestCase):
             snapshot = json.loads((output / "config_snapshot.yaml").read_text(encoding="utf-8"))
             self.assertEqual(snapshot["common"]["data_path"], str(data_path))
             self.assertEqual(snapshot["common"]["scenes_dir"], str(scenes_dir))
+            self.assertFalse(snapshot["memory_effective"]["rgm"]["enabled"])
 
             second = subprocess.run(
                 ["bash", str(_EVAL_SCRIPT)], cwd=_REPO,

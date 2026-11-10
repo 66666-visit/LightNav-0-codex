@@ -24,6 +24,7 @@ from lightnav.memory.manager import MemoryManager
 from lightnav.memory.memory_writer import MockSceneExtractor
 from lightnav.memory.place_recognition import MockPlaceDescriptorExtractor
 from lightnav.memory.schemas import DetectedObject, MemoryContext, SceneExtraction
+from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.yolo_scene_extractor import YOLOSceneExtractor
 from lightnav.traj_vocab import RVQBundle
 
@@ -595,6 +596,63 @@ def test_null_memory_keeps_first_prompt_identical_to_original_sample(strategy: s
     ):
         assert actual_segment["frame_indices"] == original_segment["frame_indices"]
         assert torch.equal(actual_segment["video"], original_segment["video"])
+    policy.close_episode()
+
+
+def test_rgm_step0_and_rejected_memory_preserve_model_sample_contract() -> None:
+    extractor = MockSceneExtractor({
+        0: SceneExtraction(objects=["couch", "chair"], confidence=0.8),
+    })
+    manager = MemoryManager(
+        extractor=extractor, strategy="hierarchical",
+        rgm_config=RGMConfig(enabled=True),
+    )
+    engine = MemoryStubEngine()
+    policy = TrajVocabVLNCEPolicy(
+        engine, _build_centroids(), dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        memory_enabled=True, memory_manager=manager,
+    )
+    policy.reset({"instruction": {"text": "Find the sofa"}})
+    policy.act({"rgb": _rgb_frame(), "goal_distance": 99.0},
+               info={"oracle_success": True})
+    prompt = engine.samples[-1]["conversations"][0]["value"]
+    assert "instruction landmark couch" in prompt
+    assert "chair" not in prompt
+    assert "goal_distance" not in prompt and "oracle_success" not in prompt
+    assert policy.last_memory_diagnostic["prompt_hash"]["roundtrip_ok"] is True
+    raw = manager.episodic.events
+    assert any(event.description == "Observed chair" for event in raw)
+    assert any(event.description == "Observed chair" and
+               event.metadata["rgm_adopted"] is False for event in raw)
+    policy.close_episode()
+    assert manager.episodic.events == []
+
+
+def test_rgm_unrelated_current_detection_falls_back_to_exact_base_sample() -> None:
+    manager = MemoryManager(
+        extractor=MockSceneExtractor({
+            0: SceneExtraction(objects=["chair"], confidence=0.9),
+        }),
+        strategy="hierarchical", rgm_config=RGMConfig(enabled=True),
+    )
+    engine = MemoryStubEngine()
+    policy = TrajVocabVLNCEPolicy(
+        engine, _build_centroids(), dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        memory_enabled=True, memory_manager=manager,
+    )
+    policy.reset({"instruction": {"text": "Find the sofa"}})
+    policy.act({"rgb": _rgb_frame()})
+    base = build_vln_traj_sample(
+        policy.agent._get_video_tensor(), policy.agent.instruction,
+        list(policy.agent._history_frame_ids), engine.bundle,
+    )
+    assert engine.samples[-1]["conversations"] == base["conversations"]
+    for actual, original in zip(engine.samples[-1]["video_segments"], base["video_segments"]):
+        assert actual["frame_indices"] == original["frame_indices"]
+        assert torch.equal(actual["video"], original["video"])
+    assert policy.last_memory_diagnostic["prompt_hash"]["roundtrip_ok"] is True
     policy.close_episode()
 
 

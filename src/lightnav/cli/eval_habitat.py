@@ -15,6 +15,7 @@ import os
 import sys
 
 from lightnav.habitat.runner import HabitatEvalConfig, MemoryConfig, run_habitat_eval
+from lightnav.memory.rgm_config import RGMConfig
 
 # Argparse defaults come from the dataclass so the CLI and the Python API cannot drift.
 _DEFAULTS = HabitatEvalConfig(model_path="")
@@ -68,6 +69,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--resume", action="store_true",
         help="Skip completed episode IDs already recorded in this output directory.",
+    )
+    p.add_argument(
+        "--progress_shard_index", type=int, default=_DEFAULTS.progress_shard_index,
+        help="Zero-based shard index shown in live Episode progress (default: 0).",
+    )
+    p.add_argument(
+        "--progress_shard_count", type=int, default=_DEFAULTS.progress_shard_count,
+        help="Number of shards shown in live Episode progress (default: 1).",
+    )
+    p.add_argument(
+        "--progress_tty", action="store_true",
+        help="Use an in-place progress display when stderr is forwarded from a TTY.",
     )
     p.add_argument(
         "--languages",
@@ -185,6 +198,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--memory_place_device", default=_DEFAULTS.memory.place_device,
         help="DINOv2 inference device, e.g. cpu or cuda:0 (default: cpu).",
     )
+    p.add_argument("--rgm_enabled", action="store_true",
+                   help="Enable Reliability-Gated Memory within hierarchical memory.")
+    for name, default in (
+        ("step0_conditional", True), ("write_gate_enabled", True),
+        ("retrieval_gate_enabled", True), ("prompt_gate_enabled", True),
+        ("yolo_temporal_enabled", False), ("place_two_stage_enabled", False),
+        ("topology_motion_validation_enabled", False),
+    ):
+        p.add_argument(f"--rgm_{name}", action=argparse.BooleanOptionalAction,
+                       default=default, help=f"RGM {name.replace('_', ' ')} switch.")
+    p.add_argument("--rgm_adaptive_extraction_enabled", action="store_true",
+                   help="Reserved; V1 rejects adaptive extraction.")
+    for name, value in (
+        ("min_candidate_confidence", 0.25),
+        ("min_instruction_landmark_confidence", 0.60),
+        ("place_global_candidate_min", 0.75), ("place_global_new_max", 0.65),
+        ("place_local_cosine_min", 0.70), ("place_local_inlier_min", 0.50),
+        ("place_min_image_quality", 0.20),
+        ("place_global_margin_min", 0.03),
+        ("place_new_temporal_similarity_min", 0.85),
+        ("place_ransac_reprojection_threshold", 0.08),
+        ("topology_visual_delta_min", 0.35),
+    ):
+        p.add_argument(f"--rgm_{name}", type=float, default=value,
+                       help=f"Uncalibrated RGM {name.replace('_', ' ')} threshold.")
+    for name, value in (
+        ("temporal_window", 3), ("temporal_min_support", 2),
+        ("place_top_k", 3), ("place_local_min_matches", 8),
+        ("place_keyframes_max", 3), ("prompt_max_records", 3),
+        ("prompt_max_chars", 400),
+    ):
+        p.add_argument(f"--rgm_{name}", type=int, default=value,
+                       help=f"RGM {name.replace('_', ' ')} setting.")
 
     # Visualisation (docs/VISUALIZATION.md); needs `pip install 'lightnav[video]'`.
     viz = p.add_argument_group("visualisation")
@@ -270,6 +316,35 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
             place_extract_every_n_steps=args.memory_place_extract_every_n_steps,
             place_similarity_threshold=args.memory_place_similarity_threshold,
             place_device=args.memory_place_device,
+            rgm=RGMConfig(
+                enabled=args.rgm_enabled,
+                step0_conditional=args.rgm_step0_conditional,
+                write_gate_enabled=args.rgm_write_gate_enabled,
+                retrieval_gate_enabled=args.rgm_retrieval_gate_enabled,
+                prompt_gate_enabled=args.rgm_prompt_gate_enabled,
+                yolo_temporal_enabled=args.rgm_yolo_temporal_enabled,
+                place_two_stage_enabled=args.rgm_place_two_stage_enabled,
+                topology_motion_validation_enabled=args.rgm_topology_motion_validation_enabled,
+                adaptive_extraction_enabled=args.rgm_adaptive_extraction_enabled,
+                min_candidate_confidence=args.rgm_min_candidate_confidence,
+                min_instruction_landmark_confidence=args.rgm_min_instruction_landmark_confidence,
+                temporal_window=args.rgm_temporal_window,
+                temporal_min_support=args.rgm_temporal_min_support,
+                place_top_k=args.rgm_place_top_k,
+                place_global_candidate_min=args.rgm_place_global_candidate_min,
+                place_global_new_max=args.rgm_place_global_new_max,
+                place_local_cosine_min=args.rgm_place_local_cosine_min,
+                place_local_min_matches=args.rgm_place_local_min_matches,
+                place_local_inlier_min=args.rgm_place_local_inlier_min,
+                place_min_image_quality=args.rgm_place_min_image_quality,
+                place_global_margin_min=args.rgm_place_global_margin_min,
+                place_new_temporal_similarity_min=args.rgm_place_new_temporal_similarity_min,
+                place_ransac_reprojection_threshold=args.rgm_place_ransac_reprojection_threshold,
+                place_keyframes_max=args.rgm_place_keyframes_max,
+                topology_visual_delta_min=args.rgm_topology_visual_delta_min,
+                prompt_max_records=args.rgm_prompt_max_records,
+                prompt_max_chars=args.rgm_prompt_max_chars,
+            ),
         ),
         save_video=args.save_video,
         video_fps=args.video_fps,
@@ -280,6 +355,9 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
         seed=args.seed,
         strict_full_eval=args.strict_full_eval,
         resume=args.resume,
+        progress_shard_index=args.progress_shard_index,
+        progress_shard_count=args.progress_shard_count,
+        progress_tty=args.progress_tty,
     )
 
 

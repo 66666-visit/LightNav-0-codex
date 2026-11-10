@@ -294,6 +294,99 @@ def sample_pilot(
     }
 
 
+def sample_rgm_88(parent_manifest: str | Path, *, dataset_path: str | Path | None = None,
+                  scenes_dir: str | Path | None = None, seed: int = SEED) -> dict[str, Any]:
+    """Derive 8 per scene from the old 220 IDs without using model outcomes."""
+    if seed != SEED:
+        raise ValueError("RGM V1 Pilot requires seed 42")
+    parent_path = Path(parent_manifest)
+    parent_bytes = parent_path.read_bytes()
+    parent = json.loads(parent_bytes)
+    rows = parent.get("episodes")
+    if (parent.get("dataset_split") != SPLIT or parent.get("sample_seed") != SEED
+            or parent.get("expected_count") != 220 or not isinstance(rows, list)
+            or len(rows) != 220):
+        raise ValueError("parent must be the complete 220 Episode val_unseen Pilot")
+    source_rows: dict[tuple[str, str], dict[str, Any]] = {}
+    if dataset_path is not None:
+        source = resolve_dataset_path(dataset_path)
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        if parent.get("source_sha256") and digest != parent["source_sha256"]:
+            raise ValueError("R2R source hash differs from parent Pilot")
+        with gzip.open(source, "rt", encoding="utf-8") as stream:
+            dataset = json.load(stream)
+        for episode in dataset["episodes"]:
+            key = (str(episode["scene_id"]), str(episode["episode_id"]))
+            if key in source_rows:
+                raise ValueError(f"duplicate R2R source Episode {key}")
+            source_rows[key] = episode
+            mapped_key = (habitat_scene_id(key[0], scenes_dir), key[1])
+            if mapped_key in source_rows and source_rows[mapped_key] is not episode:
+                raise ValueError(f"ambiguous mapped R2R Episode {mapped_key}")
+            source_rows.setdefault(mapped_key, episode)
+    by_scene: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("parent Pilot has an invalid Episode row")
+        scene = row.get("scene_id")
+        episode = row.get("habitat_episode_id")
+        if not isinstance(scene, str) or not scene or not isinstance(episode, str) or not episode:
+            raise ValueError("parent Pilot has an invalid Episode key")
+        key = (scene, episode)
+        if key in seen:
+            raise ValueError(f"duplicate parent Episode {key}")
+        seen.add(key)
+        enriched = dict(row)
+        source_episode = source_rows.get((str(row.get("dataset_scene_id", scene)), episode))
+        if source_episode is not None and "route_length" in enriched:
+            measured_length = _route_length(source_episode, episode)
+            if abs(float(enriched["route_length"]) - measured_length) > 1e-6:
+                raise ValueError(f"parent route length differs from R2R source for {key}")
+        if source_episode is not None and "trajectory_id" in enriched:
+            if str(enriched["trajectory_id"]) != str(source_episode.get("trajectory_id")):
+                raise ValueError(f"parent trajectory_id differs from R2R source for {key}")
+        if "route_length" not in enriched:
+            if source_episode is None:
+                raise ValueError(f"route length missing for {key}; provide --data-path")
+            enriched["route_length"] = _route_length(source_episode, episode)
+        if "trajectory_id" not in enriched:
+            if source_episode is None or "trajectory_id" not in source_episode:
+                raise ValueError(f"trajectory_id missing for {key}; provide --data-path")
+            enriched["trajectory_id"] = str(source_episode["trajectory_id"])
+        length = enriched["route_length"]
+        if type(length) not in (int, float) or not math.isfinite(length) or length <= 0:
+            raise ValueError(f"invalid parent route length for {key}")
+        by_scene[scene].append(enriched)
+    if len(by_scene) != SCENE_COUNT or any(len(scene_rows) < 8 for scene_rows in by_scene.values()):
+        raise ValueError("parent Pilot must have 11 scenes with at least 8 Episodes each")
+    selected = []
+    for scene, scene_rows in sorted(by_scene.items()):
+        selected.extend(_select_scene(scene_rows, scene, seed, 8))
+    selected.sort(key=lambda row: (
+        row["scene_id"], DISTANCE_GROUPS.index(row["distance_group"]),
+        row["route_length"], row["habitat_episode_id"],
+    ))
+    for row in selected:
+        row["sample_seed"] = seed
+        row["dataset_split"] = SPLIT
+        row["sampling_method"] = "rgm_88_from_parent_220_distance_tertiles_v1"
+    if len(selected) != 88 or len({(row["scene_id"], row["habitat_episode_id"])
+                                   for row in selected}) != 88:
+        raise ValueError("RGM Pilot must select 88 unique Episodes")
+    return {
+        "protocol_version": "rgm_pilot_88_v1", "dataset_split": SPLIT,
+        "sample_seed": seed, "sampling_method": "rgm_88_from_parent_220_distance_tertiles_v1",
+        "parent_manifest_sha256": hashlib.sha256(parent_bytes).hexdigest(),
+        "source_dataset": parent.get("source_dataset"),
+        "source_sha256": parent.get("source_sha256"),
+        "expected_count": 88, "per_scene": 8,
+        "full_scene_counts": parent.get("full_scene_counts"),
+        "scene_quotas": {scene: 8 for scene in by_scene},
+        "episodes": selected,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-path", default=os.environ.get("DATA_PATH", ""))
@@ -303,12 +396,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--per-scene", type=int, default=PILOT_PER_SCENE)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--parent-manifest", type=Path,
+                        help="derive the RGM 88 Episode Pilot from a legacy 220 Manifest")
     args = parser.parse_args(argv)
-    manifest = sample_pilot(
-        args.data_path,
-        scenes_dir=args.scenes_dir,
-        per_scene=args.per_scene,
-        seed=args.seed,
+    manifest = (
+        sample_rgm_88(
+            args.parent_manifest, dataset_path=args.data_path or None,
+            scenes_dir=args.scenes_dir, seed=args.seed,
+        ) if args.parent_manifest else sample_pilot(
+            args.data_path, scenes_dir=args.scenes_dir,
+            per_scene=args.per_scene, seed=args.seed,
+        )
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x", encoding="utf-8") as stream:

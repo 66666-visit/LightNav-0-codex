@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Protocol
+from typing import Callable, Protocol
 
 import numpy as np
 
 from lightnav.memory.episodic_memory import EpisodicMemory
 from lightnav.memory.scene_graph import SceneGraph
-from lightnav.memory.schemas import DetectedObject, MemoryEvent, ObservationPacket, SceneExtraction
+from lightnav.memory.schemas import (
+    DetectedObject, GateDecision, MemoryEvent, ObservationPacket, SceneExtraction,
+)
 from lightnav.memory.working_memory import WorkingMemoryStore
 
 _CURRENT_PLACE = object()
@@ -78,13 +80,18 @@ class MemoryWriter:
         episodic: EpisodicMemory,
         graph: SceneGraph,
         extractor: SceneExtractor,
+        event_gate: Callable[[MemoryEvent], GateDecision] | None = None,
+        extraction_observer: Callable[[int], None] | None = None,
     ) -> None:
         self.working = working
         self.episodic = episodic
         self.graph = graph
         self.extractor = extractor
+        self.event_gate = event_gate
+        self.extraction_observer = extraction_observer
         self._event_seq = 0
         self._last_rgb_histogram: tuple[float, ...] | None = None
+        self.last_appearance_delta: float | None = None
 
     def observe(self, packet: ObservationPacket) -> list[MemoryEvent]:
         """Write one observation, excluding any evaluator-only ``info`` fields."""
@@ -104,6 +111,12 @@ class MemoryWriter:
         # or writing any event, so the same observation can be retried.
         extraction = self.extractor.extract(packet)
         self._validate_extraction(extraction)
+        if self.extraction_observer is not None and (
+            (getattr(self.extractor, "last_attempt_step", None) == packet.step_id
+             and getattr(self.extractor, "last_error", None) is None)
+            or extraction.source != "none"
+        ):
+            self.extraction_observer(packet.step_id)
         self.working.advance(
             packet.step_id, last_action=packet.last_action, prediction=packet.prediction,
         )
@@ -218,23 +231,35 @@ class MemoryWriter:
                     metadata = {"node_id": node.node_id}
                     if detection.bbox_xyxy is not None:
                         metadata["bbox_xyxy"] = list(detection.bbox_xyxy)
-                    new_events.append(self._event(
+                    observation_event = self._event(
                         packet.step_id, kind, f"Observed {label}",
                         confidence=detection.confidence, source=extraction.source,
                         place_id=place_id, importance=0.8 if kind == "landmark" else 0.6,
                         metadata=metadata,
-                    ))
-                    if self._instruction_relevant(label, self.working.state.instruction):
-                        self.working.record_instruction_match(label)
-                        new_events.append(self._event(
+                    )
+                    if self.event_gate is not None:
+                        node.attributes["rgm_adopted"] = observation_event.metadata["rgm_adopted"]
+                    new_events.append(observation_event)
+                    if self.event_gate is not None:
+                        from lightnav.memory.memory_write_gate import instruction_match
+
+                        relevant = bool(instruction_match(label, self.working.state.instruction))
+                    else:
+                        relevant = self._instruction_relevant(label, self.working.state.instruction)
+                    if relevant:
+                        if observation_event.metadata.get("rgm_adopted", True):
+                            self.working.record_instruction_match(label)
+                        match_event = self._event(
                             packet.step_id, "instruction_match",
                             f"Observed instruction-related {label}",
                             confidence=detection.confidence, source=extraction.source,
                             place_id=place_id, importance=0.95,
                             metadata=metadata,
-                        ))
+                        )
+                        new_events.append(match_event)
 
         self._last_rgb_histogram = rgb_histogram
+        self.last_appearance_delta = appearance_delta
         return new_events
 
     def _write_action(self, packet: ObservationPacket) -> MemoryEvent:
@@ -274,8 +299,11 @@ class MemoryWriter:
             description=description, confidence=confidence, source=source,
             place_id=self.working.state.place_id if place_id is _CURRENT_PLACE else place_id,
             importance=importance, metadata=metadata or {},
+            episode_id=self.working.state.episode_id,
         )
         self._event_seq += 1
+        if self.event_gate is not None:
+            self.event_gate(event)
         self.episodic.add(event)
         self.working.record_event(event)
         return event
@@ -308,6 +336,17 @@ class MemoryWriter:
             return False
         raw = args.get("linear_velocity")
         return isinstance(raw, (int, float)) and math.isfinite(raw) and raw > -0.95
+
+    @staticmethod
+    def _has_positive_forward_command(action: dict | None) -> bool:
+        """RGM topology requires an actual positive issued linear command."""
+        if not isinstance(action, dict) or action.get("action") != "velocity_control":
+            return False
+        args = action.get("action_args")
+        if not isinstance(args, dict):
+            return False
+        raw = args.get("linear_velocity")
+        return isinstance(raw, (int, float)) and math.isfinite(raw) and raw > 0.0
 
     @staticmethod
     def _instruction_relevant(label: str, instruction: str) -> bool:

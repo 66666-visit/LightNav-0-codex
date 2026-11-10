@@ -43,6 +43,7 @@ class MemoryEvent:
     place_id: str | None = None
     importance: float = 0.5
     metadata: dict[str, Any] = field(default_factory=dict)
+    episode_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -244,3 +245,52 @@ class SceneExtraction:
             DetectedObject.from_dict(item) for item in values.get("detections", [])
         ]
         return cls(**values)
+
+
+@dataclass(frozen=True)
+class RGMEvidence:
+    episode_id: str
+    step: int
+    event_id: str
+    kind: str
+    source: str
+    payload: dict[str, Any]
+    confidence: float | None
+    related_instruction_terms: tuple[str, ...] = ()
+    provenance: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class GateDecision:
+    accepted: bool
+    score: float | None
+    reason: str
+    evidence_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class VisualPlaceFeatures:
+    global_descriptor: tuple[float, ...]
+    patch_descriptors: Any  # transient float16 ndarray in D; never serialized
+    patch_grid: tuple[int, int]
+    patch_indices: tuple[int, ...] = ()
+    preprocessing_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PlaceDecision:
+    status: str  # MATCH | NEW | UNKNOWN
+    candidate_place_id: str | None
+    global_similarity: float | None
+    second_similarity: float | None
+    local_match_count: int
+    local_inlier_ratio: float | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class MemorySelection:
+    accepted_records: tuple[LayerMemoryItem, ...]
+    rejected_records: tuple[tuple[str, str], ...]
+    gate_reasons: tuple[str, ...]
+    injected_text: str

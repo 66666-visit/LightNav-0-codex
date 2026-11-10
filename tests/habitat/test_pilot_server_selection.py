@@ -117,6 +117,38 @@ class PilotServerSelectionTest(unittest.TestCase):
         self.assertFalse(shard_keys[0] & shard_keys[1])
         self.assertEqual(shard_keys[0] | shard_keys[1], expected)
 
+    def test_rgm_88_selection_precedes_sharding_and_rejects_bad_quota(self) -> None:
+        rows = []
+        for scene in range(11):
+            scene_rows = [row for row in self.rows
+                          if row["scene_id"] == f"scene_{scene:02d}"][:8]
+            for index, row in enumerate(scene_rows):
+                rows.append({**row, "distance_group": (
+                    "short" if index < 3 else "medium" if index < 6 else "long"
+                )})
+        self.manifest.write_text(json.dumps({
+            "protocol_version": "rgm_pilot_88_v1", "dataset_split": "val_unseen",
+            "sample_seed": 42, "expected_count": 88, "per_scene": 8,
+            "episodes": rows,
+        }), encoding="utf-8")
+        env = FakeHabitatEnv(self.all_episodes)
+        wrapper = self._wrapper(0)
+        wrapper._apply_pilot_selection(env)
+        self.assertEqual(len(env.episodes), 88)
+        wrapper._apply_episode_split(env)
+        self.assertEqual(len(env.episodes), 44)
+        self.assertEqual(env.setter_calls, 2)
+        rows[0]["distance_group"] = "long"
+        self.manifest.write_text(json.dumps({
+            "protocol_version": "rgm_pilot_88_v1", "dataset_split": "val_unseen",
+            "sample_seed": 42, "expected_count": 88, "per_scene": 8,
+            "episodes": rows,
+        }), encoding="utf-8")
+        invalid = FakeHabitatEnv(self.all_episodes)
+        with self.assertRaisesRegex(ValueError, "3/3/2"):
+            self._wrapper()._apply_pilot_selection(invalid)
+        self.assertEqual(invalid.setter_calls, 0)
+
     def test_pilot_missing_or_duplicate_id_fails_before_iterator_change(self) -> None:
         env = FakeHabitatEnv(self.all_episodes)
         changed = list(self.rows)

@@ -167,7 +167,8 @@ class TrajVocabVLNCEPolicy:
         self._last_action_waypoint = None
         self._last_raw_text = ""
 
-    def reset(self, obs: dict[str, Any] | None = None) -> None:
+    def reset(self, obs: dict[str, Any] | None = None, *,
+              memory_episode_id: str | None = None) -> None:
         """Reset the frame buffer and seed the instruction from ``obs`` if given."""
         self.close_episode()
         self.instruction = extract_instruction(obs) if obs is not None else ""
@@ -176,7 +177,7 @@ class TrajVocabVLNCEPolicy:
         if self.memory_manager is not None:
             self._memory_episode_index += 1
             self.memory_manager.reset_episode(
-                episode_id=f"policy_episode_{self._memory_episode_index}",
+                episode_id=memory_episode_id or f"policy_episode_{self._memory_episode_index}",
                 instruction=self.instruction,
             )
             self._memory_episode_open = True
@@ -220,7 +221,9 @@ class TrajVocabVLNCEPolicy:
         diagnostic: dict[str, Any] | None = None
         self.agent.observe(obs["rgb"])
         if self._memory_episode_open:
-            from lightnav.memory.memory_context_builder import build_context_text, inject_memory_context
+            from lightnav.memory.memory_context_builder import (
+                audit_prompt_injection, build_context_text, inject_memory_context,
+            )
             from lightnav.memory.schemas import ObservationPacket
 
             # Only robot-visible data enters memory. Habitat ``info`` contains
@@ -242,17 +245,39 @@ class TrajVocabVLNCEPolicy:
                 self.engine.bundle,
             )
             context = self.memory_manager.get_context()
-            sample = inject_memory_context(
-                sample,
-                context,
-                max_chars=getattr(self.memory_manager, "max_context_chars", 600),
+            base_sample = sample
+            prompt_fallback_reason = None
+            rgm_enabled = getattr(
+                getattr(self.memory_manager, "rgm_config", None), "enabled", False,
             )
+            try:
+                if rgm_enabled and not build_context_text(
+                    context, max_chars=getattr(self.memory_manager, "max_context_chars", 600),
+                ):
+                    sample = base_sample
+                else:
+                    sample = inject_memory_context(
+                        base_sample, context,
+                        max_chars=getattr(self.memory_manager, "max_context_chars", 600),
+                    )
+                prompt_audit = audit_prompt_injection(
+                    base_sample, sample, context,
+                    max_chars=getattr(self.memory_manager, "max_context_chars", 600),
+                ) if rgm_enabled else None
+            except ValueError as exc:
+                if not rgm_enabled:
+                    raise
+                sample = base_sample
+                prompt_audit = None
+                prompt_fallback_reason = str(exc)
             if self.memory_verbose or hasattr(self.memory_manager, "scene_graph"):
                 extractor = self.memory_manager.extractor
                 attempted = getattr(extractor, "last_attempt_step", None) == self._memory_step - 1
                 memory_text = build_context_text(
                     context, max_chars=getattr(self.memory_manager, "max_context_chars", 600),
                 )
+                if prompt_fallback_reason is not None:
+                    memory_text = ""
                 injected_lines = memory_text.splitlines()
                 if injected_lines and injected_lines[0] == "Episode observations (may be uncertain):":
                     injected_lines = injected_lines[1:]
@@ -280,6 +305,61 @@ class TrajVocabVLNCEPolicy:
                     "injected_memory_chars": len(memory_text),
                     "injected_memory_text": memory_text,
                 }
+                if rgm_enabled:
+                    from dataclasses import asdict
+
+                    gate = self.memory_manager.write_gate
+                    current_event_ids = {event.event_id for event in events}
+                    diagnostic.update({
+                        "episode_id": self.memory_manager.working.state.episode_id,
+                        "rgm_config": asdict(self.memory_manager.rgm_config),
+                        "yolo_candidate_count": len([event for event in events
+                                                     if event.kind == "object_observation"]),
+                        "yolo_temporal_support": [
+                            event.metadata.get("rgm_temporal_support") for event in events
+                            if event.kind == "object_observation"
+                        ],
+                        "yolo_association_ms": (
+                            sum(float(event.metadata.get("rgm_association_ms", 0.0))
+                                for event in events
+                                if event.kind in {"object_observation", "landmark"})
+                            if attempted else None
+                        ),
+                        "write_gate_decisions": [
+                            asdict(item) for item in gate.decisions
+                            if item.evidence_ids and item.evidence_ids[-1] in current_event_ids
+                        ]
+                        if gate is not None else [],
+                        "retrieval_gate_decisions": list(self.memory_manager.retrieval_gate.decisions),
+                        "retrieval_candidates": [
+                            {"layer": layer, "kind": item.kind, "step": item.step_id,
+                             "evidence_ids": [ref.event_id for ref in item.evidence_refs]}
+                            for layer, items in self.memory_manager.last_layer_results.items()
+                            for item in items
+                        ],
+                        "fusion_selected_records": [item.kind for item in context.layer_items],
+                        "prompt_gate_decision": asdict(
+                            self.memory_manager.prompt_gate.last_selection,
+                        ),
+                        "prompt_fallback_reason": prompt_fallback_reason,
+                        "prompt_hash": prompt_audit,
+                        "dino_global_topk": list(self.memory_manager.place_verifier.last_topk)
+                        if self.memory_manager.last_place_extraction_attempted else [],
+                        "place_decision": asdict(self.memory_manager.last_place_decision)
+                        if self.memory_manager.last_place_decision else None,
+                        "dino_local_match_count": (
+                            self.memory_manager.last_place_decision.local_match_count
+                            if self.memory_manager.last_place_decision else None
+                        ),
+                        "dino_local_inlier_ratio": (
+                            self.memory_manager.last_place_decision.local_inlier_ratio
+                            if self.memory_manager.last_place_decision else None
+                        ),
+                        "topology_edge_status": self.memory_manager.last_topology_edge_status,
+                        "last_confirmed_place_step": (
+                            self.memory_manager.topological_memory.last_observation_step
+                        ),
+                    })
                 if getattr(self.memory_manager, "strategy", "flat") == "hierarchical":
                     diagnostic["memory_strategy"] = "hierarchical"
                     diagnostic["layer_contexts"] = {

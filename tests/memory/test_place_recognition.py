@@ -150,6 +150,54 @@ class PlaceRecognitionTest(unittest.TestCase):
             self.assertTrue(model.eval_called)
 
     @unittest.skipUnless(_HAS_VISION_DEPS, "NumPy, Pillow and torch are required")
+    def test_two_stage_features_use_one_forward_and_bounded_patch_grid(self) -> None:
+        import numpy as np
+        import torch
+
+        class FakeProcessor:
+            def __call__(self, *, images, return_tensors):
+                return {"pixel_values": torch.zeros((1, 3, 28, 28))}
+
+        class FakeModel:
+            config = SimpleNamespace(
+                model_type="dinov2", hidden_size=384, num_register_tokens=0,
+                patch_size=14,
+            )
+
+            def __init__(self):
+                self.calls = 0
+
+            def to(self, device):
+                return self
+
+            def eval(self):
+                return self
+
+            def __call__(self, **inputs):
+                self.calls += 1
+                tokens = torch.ones((1, 5, 384))
+                tokens[:, 0, :] = 100.0
+                return SimpleNamespace(last_hidden_state=tokens)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _fake_local_directory(root)
+            model = FakeModel()
+            extractor = DINOv2PlaceDescriptorExtractor(
+                str(root), processor_factory=lambda *args, **kwargs: FakeProcessor(),
+                model_factory=lambda *args, **kwargs: model,
+            )
+            features = extractor.extract_features(ObservationPacket(
+                step_id=0, rgb=np.arange(28 * 28 * 3, dtype=np.uint32).reshape(28, 28, 3)
+                .astype(np.uint8),
+            ))
+            self.assertEqual(model.calls, 1)
+            self.assertEqual(features.patch_grid, (2, 2))
+            self.assertEqual(features.patch_descriptors.shape, (4, 384))
+            self.assertEqual(features.patch_indices, (0, 1, 2, 3))
+            self.assertEqual(len(features.global_descriptor), 384)
+
+    @unittest.skipUnless(_HAS_VISION_DEPS, "NumPy, Pillow and torch are required")
     def test_bad_rgb_rejected_without_loading_model(self) -> None:
         import numpy as np
 

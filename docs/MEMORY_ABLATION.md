@@ -230,3 +230,43 @@ git diff --check
 The current local WSL environment has Python 3.10 and lacks NumPy, pytest,
 Ruff, GPU, Habitat data, and local model weights. It can run only dependency-free
 unit checks; no full R2R result or real DINOv2 performance claim comes from it.
+
+## RGM V1: new 88-Episode A/C/D Pilot
+
+This is a separate protocol from the 220-Episode experiment above. A is the
+unchanged `baseline_off` policy, C is `rgm_gates` (Write, Retrieval and Prompt
+Gates with existing fixed-rate YOLO and global DINO), and D is `rgm_full`
+(the same gates plus category-level YOLO temporal support, two-stage DINO
+matching and conservative topology motion evidence). B is not run. C and D
+share the same 88 Episode IDs, checkpoint, visual history, action decoder,
+500-step limit and 3-record/400-character memory budget.
+
+On AutoDL, point to the old 220 selection and artifacts. No local copy is
+required during development:
+
+```bash
+MODEL_PATH=/path/to/LightNav-0 \
+YOLO_MODEL_PATH=/path/to/yolo11n.pt \
+DINO_MODEL_PATH=/path/to/dinov2-small \
+DATA_PATH=/path/to/R2R_VLNCE_v1-3_preprocessed \
+SCENES_DIR=/path/to/scene_datasets \
+bash scripts/run_memory_ablation.sh --rgm-88 \
+  --parent-manifest output/r2r_pilot_220_v2/pilot_manifest.json \
+  --legacy-root output/r2r_pilot_220_v2 \
+  --output-root output/rgm_pilot_88_v1
+```
+
+Resume with the same paths and `--resume`. The new sampler selects 8 of the
+parent's Episodes per scene, with 3/3/2 short/medium/long strata, Seed 42 and
+trajectory diversity. It never looks at old model outcomes. The A reuse audit
+reads the old results, diagnostics, config snapshot and completion marker.
+It rejects missing result rows, incompatible model/evaluation settings and
+missing source or weight fingerprints; the launcher then runs A on the 88 IDs.
+Old artifacts are never modified. If reuse succeeds, old navigation metrics
+are paired with C/D; old latency is excluded from cross-hardware comparisons.
+
+Each completed group writes exact coverage artifacts and a Pilot marker.
+`comparison.json` contains all three group summaries, paired Episode deltas
+and seeded Episode-bootstrap 95% intervals. A missing marker, diagnostic step
+or incompatible C/D configuration prevents a complete comparison. RGB and
+unverified traversal claims are not retained as validated physical state.

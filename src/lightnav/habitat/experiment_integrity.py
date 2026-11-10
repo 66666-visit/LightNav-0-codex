@@ -209,6 +209,40 @@ def check_pilot_selection(manifest: dict[str, Any], pilot_selection: str | Path)
     canonical = validate_manifest(manifest)
     data = json.loads(Path(pilot_selection).read_text(encoding="utf-8"))
     rows = data.get("episodes") if isinstance(data, dict) else None
+    if isinstance(data, dict) and data.get("protocol_version") == "rgm_pilot_88_v1":
+        if (data.get("dataset_split") != "val_unseen" or data.get("sample_seed") != 42
+                or data.get("expected_count") != 88 or data.get("per_scene") != 8
+                or not isinstance(rows, list) or len(rows) != 88
+                or not isinstance(data.get("parent_manifest_sha256"), str)
+                or len(data["parent_manifest_sha256"]) != 64
+                or canonical["split"] != "val_unseen" or canonical["expected_count"] != 88):
+            raise ValueError("RGM Pilot selection requires 88 val_unseen Episode IDs")
+        selected = []
+        counts: dict[str, int] = {}
+        strata: dict[str, dict[str, int]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("RGM Pilot row must be an object")
+            scene, episode = row.get("scene_id"), row.get("habitat_episode_id")
+            if not isinstance(scene, str) or not scene or not isinstance(episode, str) or not episode:
+                raise ValueError("RGM Pilot has invalid Episode key")
+            group = row.get("distance_group")
+            if group not in ("short", "medium", "long"):
+                raise ValueError("RGM Pilot distance group is missing")
+            selected.append((scene, episode))
+            counts[scene] = counts.get(scene, 0) + 1
+            current = strata.setdefault(scene, {"short": 0, "medium": 0, "long": 0})
+            current[group] += 1
+        if (len(set(selected)) != 88 or len(counts) != 11
+                or any(count != 8 for count in counts.values())
+                or any(groups != {"short": 3, "medium": 3, "long": 2}
+                       for groups in strata.values())
+                or data.get("scene_quotas") != {scene: 8 for scene in counts}):
+            raise ValueError("RGM Pilot needs 8 unique Episodes and 3/3/2 strata per scene")
+        loaded = {_key(row) for row in canonical["episodes"]}
+        if loaded != set(selected):
+            raise ValueError("loaded RGM Pilot Episode IDs differ from selection")
+        return
     if (
         not isinstance(data, dict) or data.get("dataset_split") != "val_unseen"
         or data.get("expected_count") != 220 or data.get("per_scene") != 20

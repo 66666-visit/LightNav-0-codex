@@ -112,7 +112,8 @@ class EpisodicMemory:
             raise ValueError("event source is required")
         self._events.append(event)
         self._ids.add(event.event_id)
-        if self.index_enabled and event.kind in _KEY_KINDS:
+        if (self.index_enabled and event.kind in _KEY_KINDS
+                and event.metadata.get("rgm_adopted", True)):
             self._key_events.append(event)
             self._add_to_segment(event)
 

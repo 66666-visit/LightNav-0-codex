@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
-from lightnav.memory.schemas import ObservationPacket
+from lightnav.memory.schemas import ObservationPacket, VisualPlaceFeatures
 
 
 def normalize_descriptor(values: Sequence[float]) -> tuple[float, ...]:
@@ -153,8 +153,8 @@ class DINOv2PlaceDescriptorExtractor:
         self._model = model
         self._torch = torch
 
-    def extract(self, packet: ObservationPacket) -> tuple[float, ...]:
-        """Pool patch tokens from an HWC uint8 RGB frame under inference mode."""
+    def _extract_features(self, packet: ObservationPacket, *, include_patches: bool) -> VisualPlaceFeatures:
+        """Return global evidence and optionally local evidence from one forward."""
         import numpy as np
         try:
             from PIL import Image
@@ -166,6 +166,7 @@ class DINOv2PlaceDescriptorExtractor:
             raise ValueError("DINOv2 input must be HWC uint8 RGB")
         if rgb.shape[0] == 0 or rgb.shape[1] == 0:
             raise ValueError("DINOv2 RGB frame must have nonzero height and width")
+        image_quality = min(1.0, float(np.std(rgb.astype(np.float32).mean(axis=2))) / 64.0)
         self._load()
         image = Image.fromarray(np.ascontiguousarray(rgb), mode="RGB")
         batch = self._processor(images=image, return_tensors="pt")
@@ -182,5 +183,49 @@ class DINOv2PlaceDescriptorExtractor:
                 or tokens.shape[1] <= first_patch or tokens.shape[2] != 384
             ):
                 raise ValueError("DINOv2 did not return a batch of 384-D patch tokens")
-            pooled = tokens[:, first_patch:, :].mean(dim=1).squeeze(0)
-        return normalize_descriptor(pooled.detach().cpu().tolist())
+            patches = tokens[:, first_patch:, :].squeeze(0)
+            pooled = patches.mean(dim=0)
+        pixel_values = batch["pixel_values"]
+        global_descriptor = normalize_descriptor(pooled.detach().cpu().tolist())
+        if not include_patches:
+            return VisualPlaceFeatures(global_descriptor, (), (0, 0))
+        patch_size = int(getattr(self._model.config, "patch_size", 14))
+        height = int(pixel_values.shape[-2]) // patch_size
+        width = int(pixel_values.shape[-1]) // patch_size
+        if height * width != int(patches.shape[0]):
+            raise ValueError("DINO patch count disagrees with processed image grid")
+        # A bounded regular grid keeps geometric correspondence while avoiding
+        # quadratic matching over every DINO Patch at larger processor sizes.
+        import math
+
+        stride = max(1, math.ceil(math.sqrt(int(patches.shape[0]) / 256)))
+        indices = tuple(row * width + column for row in range(0, height, stride)
+                        for column in range(0, width, stride))
+        sampled = patches.detach().cpu().numpy()[list(indices)].astype(np.float32)
+        norms = np.linalg.norm(sampled, axis=1, keepdims=True)
+        if not np.all(np.isfinite(sampled)) or np.any(norms <= 0):
+            raise ValueError("DINO patch descriptors must be finite and nonzero")
+        patch_rows = (sampled / norms).astype(np.float16)
+        return VisualPlaceFeatures(
+            global_descriptor=global_descriptor,
+            patch_descriptors=patch_rows,
+            patch_grid=(height, width),
+            patch_indices=indices,
+            preprocessing_metadata={
+                "processed_height": int(pixel_values.shape[-2]),
+                "processed_width": int(pixel_values.shape[-1]),
+                "patch_size": patch_size,
+                "rgb_height": int(rgb.shape[0]), "rgb_width": int(rgb.shape[1]),
+                "roi_mapping": "unavailable_without_processor_crop_metadata",
+                "patch_stride": stride,
+                "image_quality": image_quality,
+            },
+        )
+
+    def extract_features(self, packet: ObservationPacket) -> VisualPlaceFeatures:
+        """Global plus Patch features for RGM D, with one model forward."""
+        return self._extract_features(packet, include_patches=True)
+
+    def extract(self, packet: ObservationPacket) -> tuple[float, ...]:
+        """Legacy global-only descriptor API; no Patch transfer to the CPU."""
+        return self._extract_features(packet, include_patches=False).global_descriptor

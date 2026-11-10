@@ -8,6 +8,7 @@ closing tag in the human message; it never changes the visual or action format.
 from __future__ import annotations
 
 from html import escape
+from hashlib import sha256
 
 from lightnav.memory.schemas import MemoryContext
 
@@ -88,3 +89,53 @@ def inject_memory_context(
     spacer = "" if prefix.endswith(" ") else " "
     human["value"] = f"{prefix}{spacer}{memory_text}\n{suffix}"
     return copied
+
+
+def audit_prompt_injection(base: dict, augmented: dict, context: MemoryContext,
+                           *, max_chars: int) -> dict[str, object]:
+    """Check exact original-prompt recovery and unchanged multimodal payload."""
+    originals = base.get("conversations", [])
+    changed = augmented.get("conversations", [])
+    base_human = [message for message in originals if message.get("from") == "human"]
+    new_human = [message for message in changed if message.get("from") == "human"]
+    if len(base_human) != 1 or len(new_human) != 1:
+        raise ValueError("prompt audit requires one human message")
+    original_prompt = base_human[0]["value"]
+    new_prompt = new_human[0]["value"]
+    memory_text = build_context_text(context, max_chars=max_chars)
+    if not memory_text:
+        roundtrip = new_prompt == original_prompt and (
+            augmented is base or (
+                set(augmented) == set(base)
+                and all(augmented[key] is value for key, value in base.items()
+                        if key not in {"video_segments", "conversations"})
+            )
+        )
+    elif isinstance(original_prompt, str) and original_prompt.count(_TASK_END) == 1:
+        insert_at = original_prompt.index(_TASK_END) + len(_TASK_END)
+        if original_prompt[insert_at:insert_at + 2] == ". ":
+            insert_at += 2
+        prefix, suffix = original_prompt[:insert_at], original_prompt[insert_at:]
+        spacer = "" if prefix.endswith(" ") else " "
+        memory_block = spacer + memory_text + "\n"
+        roundtrip = (
+            new_prompt == prefix + memory_block + suffix
+            and new_prompt[:insert_at] + new_prompt[
+                insert_at + len(memory_block):
+            ] == original_prompt
+        )
+    else:
+        roundtrip = False
+    same_roles = [item.get("from") for item in originals] == [item.get("from") for item in changed]
+    same_others = all(
+        old == new for old, new in zip(originals, changed)
+        if old.get("from") != "human"
+    )
+    same_video = base.get("video_segments") is augmented.get("video_segments")
+    if not (roundtrip and same_roles and same_others and same_video):
+        raise ValueError("memory prompt contract failed")
+    return {
+        "base_sha256": sha256(original_prompt.encode()).hexdigest(),
+        "augmented_sha256": sha256(new_prompt.encode()).hexdigest(),
+        "roundtrip_ok": True, "injected_chars": len(memory_text),
+    }

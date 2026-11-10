@@ -36,11 +36,13 @@ from lightnav.habitat.experiment_integrity import (
     write_or_match_manifest,
 )
 from lightnav.habitat.policy import TrajVocabVLNCEPolicy, extract_instruction
+from lightnav.habitat.progress import ProgressReporter
 from lightnav.habitat.results import (
     make_json_safe,
     print_objectnav_summary,
     print_vlnce_summary,
 )
+from lightnav.memory.rgm_config import RGMConfig
 from lightnav.serving.protocol import pointing_payload
 from lightnav.serving.token_budget import decode_token_budget, probe_grounding_tokens
 from lightnav.tracking import load_centroids
@@ -71,6 +73,7 @@ class MemoryConfig:
     place_extract_every_n_steps: int = 5
     place_similarity_threshold: float = 0.85
     place_device: str = "cpu"
+    rgm: RGMConfig = field(default_factory=RGMConfig)
 
     def __post_init__(self) -> None:
         if self.top_k < 1 or self.max_context_chars < 1:
@@ -105,6 +108,8 @@ class MemoryConfig:
             raise ValueError("memory.place_similarity_threshold must be in (0, 1]")
         if not isinstance(self.place_device, str) or not self.place_device.strip():
             raise ValueError("memory.place_device must be nonempty")
+        if self.rgm.enabled and not self.enabled:
+            raise ValueError("RGM requires memory_enabled")
 
 
 @dataclass
@@ -150,6 +155,18 @@ class HabitatEvalConfig:
     seed: int | None = None
     strict_full_eval: bool = False
     resume: bool = False
+    progress_shard_index: int = 0
+    progress_shard_count: int = 1
+    progress_tty: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.progress_shard_index) is not int
+            or type(self.progress_shard_count) is not int
+            or self.progress_shard_count < 1
+            or not 0 <= self.progress_shard_index < self.progress_shard_count
+        ):
+            raise ValueError("progress shard index/count are invalid")
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +392,7 @@ def build_velocity_policy(
             place_extractor=place_extractor,
             place_every_n_steps=cfg.memory.place_extract_every_n_steps,
             place_similarity_threshold=cfg.memory.place_similarity_threshold,
+            rgm_config=cfg.memory.rgm,
         )
     return TrajVocabVLNCEPolicy(
         engine,
@@ -719,6 +737,7 @@ def run_habitat_eval(
     engine, bundle = engine_factory(cfg)
     env = env_factory(cfg)
 
+    progress: ProgressReporter | None = None
     try:
         manifest = None
         manifest_index: dict[tuple[str, str], int] = {}
@@ -752,6 +771,29 @@ def run_habitat_eval(
             if archived:
                 print(f"Archived {archived} unfinished diagnostic steps before resume")
         Path(diagnostics_jsonl).touch(exist_ok=True)
+        if cfg.languages:
+            logger.info(
+                "Skipping numeric Episode progress: client language filter has no "
+                "known post-filter manifest count"
+            )
+        elif manifest is not None and manifest["expected_count"] > 0:
+            total = manifest["expected_count"]
+            if cfg.episodes > 0:
+                total = min(total, cfg.episodes)
+            group_label = (
+                Path(output_dir).parent.name
+                if Path(output_dir).name.startswith("shard_") else "LightNav"
+            )
+            try:
+                progress = ProgressReporter(
+                    total, shard_index=cfg.progress_shard_index,
+                    shard_count=cfg.progress_shard_count,
+                    completed_results=existing_results, group_label=group_label,
+                    tty_override=True if cfg.progress_tty else None,
+                    auto_heartbeat=True,
+                )
+            except Exception:
+                logger.exception("Progress reporting failed to initialize; evaluation continues")
     except BaseException:
         try:
             if viz is not None:
@@ -784,6 +826,17 @@ def run_habitat_eval(
     n_run = 0
     policy = None
     start_time = time.time()
+
+    def report_progress(method: str, *args: Any, **kwargs: Any) -> None:
+        """Keep optional terminal reporting from changing evaluation results."""
+        nonlocal progress
+        if progress is None:
+            return
+        try:
+            getattr(progress, method)(*args, **kwargs)
+        except Exception:
+            logger.exception("Progress reporting failed; evaluation continues")
+            progress = None
 
     try:
         while True:
@@ -823,11 +876,20 @@ def run_habitat_eval(
                 flush=True,
             )
 
+            report_progress("start", habitat_scene_id, habitat_ep_id,
+                            max_steps=cfg.max_steps)
             episode_start = time.monotonic()
             instruction = extract_instruction(obs)
             if policy is None:
                 policy = policy_factory(cfg, engine, bundle, info)
-            policy.reset(obs)
+            if cfg.memory.rgm.enabled and isinstance(policy, TrajVocabVLNCEPolicy):
+                policy.reset(
+                    obs, memory_episode_id=json.dumps(
+                        [habitat_scene_id, habitat_ep_id], separators=(",", ":"),
+                    ),
+                )
+            else:
+                policy.reset(obs)
             if viz is not None:
                 viz.begin_episode(episode_id)
 
@@ -908,6 +970,9 @@ def run_habitat_eval(
                     if dtg < min_distance_to_goal:
                         min_distance_to_goal = dtg
 
+                    if not (terminated or truncated):
+                        report_progress("update_step", step + 1, max_steps=cfg.max_steps)
+
                     if terminated or truncated:
                         final_success = info.get("success", False)
                         break
@@ -982,6 +1047,7 @@ def run_habitat_eval(
                 os.fsync(f.fileno())
             results.append(result)
             completed_keys.add(ep_key)
+            report_progress("complete", result)
 
             status = "OK" if result["success"] else "FAIL"
             print(
@@ -1003,6 +1069,7 @@ def run_habitat_eval(
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     finally:
+        report_progress("abort")
         try:
             if policy is not None and hasattr(policy, "close_episode"):
                 policy.close_episode()
@@ -1016,6 +1083,7 @@ def run_habitat_eval(
     elapsed = time.time() - start_time
     if cfg.strict_full_eval:
         check_coverage(results, manifest, complete=True)
+    report_progress("finish")
     if skipped_lang > 0:
         print(f"\nSkipped {skipped_lang} episodes due to language filter.")
 

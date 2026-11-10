@@ -249,6 +249,55 @@ def test_formal_eval_resumes_completed_episode_ids_without_double_counting(tmp_p
     assert (output / "episode_manifest.json").is_file()
 
 
+def test_progress_uses_loaded_shard_manifest_and_measured_result(tmp_path, capsys):
+    harness = Harness(ManifestEnv(steps_to_terminate=2))
+    harness.policy = TimedFakePolicy()
+    results = harness.run(_cfg(
+        tmp_path, episodes=-1, max_steps=500, force_stop_at_max_steps=False,
+        strict_full_eval=True, seed=42,
+        progress_shard_index=1, progress_shard_count=2,
+    ))
+    progress = capsys.readouterr().err
+    assert len(results) == 3
+    assert "Overall shard 1/2" in progress
+    assert "[1/3] START Episode ID: 1" in progress
+    assert "[3/3] COMPLETED" in progress
+    assert "SR: 1.000 | OS: 1.000 | SPL: 0.500" in progress
+    assert "shard 1/2 COMPLETE: 3/3" in progress
+    assert harness.policy.acts == 6
+
+
+def test_progress_resume_starts_after_saved_episode_without_recount(tmp_path, capsys):
+    cfg = _cfg(
+        tmp_path, episodes=-1, max_steps=500,
+        force_stop_at_max_steps=False, strict_full_eval=True, seed=42,
+    )
+    interrupted = Harness(ManifestEnv())
+    interrupted.policy = TimedFakePolicy(fail_on_reset=2)
+    with pytest.raises(RuntimeError, match="interrupted episode"):
+        interrupted.run(cfg)
+    capsys.readouterr()
+
+    resumed = Harness(ManifestEnv())
+    resumed.policy = TimedFakePolicy()
+    cfg.resume = True
+    results = resumed.run(cfg)
+    progress = capsys.readouterr().err
+    assert len(results) == 3
+    assert "Resumed: 1/3 completed Episodes" in progress
+    assert "[2/3] START Episode ID: 2" in progress
+    assert "[3/3] COMPLETED" in progress
+    assert "[1/3] COMPLETED" not in progress
+    assert len(_read_jsonl(Path(cfg.output_dir) / "results.jsonl")) == 3
+
+
+def test_progress_avoids_false_total_with_client_language_filter(tmp_path, capsys):
+    harness = Harness(ManifestEnv())
+    results = harness.run(_cfg(tmp_path, episodes=-1, languages=["en-US"]))
+    assert len(results) == 1
+    assert "Overall shard" not in capsys.readouterr().err
+
+
 def test_formal_resume_repairs_partial_jsonl_tails_without_losing_results(tmp_path):
     cfg = _cfg(
         tmp_path, episodes=-1, max_steps=500,

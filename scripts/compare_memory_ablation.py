@@ -773,6 +773,9 @@ def compare(
 ) -> dict[str, Any]:
     if samples < 1:
         raise ValueError("bootstrap samples must be positive")
+    snapshot_path = root / "ablation_run.json"
+    if snapshot_path.is_file() and _read_json(snapshot_path).get("protocol_version") == "rgm_pilot_88_v1":
+        return compare_rgm_88(root, samples=samples, seed=seed)
     selected_groups = load_selected_groups(root)
     manifest, expected = load_manifest(root)
     snapshot_path = root / "ablation_run.json"
@@ -931,6 +934,195 @@ def compare(
             ),
         }
     return report
+
+
+def compare_rgm_88(root: Path, *, samples: int = 2000, seed: int = 0) -> dict[str, Any]:
+    """Compare exact paired A/C/D rows under the immutable RGM 88 protocol."""
+    from dataclasses import asdict
+
+    from lightnav.habitat.experiment_integrity import check_pilot_selection
+    from lightnav.memory.rgm_config import RGMConfig
+
+    launch = _read_json(root / "ablation_run.json")
+    if launch.get("groups") != ["baseline_off", "rgm_gates", "rgm_full"]:
+        raise ValueError("RGM Pilot groups must be A/C/D in order")
+    manifest, expected = load_manifest(root)
+    if len(expected) != 88:
+        raise ValueError("RGM Pilot requires exactly 88 loaded Episodes")
+    check_pilot_selection(manifest, root / "pilot_manifest.json")
+    pilot_metadata = _read_json(root / "pilot_manifest.json")
+    if pilot_metadata.get("parent_manifest_sha256") != launch.get("parent_manifest_sha256"):
+        raise ValueError("RGM Pilot parent provenance differs from launcher snapshot")
+    digest = hashlib.sha256((root / "pilot_manifest.json").read_bytes()).hexdigest()
+    if digest != launch.get("pilot_manifest_sha256"):
+        raise ValueError("RGM Pilot Manifest differs from immutable launcher snapshot")
+    groups = {
+        name: _load_group(root, name, manifest, expected, allow_incomplete=False, pilot=True)
+        for name in ("rgm_gates", "rgm_full")
+    }
+    _validate_common_configs(groups, expected_count=88, pilot=True)
+    for name, group in groups.items():
+        if not group.artifacts_complete or group.missing or group.diagnostic_gaps:
+            raise ValueError(f"{name} is not complete")
+        if _measurement_gaps(group):
+            raise ValueError(f"{name} has missing measured diagnostics")
+        required_rgm = {
+            "episode_id", "rgm_config", "yolo_detection_ms", "yolo_candidate_count",
+            "yolo_temporal_support", "yolo_association_ms", "write_gate_decisions",
+            "dino_global_topk", "dino_local_match_count", "dino_local_inlier_ratio",
+            "place_decision", "topology_edge_status", "retrieval_candidates",
+            "retrieval_gate_decisions", "fusion_selected_records", "prompt_gate_decision",
+            "prompt_fallback_reason", "prompt_hash", "injected_memory_text",
+            "injected_memory_chars", "inference_latency_ms",
+        }
+        for row in _iter_jsonl(root / name / "memory_diagnostics.jsonl", required=True):
+            if required_rgm - row.keys():
+                raise ValueError(f"{name} lacks RGM decision diagnostics")
+    c_args = list(groups["rgm_gates"].config["memory_args"])
+    d_args = list(groups["rgm_full"].config["memory_args"])
+    required_flags = {
+        "--memory_enabled", "--memory_place_enabled", "--rgm_enabled",
+    }
+    if not required_flags <= set(c_args):
+        raise ValueError("C/D require memory, place recognition and RGM")
+    for flag, value in (
+        ("--memory_strategy", "hierarchical"),
+        ("--memory_layers", "short,mid,long"),
+        ("--memory_extractor", "yolo11"),
+        ("--memory_extract_every_n_steps", "5"),
+        ("--memory_place_extract_every_n_steps", "5"),
+        ("--rgm_prompt_max_records", "3"),
+        ("--rgm_prompt_max_chars", "400"),
+    ):
+        if flag not in c_args or c_args[c_args.index(flag) + 1] != value:
+            raise ValueError(f"C/D protocol requires {flag} {value}")
+    extra = {"--rgm_yolo_temporal_enabled", "--rgm_place_two_stage_enabled",
+             "--rgm_topology_motion_validation_enabled"}
+    if [arg for arg in d_args if arg not in extra] != c_args or not extra <= set(d_args):
+        raise ValueError("C and D memory settings differ outside the three D extensions")
+    if "--rgm_enabled" not in c_args:
+        raise ValueError("C/D did not enable RGM")
+    baseline_dir = root / "baseline_off"
+    reused = (baseline_dir / "reuse_provenance.json").is_file()
+    if reused:
+        provenance = _read_json(baseline_dir / "reuse_provenance.json")
+        if provenance.get("status") != "compatible" or provenance.get("reusable_count") != 88:
+            raise ValueError("legacy A reuse lacks strict compatibility")
+        if _read_json(baseline_dir / "episode_manifest.json") != manifest:
+            raise ValueError("reused A manifest differs from C/D")
+        marker = _read_json(baseline_dir / "pilot_complete.json")
+        expected_marker = {
+            "expected_count": 88,
+            "manifest_sha256": hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest(),
+        }
+        if marker != expected_marker:
+            raise ValueError("reused A completion marker differs from loaded manifest")
+        a_records = {}
+        for row in _iter_jsonl(baseline_dir / "results.jsonl"):
+            key = _episode_key(row)
+            if key in a_records:
+                raise ValueError(f"duplicate reused A Episode {key}")
+            a_records[key] = row
+        if set(a_records) != set(expected):
+            raise ValueError("reused A does not cover the selected 88")
+        a_summary = _read_json(baseline_dir / "summary.json")
+        if a_summary.get("num_episodes") != 88:
+            raise ValueError("reused A summary count differs from 88")
+        a_config = _read_json(baseline_dir / "config_snapshot.yaml")
+        if a_config.get("common") != groups["rgm_gates"].config.get("common"):
+            raise ValueError("reused A common evaluation config differs from C/D")
+        a_diagnostics = {}
+        for row in _iter_jsonl(baseline_dir / "memory_diagnostics.jsonl"):
+            key = _episode_key(row)
+            if key not in a_records:
+                raise ValueError("reused A has diagnostic outside selected 88")
+            a_diagnostics.setdefault(key, DiagnosticAggregate()).add(
+                row, group="baseline_off", key=key,
+            )
+        for key, record in a_records.items():
+            aggregate = a_diagnostics.get(key)
+            if (aggregate is None or aggregate.step_bits != (1 << int(record["steps"])) - 1):
+                raise ValueError(f"reused A diagnostic coverage incomplete: {key}")
+        groups["baseline_off"] = GroupData(
+            "baseline_off", a_records, a_diagnostics, a_summary, [], {}, 0,
+            None, True, a_config,
+        )
+    else:
+        groups["baseline_off"] = _load_group(
+            root, "baseline_off", manifest, expected, allow_incomplete=False, pilot=True,
+        )
+        if not groups["baseline_off"].artifacts_complete:
+            raise ValueError("A rerun is not complete")
+        _validate_common_configs(groups, expected_count=88, pilot=True)
+    a_args = groups["baseline_off"].config.get("memory_args", [])
+    if "--memory_enabled" in a_args or "--rgm_enabled" in a_args:
+        raise ValueError("A must use the original memory-off policy")
+    for name in ("rgm_gates", "rgm_full"):
+        effective = groups[name].config.get("memory_effective")
+        expected_rgm = asdict(RGMConfig(
+            enabled=True,
+            yolo_temporal_enabled=name == "rgm_full",
+            place_two_stage_enabled=name == "rgm_full",
+            topology_motion_validation_enabled=name == "rgm_full",
+        ))
+        if not isinstance(effective, dict) or effective.get("rgm") != expected_rgm:
+            raise ValueError(f"{name} effective RGM settings differ from the fixed Pilot protocol")
+        if effective.get("enabled") is not True:
+            raise ValueError(f"{name} effective memory setting is disabled")
+    ordered = ("baseline_off", "rgm_gates", "rgm_full")
+    episode_metrics = {}
+    group_report = {}
+    for name in ordered:
+        group = groups[name]
+        metrics = {
+            key: _episode_metrics(
+                row, group.diagnostics.get(key),
+                require_complete=not (reused and name == "baseline_off"),
+            )
+            for key, row in group.records.items()
+        }
+        _check_summary_metrics(
+            group, _metric_summary(list(metrics.values()), samples=samples, seed=seed),
+        )
+        if reused and name == "baseline_off":
+            for item in metrics.values():
+                item["mean_inference_latency_ms"] = None
+                item["episode_time_sec"] = None
+        episode_metrics[name] = metrics
+        summary = _metric_summary(list(metrics.values()), samples=samples, seed=seed)
+        if reused and name == "baseline_off":
+            summary["mean_inference_latency_ms"] = {
+                "mean": None, "ci95": None, "n": 0,
+            }
+        group_report[name] = {
+            "completed_episodes": 88, "metrics": summary,
+            "legacy_reused": reused and name == "baseline_off",
+        }
+    pairs = {}
+    for first, second in (("baseline_off", "rgm_gates"),
+                          ("baseline_off", "rgm_full"), ("rgm_gates", "rgm_full")):
+        per_episode = []
+        for key in expected:
+            differences = {}
+            for metric in (*METRICS, "episode_time_sec"):
+                left = episode_metrics[first][key][metric]
+                right = episode_metrics[second][key][metric]
+                differences[metric] = right - left if left is not None and right is not None else None
+            per_episode.append({**_key_dict(key), "delta": differences})
+        pairs[f"{second}_minus_{first}"] = {
+            "paired_count": 88, "metrics": _metric_summary(
+                [row["delta"] for row in per_episode], samples=samples, seed=seed,
+            ),
+            "per_episode": per_episode,
+        }
+    return {
+        "status": "complete", "evaluation_mode": "rgm_pilot_88_v1",
+        "selected_groups": list(ordered), "manifest": manifest,
+        "bootstrap": {"samples": samples, "seed": seed, "unit": "episode"},
+        "groups": group_report, "paired_differences": pairs,
+        "legacy_a_reused": reused,
+        "latency_note": "Legacy A latency excluded across hardware/environment" if reused else None,
+    }
 
 
 def write_report(root: Path, report: dict[str, Any]) -> None:

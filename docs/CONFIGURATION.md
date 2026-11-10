@@ -135,6 +135,54 @@ does not write `formal_complete.json`; omitting `--pilot-per-scene` retains the
 full 1,839-Episode evaluation. `SCENES_DIR` should match the scene path used
 by the Habitat dataset loader. See [MEMORY_ABLATION.md](MEMORY_ABLATION.md).
 
+### RGM V1 88-Episode Pilot
+
+`--rgm_enabled` activates the three evidence gates inside the existing hierarchical
+memory path. It requires `--memory_enabled --memory_strategy hierarchical`.
+`--rgm_write_gate_enabled`, `--rgm_retrieval_gate_enabled`, and
+`--rgm_prompt_gate_enabled` default to on when RGM is selected; each supports
+the corresponding `--no-rgm_*` form. `--rgm_step0_conditional` controls the
+instruction-related current-frame exception at step 0. D adds
+`--rgm_yolo_temporal_enabled`, `--rgm_place_two_stage_enabled`, and
+`--rgm_topology_motion_validation_enabled`. Each can be disabled separately.
+`--rgm_adaptive_extraction_enabled` is reserved and rejected in V1; YOLO and
+DINO retain their fixed 5-step cadence.
+
+The uncalibrated numeric flags and defaults are:
+
+| Flag suffix after `--rgm_` | Default | Meaning |
+| --- | ---: | --- |
+| `min_candidate_confidence` | 0.25 | Minimum raw detection confidence |
+| `min_instruction_landmark_confidence` | 0.60 | Direct instruction landmark acceptance |
+| `temporal_window` / `temporal_min_support` | 3 / 2 | Independent extraction events for category evidence |
+| `place_top_k` | 3 | Global DINO place candidates |
+| `place_global_candidate_min` / `place_global_new_max` | 0.75 / 0.65 | Global match and new-candidate bounds |
+| `place_local_cosine_min` / `place_local_min_matches` | 0.70 / 8 | Mutual Patch correspondence thresholds |
+| `place_local_inlier_min` / `place_global_margin_min` | 0.50 / 0.03 | Local geometry and global ambiguity bounds |
+| `place_new_temporal_similarity_min` | 0.85 | Similarity needed between independent novel-place observations |
+| `place_ransac_reprojection_threshold` | 0.08 | Normalized image-coordinate RANSAC tolerance |
+| `place_min_image_quality` | 0.20 | Minimum grayscale contrast proxy before place identity decisions |
+| `place_keyframes_max` | 3 | Episode-local Patch keyframes per visual place |
+| `topology_visual_delta_min` | 0.35 | Minimum RGB change for an observed transition |
+| `prompt_max_records` / `prompt_max_chars` | 3 / 400 | Final injected memory budget |
+
+All RGM flags appear in `config_snapshot.yaml` under `memory_args`. Scores are
+engineering thresholds, not calibrated probabilities. No current server field
+supplies Pose, collision feedback or odometry; RGM never marks a traversal as
+physically verified.
+
+For the new A/C/D Pilot, use
+`bash scripts/run_memory_ablation.sh --rgm-88 --parent-manifest OLD/pilot_manifest.json`
+with `MODEL_PATH`, `YOLO_MODEL_PATH`, `DINO_MODEL_PATH` and `DATA_PATH` set.
+Optional `--legacy-root` points to `output/r2r_pilot_220_v2`, `--output-root`
+defaults to `output/rgm_pilot_88_v1`, and `--resume` preserves the fixed selection.
+The launcher derives 88 IDs from the legacy 220 Manifest (8 per scene, 3/3/2
+distance strata), runs C=`rgm_gates` and D=`rgm_full`, then strictly checks
+legacy A=`baseline_off`. Missing source or weight fingerprints reject automatic
+A reuse and cause the launcher to run A on the same 88 IDs. B is absent from
+the RGM protocol. The legacy 220 and full 1839 launch modes above remain
+available separately.
+
 The underlying `scripts/eval_habitat.sh` also accepts `STRICT_FULL_EVAL=1`
 for the full-split gate, `RESUME=1` to skip existing completed Episodes,
 `EPISODE_MANIFEST_PATH` to create or compare a shared manifest, `SEED` for
@@ -145,6 +193,22 @@ truncate. Its matching client flags are `--strict_full_eval`, `--resume`,
 selection to the Habitat server as `--pilot-manifest`; the integrity gate
 checks exact selected IDs and writes `pilot_complete.json`. The ordinary
 defaults remain available for smoke tests.
+
+`lightnav-eval-habitat` reports Episode progress from the server's loaded
+manifest. `--progress_shard_index` and `--progress_shard_count` label direct
+client runs (defaults: `0` and `1`); `scripts/eval_habitat.sh` supplies them
+automatically. In multi-GPU runs, progress and ETA are **per shard**, using
+that shard's actual loaded Episode count. Completed results are included on
+resume. Episode start and completion print immediately; non-TTY runs emit a
+timer-driven heartbeat about every 12 seconds, including during a slow model
+call. Single-shard TTY runs use an in-place
+display (`--progress_tty` when stderr is forwarded through the launcher);
+multi-shard runs use labelled heartbeat lines. Progress goes to stderr so the shell
+launcher streams it live and writes `logs/client_progress_gpu*_shard*.log`
+alongside its existing client logs. ETA is approximate and initially reads
+`CALIBRATING` until completed Episode durations are available. A client-side
+`--languages` filter has no known post-filter Episode count in the server
+manifest, so numeric progress is suppressed for that run.
 
 `lightnav-serve` flags (environment names are what `scripts/start_servers.sh` and
 `docker/entrypoint.sh` read):
