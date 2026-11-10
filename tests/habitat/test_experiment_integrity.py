@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from lightnav.habitat.experiment_integrity import (
+    _key,
+    _normalize_scene_id,
     archive_unfinished_diagnostics,
     check_coverage,
     check_pilot_selection,
+    combine_shard_manifests,
     collect_ready_manifests,
     repair_interrupted_jsonl_tail,
+    validate_manifest,
     verify_group,
+    write_or_match_manifest,
 )
 
 
@@ -64,8 +70,8 @@ class ExperimentIntegrityTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate result"):
             check_coverage([row, row], manifest, complete=False)
         actual, missing = check_coverage([row], manifest, complete=False)
-        self.assertEqual(actual, {("scene_a", "1")})
-        self.assertEqual(missing, {("scene_b", "1")})
+        self.assertEqual(actual, {(_normalize_scene_id("scene_a"), "1")})
+        self.assertEqual(missing, {(_normalize_scene_id("scene_b"), "1")})
         with self.assertRaisesRegex(ValueError, "missing 1 episodes"):
             check_coverage([row], manifest, complete=True)
 
@@ -354,6 +360,260 @@ class ExperimentIntegrityTest(unittest.TestCase):
         _write_jsonl(result_path, [result])
         with self.assertRaisesRegex(ValueError, "differs from its shard result"):
             verify_group(root)
+
+
+class ScenePathIntegrityTest(unittest.TestCase):
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        actual_root = self.root / "actual_data"
+        actual_root.mkdir()
+        alias_root = self.root / "data"
+        alias_root.symlink_to(actual_root, target_is_directory=True)
+        self.absolute_scenes = []
+        self.relative_scenes = []
+        for scene in range(11):
+            suffix = Path("scene_datasets") / "mp3d" / f"scene_{scene:02d}"
+            actual = actual_root / suffix / "scene.glb"
+            actual.parent.mkdir(parents=True)
+            (actual.parent / "nested").mkdir()
+            actual.touch()
+            self.absolute_scenes.append(str(actual))
+            alias = alias_root / suffix / "nested" / ".." / "scene.glb"
+            self.relative_scenes.append(os.path.relpath(alias, Path.cwd()))
+
+    def _rgm_rows(self) -> list[dict[str, str]]:
+        return [
+            {
+                "scene_id": self.absolute_scenes[scene],
+                "habitat_episode_id": f"ep_{scene}_{index}",
+                "distance_group": "short" if index < 3 else "medium" if index < 6 else "long",
+            }
+            for scene in range(11) for index in range(8)
+        ]
+
+    def _rgm_selection(self, rows: list[dict[str, str]] | None = None,
+                       quotas: dict[str, int] | None = None) -> Path:
+        path = self.root / "rgm_pilot_manifest.json"
+        path.write_text(json.dumps({
+            "protocol_version": "rgm_pilot_88_v1", "dataset_split": "val_unseen",
+            "sample_seed": 42, "expected_count": 88, "per_scene": 8,
+            "parent_manifest_sha256": "a" * 64,
+            "scene_quotas": quotas if quotas is not None else {
+                scene: 8 for scene in self.absolute_scenes
+            },
+            "episodes": self._rgm_rows() if rows is None else rows,
+        }), encoding="utf-8")
+        return path
+
+    def _loaded_88(self) -> dict:
+        return _manifest([
+            (self.relative_scenes[scene], f"ep_{scene}_{index}")
+            for scene in range(11) for index in range(8)
+        ])
+
+    def test_rgm_88_collect_matches_absolute_and_relative_symlink_paths(self) -> None:
+        selection = self._rgm_selection(quotas={
+            self.relative_scenes[scene] if scene % 2 else self.absolute_scenes[scene]: 8
+            for scene in range(11)
+        })
+        loaded = self._loaded_88()
+        first = self.root / "shard_0.ready"
+        second = self.root / "shard_1.ready"
+        first.write_text(json.dumps(_manifest([
+            (row["scene_id"], row["episode_id"]) for row in loaded["episodes"][:44]
+        ])), encoding="utf-8")
+        second.write_text(json.dumps(_manifest([
+            (row["scene_id"], row["episode_id"]) for row in loaded["episodes"][44:]
+        ])), encoding="utf-8")
+        group = self.root / "group_manifest.json"
+        shared = self.root / "shared_manifest.json"
+        combined = collect_ready_manifests([first, second], group, shared, 88, selection)
+        self.assertEqual(combined["expected_count"], 88)
+        self.assertEqual(combined["episodes"][0]["scene_id"], self.relative_scenes[0])
+        self.assertEqual(json.loads(group.read_text()), json.loads(shared.read_text()))
+
+    def test_rgm_88_still_rejects_wrong_episode_and_scene_file(self) -> None:
+        selection = self._rgm_selection()
+        loaded = self._loaded_88()
+        wrong_id = json.loads(json.dumps(loaded))
+        wrong_id["episodes"][0]["episode_id"] = "other_episode"
+        with self.assertRaisesRegex(ValueError, "loaded RGM Pilot Episode IDs differ"):
+            check_pilot_selection(wrong_id, selection)
+        wrong_scene = json.loads(json.dumps(loaded))
+        other = Path(self.absolute_scenes[0]).with_name("other.glb")
+        other.touch()
+        wrong_scene["episodes"][0]["scene_id"] = str(other)
+        with self.assertRaisesRegex(ValueError, "loaded RGM Pilot Episode IDs differ"):
+            check_pilot_selection(wrong_scene, selection)
+
+    def test_normalized_duplicate_episode_is_rejected_in_selection_manifest_and_shards(self) -> None:
+        rows = self._rgm_rows()
+        rows[0] = {**rows[1], "scene_id": self.relative_scenes[0]}
+        with self.assertRaisesRegex(ValueError, "8 unique Episodes"):
+            check_pilot_selection(self._loaded_88(), self._rgm_selection(rows))
+        duplicate = _manifest([
+            (self.absolute_scenes[0], "ep"), (self.relative_scenes[0], "ep"),
+        ])
+        with self.assertRaisesRegex(ValueError, "duplicate episode in manifest"):
+            validate_manifest(duplicate)
+        first = self.root / "first.ready"
+        second = self.root / "second.ready"
+        first.write_text(json.dumps(_manifest([(self.absolute_scenes[0], "ep")])))
+        second.write_text(json.dumps(_manifest([(self.relative_scenes[0], "ep")])))
+        with self.assertRaisesRegex(ValueError, "duplicate episode across shards"):
+            combine_shard_manifests([first, second])
+
+    def test_rgm_88_count_scene_quota_and_strata_remain_strict(self) -> None:
+        loaded = self._loaded_88()
+        with self.assertRaisesRegex(ValueError, "88 val_unseen"):
+            check_pilot_selection(loaded, self._rgm_selection(self._rgm_rows()[:-1]))
+        rows = self._rgm_rows()
+        rows[0]["scene_id"] = self.absolute_scenes[1]
+        with self.assertRaisesRegex(ValueError, "8 unique Episodes and 3/3/2"):
+            check_pilot_selection(loaded, self._rgm_selection(rows))
+        rows = self._rgm_rows()
+        rows[0]["distance_group"] = "long"
+        with self.assertRaisesRegex(ValueError, "8 unique Episodes and 3/3/2"):
+            check_pilot_selection(loaded, self._rgm_selection(rows))
+        quotas = {scene: 8 for scene in self.absolute_scenes}
+        quotas[self.relative_scenes[0]] = quotas.pop(self.absolute_scenes[1])
+        with self.assertRaisesRegex(ValueError, "duplicate normalized scene"):
+            check_pilot_selection(loaded, self._rgm_selection(quotas=quotas))
+
+    def test_legacy_220_accepts_aliases_and_keeps_quota_validation(self) -> None:
+        rows = [
+            (self.absolute_scenes[scene], f"ep_{scene}_{index}")
+            for scene in range(11) for index in range(20)
+        ]
+        selection = self.root / "pilot_220.json"
+        data = {
+            "dataset_split": "val_unseen", "expected_count": 220, "per_scene": 20,
+            "scene_quotas": {scene: 20 for scene in self.absolute_scenes},
+            "full_scene_counts": {scene: 30 for scene in self.relative_scenes},
+            "episodes": [
+                {"scene_id": scene, "habitat_episode_id": episode}
+                for scene, episode in rows
+            ],
+        }
+        selection.write_text(json.dumps(data), encoding="utf-8")
+        loaded = _manifest([
+            (self.relative_scenes[scene], f"ep_{scene}_{index}")
+            for scene in range(11) for index in range(20)
+        ])
+        check_pilot_selection(loaded, selection)
+        data["scene_quotas"][self.absolute_scenes[0]] = 19
+        selection.write_text(json.dumps(data), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "totaling 220"):
+            check_pilot_selection(loaded, selection)
+
+    def test_formal_1839_manifest_identity_and_existing_bytes_are_preserved(self) -> None:
+        relative = _manifest([
+            (self.relative_scenes[index % 11], f"episode_{index}")
+            for index in range(1839)
+        ])
+        absolute = _manifest([
+            (self.absolute_scenes[index % 11], f"episode_{index}")
+            for index in range(1839)
+        ])
+        target = self.root / "formal_manifest.json"
+        write_or_match_manifest(target, relative)
+        original = target.read_bytes()
+        write_or_match_manifest(target, absolute)
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(validate_manifest(relative)["episodes"][0]["scene_id"],
+                         self.relative_scenes[0])
+        actual, missing = check_coverage([
+            {"scene_id": scene, "habitat_episode_id": episode}
+            for scene, episode in (
+                (self.absolute_scenes[index % 11], f"episode_{index}")
+                for index in range(1839)
+            )
+        ], relative, complete=True)
+        self.assertEqual(len(actual), 1839)
+        self.assertFalse(missing)
+
+    def test_scene_id_rejects_invalid_values_and_preserves_linux_case(self) -> None:
+        for invalid in (None, "", "  ", "bad\x00path", 42):
+            with self.subTest(scene_id=invalid), self.assertRaises(ValueError):
+                _normalize_scene_id(invalid)
+        upper = Path(self.absolute_scenes[0]).with_name("Scene.glb")
+        upper.touch()
+        self.assertNotEqual(_normalize_scene_id(str(upper)),
+                            _normalize_scene_id(self.absolute_scenes[0]))
+        self.assertEqual(_key({"scene_id": self.relative_scenes[0], "episode_id": 12}),
+                         (self.absolute_scenes[0], "12"))
+        with self.assertRaises(ValueError):
+            _key({"scene_id": self.absolute_scenes[0], "episode_id": " "})
+
+    def test_resume_diagnostics_accepts_an_alias_of_completed_scene(self) -> None:
+        path = self.root / "memory_diagnostics.jsonl"
+        row = {"scene_id": self.relative_scenes[0], "habitat_episode_id": "ep", "step": 0}
+        _write_jsonl(path, [row])
+        count = archive_unfinished_diagnostics(path, {(self.absolute_scenes[0], "ep")})
+        self.assertEqual(count, 0)
+        self.assertEqual([json.loads(line) for line in path.read_text().splitlines()], [row])
+
+    def test_verify_rgm_group_accepts_aliases_but_not_changed_metrics(self) -> None:
+        selection = self._rgm_selection()
+        group = self.root / "rgm_group"
+        shard = group / "shard_0"
+        shard.mkdir(parents=True)
+        relative_manifest = self._loaded_88()
+        absolute_manifest = _manifest([
+            (self.absolute_scenes[scene], f"ep_{scene}_{index}")
+            for scene in range(11) for index in range(8)
+        ])
+        (group / "episode_manifest.json").write_text(json.dumps(relative_manifest))
+        (shard / "episode_manifest.json").write_text(json.dumps(absolute_manifest))
+        shared = self.root / "shared_rgm_manifest.json"
+        shared.write_text(json.dumps(absolute_manifest))
+
+        shard_results = []
+        merged_results = []
+        diagnostics = []
+        for scene in range(11):
+            for index in range(8):
+                episode_id = f"ep_{scene}_{index}"
+                result = {
+                    "scene_id": self.relative_scenes[scene],
+                    "habitat_episode_id": episode_id, "steps": 1,
+                    "episode_time_sec": 1.0, "terminated": True,
+                    "truncated": False, "forced_stop": False,
+                    "success": True, "oracle_success": True,
+                    "spl": 0.5, "ndtw": 0.7, "final_distance": 2.0,
+                }
+                shard_results.append(result)
+                merged_results.append({**result, "scene_id": self.absolute_scenes[scene],
+                                       "shard": 0})
+                diagnostics.append({
+                    "scene_id": self.relative_scenes[scene],
+                    "habitat_episode_id": episode_id, "step": 0,
+                    "inference_latency_ms": 12.0, "prompt_chars": 150,
+                })
+        _write_jsonl(shard / "results.jsonl", shard_results)
+        _write_jsonl(group / "results.jsonl", merged_results)
+        _write_jsonl(group / "memory_diagnostics.jsonl", diagnostics)
+        (group / "summary.json").write_text(json.dumps({
+            "num_episodes": 88,
+            "metrics": {
+                "SR_success_rate_pct": 100.0, "OS_oracle_success_pct": 100.0,
+                "SPL_pct": 50.0, "NDTW_pct": 70.0, "NE_navigation_error_m": 2.0,
+            },
+            "episodes": [
+                {"scene_id": row["scene_id"],
+                 "habitat_episode_id": row["habitat_episode_id"]}
+                for row in merged_results
+            ],
+        }))
+        completed = verify_group(group, shared=shared, pilot_selection=selection)
+        self.assertEqual(completed["expected_count"], 88)
+        self.assertTrue((group / "pilot_complete.json").is_file())
+        merged_results[0]["spl"] = 0.8
+        _write_jsonl(group / "results.jsonl", merged_results)
+        with self.assertRaisesRegex(ValueError, "differs from its shard result"):
+            verify_group(group, shared=shared, pilot_selection=selection)
 
 
 if __name__ == "__main__":

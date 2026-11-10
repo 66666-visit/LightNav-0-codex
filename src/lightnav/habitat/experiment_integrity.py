@@ -17,16 +17,49 @@ from statistics import fmean
 from typing import Any
 
 
+def _normalize_scene_id(scene_id: str) -> str:
+    """Use a scene file's real path for identity, preserving Linux case."""
+    if not isinstance(scene_id, str) or not scene_id.strip() or "\x00" in scene_id:
+        raise ValueError("scene_id must be a nonempty valid path string")
+    try:
+        return str(Path(scene_id).resolve(strict=False))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"invalid scene_id path: {scene_id!r}") from exc
+
+
 def _key(row: dict[str, Any], *, result: bool = False) -> tuple[str, str]:
+    if not isinstance(row, dict):
+        raise ValueError("episode record must be an object")
     scene = row.get("scene_id")
     episode = row.get("habitat_episode_id" if result else "episode_id")
-    if scene is None or episode is None or not str(scene) or not str(episode):
+    if episode is None or not str(episode).strip() or "\x00" in str(episode):
         raise ValueError("episode record requires nonempty scene_id and episode_id")
-    return str(scene), str(episode)
+    return _normalize_scene_id(scene), str(episode)
+
+
+def _same_manifest_episodes(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Compare ordered Episode identities without rewriting stored scene paths."""
+    return (
+        left["split"] == right["split"]
+        and left["expected_count"] == right["expected_count"]
+        and [_key(row) for row in left["episodes"]]
+        == [_key(row) for row in right["episodes"]]
+    )
+
+
+def _normalized_scene_map(values: dict[str, int], name: str) -> dict[str, int]:
+    """Canonicalize metadata keys while rejecting two aliases of one scene."""
+    normalized = {}
+    for scene, count in values.items():
+        canonical = _normalize_scene_id(scene)
+        if canonical in normalized:
+            raise ValueError(f"{name} contains duplicate normalized scene: {canonical}")
+        normalized[canonical] = count
+    return normalized
 
 
 def validate_manifest(data: Any) -> dict[str, Any]:
-    """Return a canonical manifest, rejecting duplicate or missing episode IDs."""
+    """Validate Episode identities while retaining source scene path spellings."""
     if not isinstance(data, dict) or not isinstance(data.get("split"), str):
         raise ValueError("manifest requires a split string")
     rows = data.get("episodes")
@@ -44,7 +77,9 @@ def validate_manifest(data: Any) -> dict[str, Any]:
         if key in seen:
             raise ValueError(f"duplicate episode in manifest: {key}")
         seen.add(key)
-        episodes.append({"scene_id": key[0], "episode_id": key[1]})
+        # Keep the server's original path spelling in artifacts and hashes.
+        # Identity checks use the normalized key above and everywhere below.
+        episodes.append({"scene_id": row["scene_id"], "episode_id": key[1]})
     return {"split": data["split"], "expected_count": expected, "episodes": episodes}
 
 
@@ -53,11 +88,11 @@ def read_manifest(path: str | Path) -> dict[str, Any]:
 
 
 def write_or_match_manifest(path: str | Path, data: dict[str, Any]) -> None:
-    """Create a manifest once; existing manifests must match exactly."""
+    """Create once; existing manifests must have the same ordered Episode identities."""
     target = Path(path)
     canonical = validate_manifest(data)
     if target.exists():
-        if read_manifest(target) != canonical:
+        if not _same_manifest_episodes(read_manifest(target), canonical):
             raise ValueError(f"episode manifest differs from existing file: {target}")
         return
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -141,6 +176,7 @@ def archive_unfinished_diagnostics(
     target = Path(path)
     if not target.is_file():
         return 0
+    completed = {(_normalize_scene_id(scene), str(episode)) for scene, episode in completed}
     orphan_count = sum(
         _key(row, result=True) not in completed for row in iter_jsonl(target)
     )
@@ -229,15 +265,23 @@ def check_pilot_selection(manifest: dict[str, Any], pilot_selection: str | Path)
             group = row.get("distance_group")
             if group not in ("short", "medium", "long"):
                 raise ValueError("RGM Pilot distance group is missing")
-            selected.append((scene, episode))
-            counts[scene] = counts.get(scene, 0) + 1
-            current = strata.setdefault(scene, {"short": 0, "medium": 0, "long": 0})
+            key = _key(row, result=True)
+            selected.append(key)
+            normalized_scene = key[0]
+            counts[normalized_scene] = counts.get(normalized_scene, 0) + 1
+            current = strata.setdefault(normalized_scene, {
+                "short": 0, "medium": 0, "long": 0,
+            })
             current[group] += 1
+        quotas = data.get("scene_quotas")
+        if not isinstance(quotas, dict) or any(type(value) is not int for value in quotas.values()):
+            raise ValueError("RGM Pilot scene_quotas must contain 11 scenes of 8 Episodes")
+        normalized_quotas = _normalized_scene_map(quotas, "RGM Pilot scene_quotas")
         if (len(set(selected)) != 88 or len(counts) != 11
                 or any(count != 8 for count in counts.values())
                 or any(groups != {"short": 3, "medium": 3, "long": 2}
                        for groups in strata.values())
-                or data.get("scene_quotas") != {scene: 8 for scene in counts}):
+                or normalized_quotas != {scene: 8 for scene in counts}):
             raise ValueError("RGM Pilot needs 8 unique Episodes and 3/3/2 strata per scene")
         loaded = {_key(row) for row in canonical["episodes"]}
         if loaded != set(selected):
@@ -259,43 +303,49 @@ def check_pilot_selection(manifest: dict[str, Any], pilot_selection: str | Path)
         episode = row.get("habitat_episode_id")
         if not isinstance(scene, str) or not scene or not isinstance(episode, str) or not episode:
             raise ValueError("Pilot selection contains an invalid scene or Episode ID")
-        key = (scene, episode)
+        key = _key(row, result=True)
         if key in selected:
             raise ValueError(f"duplicate Episode in Pilot selection: {key}")
         selected.add(key)
-        scene_counts[scene] = scene_counts.get(scene, 0) + 1
-    quotas = data.get("scene_quotas")
-    if quotas is None:
+        scene_counts[key[0]] = scene_counts.get(key[0], 0) + 1
+    raw_quotas = data.get("scene_quotas")
+    if raw_quotas is None:
         # Fixed 20-per-scene Pilot manifests created before adaptive allocation
         # remain verifiable. New manifests record their actual scene quotas.
         quotas = {scene: 20 for scene in scene_counts}
     elif (
-        not isinstance(quotas, dict) or len(quotas) != 11
-        or any(not isinstance(scene, str) or not scene for scene in quotas)
-        or any(type(quota) is not int or quota < 1 for quota in quotas.values())
-        or sum(quotas.values()) != 220
+        not isinstance(raw_quotas, dict) or len(raw_quotas) != 11
+        or any(type(quota) is not int or quota < 1 for quota in raw_quotas.values())
+        or sum(raw_quotas.values()) != 220
     ):
         raise ValueError("Pilot scene_quotas must contain 11 scenes totaling 220 Episodes")
+    else:
+        quotas = _normalized_scene_map(raw_quotas, "Pilot scene_quotas")
     if len(scene_counts) != 11 or scene_counts != quotas:
         raise ValueError("Pilot selection scene counts differ from scene_quotas")
-    full_counts = data.get("full_scene_counts")
-    if data.get("scene_quotas") is not None and (
-        not isinstance(full_counts, dict) or set(full_counts) != set(quotas)
-        or any(type(count) is not int or count < quotas[scene]
-               for scene, count in full_counts.items())
-    ):
-        raise ValueError("Pilot scene_quotas exceed source scene counts")
-    if data.get("scene_quotas") is not None:
-        expected_quotas = {scene: min(20, count) for scene, count in full_counts.items()}
+    if raw_quotas is not None:
+        raw_full_counts = data.get("full_scene_counts")
+        if not isinstance(raw_full_counts, dict):
+            raise ValueError("Pilot scene_quotas exceed source scene counts")
+        full_counts = _normalized_scene_map(raw_full_counts, "Pilot full_scene_counts")
+        if (set(full_counts) != set(quotas)
+                or any(type(count) is not int or count < quotas[scene]
+                       for scene, count in full_counts.items())):
+            raise ValueError("Pilot scene_quotas exceed source scene counts")
+        # Preserve the sampler's raw scene-name tie break; compare the resulting
+        # allocation using real-path identity only after that calculation.
+        expected_quotas = {
+            scene: min(20, count) for scene, count in raw_full_counts.items()
+        }
         missing_seats = 220 - sum(expected_quotas.values())
         recipients = sorted(
-            (scene for scene, count in full_counts.items() if count > 20),
-            key=lambda scene: (-(full_counts[scene] - 20), scene),
+            (scene for scene, count in raw_full_counts.items() if count > 20),
+            key=lambda scene: (-(raw_full_counts[scene] - 20), scene),
         )
         while missing_seats > 0:
             added = 0
             for scene in recipients:
-                if expected_quotas[scene] < full_counts[scene]:
+                if expected_quotas[scene] < raw_full_counts[scene]:
                     expected_quotas[scene] += 1
                     missing_seats -= 1
                     added += 1
@@ -303,7 +353,7 @@ def check_pilot_selection(manifest: dict[str, Any], pilot_selection: str | Path)
                         break
             if not added:
                 raise ValueError("Pilot source cannot supply 220 distinct Episodes")
-        if quotas != expected_quotas:
+        if quotas != _normalized_scene_map(expected_quotas, "Pilot allocation"):
             raise ValueError("Pilot scene_quotas differ from deterministic allocation")
     loaded = {_key(row) for row in canonical["episodes"]}
     if loaded != selected:
@@ -340,7 +390,7 @@ def verify_group(
     manifest = read_manifest(root / "episode_manifest.json")
     if pilot_selection is not None:
         check_pilot_selection(manifest, pilot_selection)
-    if shared is not None and read_manifest(shared) != manifest:
+    if shared is not None and not _same_manifest_episodes(read_manifest(shared), manifest):
         raise ValueError("group episode manifest differs from shared manifest")
     shards = sorted(
         (path for path in root.glob("shard_*") if path.is_dir()),
@@ -349,7 +399,7 @@ def verify_group(
     if not shards:
         raise ValueError("group has no shard directories")
     shard_manifests = [shard / "episode_manifest.json" for shard in shards]
-    if combine_shard_manifests(shard_manifests) != manifest:
+    if not _same_manifest_episodes(combine_shard_manifests(shard_manifests), manifest):
         raise ValueError("shard manifests differ from group manifest")
     shard_records: dict[tuple[str, str], dict[str, Any]] = {}
     for shard, shard_manifest_path in zip(shards, shard_manifests):
@@ -365,7 +415,9 @@ def verify_group(
         key = _key(row, result=True)
         without_shard = dict(row)
         without_shard.pop("shard", None)
-        if without_shard != shard_records[key]:
+        if {field: value for field, value in without_shard.items() if field != "scene_id"} != {
+            field: value for field, value in shard_records[key].items() if field != "scene_id"
+        }:
             raise ValueError(f"merged Episode differs from its shard result: {key}")
         steps = row.get("steps")
         if type(steps) is not int or not 1 <= steps <= 500:

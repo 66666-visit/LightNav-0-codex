@@ -14,6 +14,8 @@ from collections import deque
 from statistics import median
 from typing import Any, Callable, Iterable, TextIO
 
+from lightnav.habitat.experiment_integrity import _key as episode_key
+
 
 def _duration(seconds: float) -> str:
     whole = max(0, math.ceil(seconds))
@@ -104,11 +106,7 @@ class ProgressReporter:
         return f"shard {self.shard_index}/{self.shard_count}"
 
     def _key(self, result: dict[str, Any]) -> tuple[str, str]:
-        scene = result.get("scene_id")
-        episode = result.get("habitat_episode_id")
-        if scene is None or episode is None or not str(scene) or not str(episode):
-            raise ValueError("progress result requires scene_id and habitat_episode_id")
-        return str(scene), str(episode)
+        return episode_key(result, result=True)
 
     def _record_duration(self, value: Any) -> None:
         try:
@@ -229,8 +227,8 @@ class ProgressReporter:
         with self._lock:
             if self._active_key is not None:
                 raise RuntimeError("an Episode is already active in progress")
-            key = (str(scene_id), str(episode_id))
-            if not all(key) or key in self._completed_keys:
+            key = self._key({"scene_id": scene_id, "habitat_episode_id": episode_id})
+            if key in self._completed_keys:
                 raise ValueError(f"Episode is invalid or already completed in progress: {key}")
             if self.completed_count >= self.total:
                 raise ValueError("no remaining Episodes in loaded shard manifest")
@@ -244,7 +242,7 @@ class ProgressReporter:
             self._active_max_steps = max_steps
             self._emit(
                 f"[{self._active_ordinal}/{self.total}] START Episode ID: {key[1]} "
-                f"| scene: {key[0]} | {self.shard_label}",
+                f"| scene: {scene_id} | {self.shard_label}",
                 self._overall_line(self._active_started),
             )
             if self.auto_heartbeat:

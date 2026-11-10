@@ -28,6 +28,7 @@ import numpy as np
 
 from lightnav.eval_config import get_task_params, load_eval_config, resolve_asset_path
 from lightnav.habitat.experiment_integrity import (
+    _key as episode_key,
     archive_unfinished_diagnostics,
     check_coverage,
     read_jsonl,
@@ -745,7 +746,7 @@ def run_habitat_eval(
             manifest = validate_manifest(env.get_episode_manifest())
             write_or_match_manifest(os.path.join(output_dir, "episode_manifest.json"), manifest)
             manifest_index = {
-                (row["scene_id"], row["episode_id"]): index
+                episode_key(row): index
                 for index, row in enumerate(manifest["episodes"])
             }
             print(f"Loaded {manifest['expected_count']} episodes on this shard", flush=True)
@@ -763,7 +764,7 @@ def run_habitat_eval(
         if manifest is not None and existing_results:
             check_coverage(existing_results, manifest, complete=False)
         completed_keys = {
-            (str(row["scene_id"]), str(row["habitat_episode_id"]))
+            episode_key(row, result=True)
             for row in existing_results
         }
         if cfg.resume:
@@ -846,7 +847,9 @@ def run_habitat_eval(
             # a repeat of the pair (not the id alone) marks the env cycling back to the start.
             habitat_ep_id = str(info.get("episode_id", ""))
             habitat_scene_id = str(info.get("scene_id", ""))
-            ep_key = (habitat_scene_id, habitat_ep_id)
+            ep_key = episode_key({
+                "scene_id": habitat_scene_id, "episode_id": habitat_ep_id,
+            })
             if ep_key in seen:
                 print(f"Full split completed: {len(seen)} unique episodes seen.", flush=True)
                 if cfg.strict_full_eval and len(seen) != manifest["expected_count"]:

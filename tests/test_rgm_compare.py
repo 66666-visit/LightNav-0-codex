@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import asdict
@@ -151,6 +152,61 @@ class RGMCompareTests(unittest.TestCase):
             marker.unlink()
             with self.assertRaises(ValueError):
                 compare(root, samples=30, seed=42)
+
+    def test_absolute_pilot_selection_matches_relative_symlink_run_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._fixture(root)
+            real = root / "real"
+            real.mkdir()
+            (root / "data").symlink_to(real, target_is_directory=True)
+            aliases = {}
+            targets = {}
+            for scene in range(11):
+                name = f"scene_{scene}"
+                target = real / f"{name}.glb"
+                target.touch()
+                targets[name] = str(target)
+                aliases[name] = os.path.relpath(root / "data" / target.name, Path.cwd())
+
+            pilot_path = root / "pilot_manifest.json"
+            pilot = json.loads(pilot_path.read_text())
+            pilot["scene_quotas"] = {targets[scene]: count
+                                      for scene, count in pilot["scene_quotas"].items()}
+            for row in pilot["episodes"]:
+                row["scene_id"] = targets[row["scene_id"]]
+            _write_json(pilot_path, pilot)
+            launch_path = root / "ablation_run.json"
+            launch = json.loads(launch_path.read_text())
+            launch["pilot_manifest_sha256"] = hashlib.sha256(pilot_path.read_bytes()).hexdigest()
+            _write_json(launch_path, launch)
+
+            manifest_path = root / "episode_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            for row in manifest["episodes"]:
+                row["scene_id"] = aliases[row["scene_id"]]
+            _write_json(manifest_path, manifest)
+            marker = {
+                "expected_count": 88,
+                "manifest_sha256": hashlib.sha256(
+                    json.dumps(manifest, sort_keys=True).encode(),
+                ).hexdigest(),
+            }
+            for name in ("baseline_off", "rgm_gates", "rgm_full"):
+                group = root / name
+                _write_json(group / "episode_manifest.json", manifest)
+                for filename in ("results.jsonl", "memory_diagnostics.jsonl"):
+                    path = group / filename
+                    rows = [json.loads(line) for line in path.read_text().splitlines()]
+                    for row in rows:
+                        row["scene_id"] = aliases[row["scene_id"]]
+                    _write_jsonl(path, rows)
+                _write_json(group / "pilot_complete.json", marker)
+
+            report = compare(root, samples=10, seed=42)
+            self.assertEqual(report["evaluation_mode"], "rgm_pilot_88_v1")
+            self.assertEqual(report["paired_differences"]["rgm_full_minus_rgm_gates"][
+                "paired_count"], 88)
 
     def test_c_cannot_silently_disable_a_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

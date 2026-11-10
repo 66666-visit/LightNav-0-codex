@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import io
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 from lightnav.habitat.progress import ProgressReporter
 
@@ -142,6 +145,22 @@ class ProgressReporterTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already completed"):
             reporter.start("a", "1")
         self.assertEqual(reporter.completed_count, 1)
+
+    def test_progress_uses_real_scene_identity_across_symlink_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            actual = root / "scenes" / "scene.glb"
+            actual.parent.mkdir()
+            actual.touch()
+            alias = root / "data"
+            alias.symlink_to(actual.parent, target_is_directory=True)
+            relative = os.path.relpath(alias / "scene.glb", Path.cwd())
+            reporter, _, _ = self.make(2, completed=(result(str(actual), "1", 10),))
+            with self.assertRaisesRegex(ValueError, "already completed"):
+                reporter.start(relative, "1")
+            reporter.start(relative, "2")
+            reporter.complete(result(str(actual), "2", 10))
+            self.assertEqual(reporter.completed_count, 2)
 
     def test_multi_shard_is_explicitly_local(self) -> None:
         reporter, clock, stream = self.make(
