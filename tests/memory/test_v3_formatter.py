@@ -26,6 +26,89 @@ def _record(evidence_id: str, description: str, *, kind: str = "observation",
 
 
 class V3FormatterTests(unittest.TestCase):
+    def test_past_experience_humanizes_action_without_changing_evidence(self) -> None:
+        store = V3MemoryStore(scope="scene_persistent")
+        store.begin_episode("scene_a", "past", "Find the archway")
+        store.add(EvidenceRecord(
+            evidence_id="event_0", scene_id="scene_a", episode_id="past", rollout_idx=0,
+            step=0, event_type="object_observation", semantic_label="archway",
+            payload={"description": "Observed archway"}, observation_status="observed",
+        ))
+        raw_action = {"action": "velocity_control", "action_args": {
+            "linear_velocity": 0.2, "angular_velocity": 0.0,
+        }}
+        original = "Issued velocity_control before this view"
+        action = store.add(EvidenceRecord(
+            evidence_id="event_1", scene_id="scene_a", episode_id="past", rollout_idx=0,
+            step=1, event_type="action",
+            payload={"description": original, "action": raw_action},
+        ))
+        store.close_episode(outcome="failure")
+        store.begin_episode("scene_a", "now", "Find the archway")
+        result = V3Retriever(store).retrieve(
+            scene_id="scene_a", instruction="Find the archway", current_step=0,
+            episode_id="now", top_k=5,
+        )
+        experience = next(record for record in result.records
+                          if record.kind == "episodic_experience")
+        self.assertIn("actions=1 (last: Issued velocity control before this view)",
+                      experience.description)
+        self.assertIn(action.key, experience.evidence_ids)
+        stored = store.get_evidence(action.key)
+        self.assertEqual(stored.payload["description"], original)
+        self.assertEqual(stored.payload["action"], raw_action)
+        context = V3PromptFormatter(max_chars=400).format([experience], current_step=0)
+        self.assertIn("Issued velocity control before this view", context.text)
+        self.assertIn("Outcome: failure", context.text)
+        self.assertEqual(context.layer_items[0].metadata["supporting_evidence_ids"],
+                         list(experience.evidence_ids))
+        store.close_episode()
+
+    def test_long_past_action_is_complete_or_omitted_at_budget_boundary(self) -> None:
+        store = V3MemoryStore(scope="scene_persistent")
+        store.begin_episode("scene_a", "past", "Find the archway")
+        store.add(EvidenceRecord(
+            evidence_id="event_0", scene_id="scene_a", episode_id="past", rollout_idx=0,
+            step=0, event_type="object_observation", semantic_label="archway",
+            observation_status="observed",
+        ))
+        original = "Issued velocity_control before this view; " + "visual checkpoint " * 25
+        action = store.add(EvidenceRecord(
+            evidence_id="event_1", scene_id="scene_a", episode_id="past", rollout_idx=0,
+            step=1, event_type="action", payload={"description": original},
+        ))
+        store.close_episode(outcome="unknown")
+        store.begin_episode("scene_a", "now", "Find the archway")
+        result = V3Retriever(store).retrieve(
+            scene_id="scene_a", instruction="Find the archway", current_step=0,
+            episode_id="now", top_k=5,
+        )
+        experience = next(record for record in result.records
+                          if record.kind == "episodic_experience")
+        rendered_action = " ".join(original.replace("velocity_control", "velocity control").split())
+        self.assertIn(rendered_action, experience.description)
+        self.assertNotIn("…", experience.description)
+        self.assertEqual(store.get_evidence(action.key).payload["description"], original)
+
+        wide = V3PromptFormatter(max_chars=1200).format([experience], current_step=0)
+        exact_limit = len(build_context_text(wide, max_chars=1200))
+        exact = V3PromptFormatter(max_chars=exact_limit).format([experience], current_step=0)
+        too_small = V3PromptFormatter(max_chars=exact_limit - 1).format(
+            [experience], current_step=0,
+        )
+        self.assertIn(rendered_action, build_context_text(exact, max_chars=exact_limit))
+        self.assertEqual(too_small.text, "")
+        self.assertEqual(too_small.layer_items, [])
+
+        later = _record("event_later", "Observed nearby archway")
+        default = V3PromptFormatter(max_chars=400).format(
+            [experience, later], current_step=0,
+        )
+        self.assertEqual([item.metadata["memory_id"] for item in default.layer_items],
+                         [later.memory_id])
+        self.assertNotIn("visual checkpoint", default.text)
+        store.close_episode()
+
     def test_store_to_retrieval_to_prompt_to_token_and_local_fallback(self) -> None:
         store = V3MemoryStore(scope="episode_local")
         store.begin_episode("scene_a", "first", "Find red archway")

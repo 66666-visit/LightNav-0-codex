@@ -107,12 +107,25 @@ class MemoryRetrievalGate:
                         "selected_evidence_ids": [], "accepted": False, "reason": reason,
                     })
                     continue
-                # Rank before deduplication so a weaker layer item cannot
-                # consume evidence needed by a stronger independent record.
+                # Rank *representations* of the same evidence before deduplication.
+                # A validated current place/object relation is more informative
+                # than its bare detection; a direct current RGB detection is
+                # more faithful than an aggregate category summary. The spatial
+                # evidence check above must pass before either can win.
+                representation = (
+                    2 if item.kind == "place_semantics"
+                    and item.metadata.get("current", False)
+                    and item.step_id == query.current_step
+                    else 1 if item.kind in {
+                        "current_observation", "object_observation", "landmark",
+                    } and item.step_id == query.current_step else 0
+                )
                 priority = (
                     -int(related or item.kind in _SPATIAL_KINDS),
+                    -representation,
                     -min(len(refs), 3), -int(historical),
-                    -float(item.confidence), -int(item.metadata.get("current", False)),
+                    -float(item.confidence), -int(item.kind == "current_observation"),
+                    -int(item.metadata.get("current", False)),
                     -item.step_id, min(refs), layer,
                 )
                 eligible.append((priority, item, approved_refs))

@@ -331,7 +331,7 @@ def test_record_budget_keeps_whole_memory_lines_and_instruction(monkeypatch):
 
 def test_v3_video_overflow_never_silently_truncates_task_or_memory(monkeypatch):
     engine, _, vllm = _engine(monkeypatch, max_seq_len=120, video_expansion=300)
-    policy, _ = _policy(
+    policy, manager = _policy(
         engine,
         detections={0: SceneExtraction(objects=["uniquememorymarker"], confidence=0.88)},
     )
@@ -343,6 +343,10 @@ def test_v3_video_overflow_never_silently_truncates_task_or_memory(monkeypatch):
         "tokens_before_truncation"
     ] > 120
     assert engine.bundle.data_processor.last_process_diagnostic["length_rejected"] is True
+    assert engine.bundle.data_processor.last_process_diagnostic[
+        "tokens_after_truncation"
+    ] is None
+    assert manager.last_v3_diagnostic["formatter_nonempty"] is True
     policy.close_episode()
 
 

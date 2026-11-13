@@ -78,6 +78,17 @@ def _short(value: str, limit: int = 90) -> str:
     return clean if len(clean) <= limit else clean[: limit - 1].rstrip() + "…"
 
 
+def _action_description(record: EvidenceRecord | None) -> str:
+    """Render an action as prose without changing its stored evidence payload."""
+    if record is None:
+        return "none"
+    value = record.payload.get("description")
+    description = value if isinstance(value, str) and value.strip() else record.event_type
+    # MemoryWriter's command type is an API identifier; the navigation prompt
+    # should read as prose. The original description and action_args stay in Store.
+    return re.sub(r"\bvelocity_control\b", "velocity control", " ".join(description.split()))
+
+
 def _record_description(record: EvidenceRecord) -> str:
     label = record.semantic_label or record.event_type
     detail = record.payload.get("description") if isinstance(record.payload, dict) else None
@@ -127,9 +138,7 @@ def _episode_description(episode: EpisodeMemory, store: V3MemoryStore,
                          *, active_segment: bool = False) -> str:
     actions = [store.get_evidence(ref) for ref in episode.actions]
     last_action = next((record for record in reversed(actions) if record is not None), None)
-    action_text = last_action.payload.get("description") if last_action is not None else None
-    if not isinstance(action_text, str) or not action_text.strip():
-        action_text = last_action.event_type if last_action is not None else "none"
+    action_text = _action_description(last_action)
     labels = [store.get_evidence(ref) for ref in episode.landmarks]
     landmark_text = ", ".join(dict.fromkeys(
         record.semantic_label for record in labels
@@ -145,7 +154,7 @@ def _episode_description(episode: EpisodeMemory, store: V3MemoryStore,
     return (
         f"Past episode {_short(episode.episode_id, 20)}: "
         f"instruction={_short(episode.instruction, 30)}; "
-        f"actions={len(episode.actions)} (last: {_short(action_text, 42)}); "
+        f"actions={len(episode.actions)} (last: {action_text}); "
         f"landmarks={_short(landmark_text, 24)}; outcome={episode.outcome}"
     )
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import re
+from copy import deepcopy
 from typing import Callable, Protocol
 
 import numpy as np
@@ -298,7 +299,7 @@ class MemoryWriter:
             event_id=f"event_{self._event_seq}", step_id=step_id, kind=kind,
             description=description, confidence=confidence, source=source,
             place_id=self.working.state.place_id if place_id is _CURRENT_PLACE else place_id,
-            importance=importance, metadata=metadata or {},
+            importance=importance, metadata=deepcopy(metadata) if metadata is not None else {},
             episode_id=self.working.state.episode_id,
         )
         self._event_seq += 1

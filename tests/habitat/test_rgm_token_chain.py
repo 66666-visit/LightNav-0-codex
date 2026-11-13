@@ -70,6 +70,7 @@ class _QwenProcessorSpy:
         self.video_expansion = video_expansion
         self.last_rendered_text = ""
         self.last_tokenizer_text = ""
+        self.last_video_shapes = []
 
     def apply_chat_template(self, messages, *, tokenize: bool = False) -> str:
         assert tokenize is False
@@ -88,6 +89,7 @@ class _QwenProcessorSpy:
     def __call__(self, *, text, videos, **kwargs):
         assert videos
         self.last_tokenizer_text = text
+        self.last_video_shapes = [tuple(video.shape) for video in videos]
         return {"input_ids": torch.tensor([self.tokenizer.encode(text)], dtype=torch.long)}
 
 
@@ -186,6 +188,9 @@ def test_accepted_memory_reaches_final_vllm_tokens_and_tracks_evidence(monkeypat
     assert "<navigation_task>Find uniquememorymarker</navigation_task>" in decoded
     assert decoded.endswith("<|im_start|>assistant\n")
     assert "placeholder" not in decoded  # Engine cuts at the first assistant answer boundary.
+    assert processor.last_video_shapes == [(1, 3, 4, 4)]
+    assert policy.get_info()["raw_text"] == "<traj_1>"
+    assert policy._last_executed_action["action"] == "velocity_control"
     assert diagnostic["episode_id"] == "episode_probe"
     assert diagnostic["step_id"] == 0
     assert len(diagnostic["prompt_sha256"]) == 64
@@ -217,11 +222,11 @@ def test_accepted_memory_reaches_final_vllm_tokens_and_tracks_evidence(monkeypat
 
 
 def test_empty_and_rejected_memory_keep_exact_original_tokens(monkeypatch):
-    base_engine, _, base_vllm = _make_engine(monkeypatch)
+    base_engine, base_processor, base_vllm = _make_engine(monkeypatch)
     baseline, _ = _make_policy(base_engine, memory_enabled=False)
     _act(baseline, instruction="Find TV")
 
-    empty_engine, _, empty_vllm = _make_engine(monkeypatch)
+    empty_engine, empty_processor, empty_vllm = _make_engine(monkeypatch)
     empty_policy, _ = _make_policy(empty_engine)
     _act(empty_policy, instruction="Find TV")
 
@@ -232,6 +237,8 @@ def test_empty_and_rejected_memory_keep_exact_original_tokens(monkeypatch):
     )
     _act(rejected_policy, instruction="Find TV")
     assert _prompt_ids(base_vllm) == _prompt_ids(empty_vllm) == _prompt_ids(rejected_vllm)
+    assert (base_processor.last_video_shapes == empty_processor.last_video_shapes
+            == processor.last_video_shapes)
     rejected_id = next(
         event.event_id for event in rejected_manager.episodic.events
         if event.kind == "object_observation"
@@ -249,47 +256,86 @@ def test_empty_and_rejected_memory_keep_exact_original_tokens(monkeypatch):
     rejected_policy.close_episode()
 
 
-def test_video_overflow_does_not_silently_drop_instruction_or_memory(monkeypatch):
+def test_legacy_video_overflow_warns_and_keeps_compatible_truncation(monkeypatch, caplog):
     engine, _, vllm = _make_engine(monkeypatch, max_seq_len=120, video_expansion=300)
     policy, _ = _make_policy(
         engine, detections={0: SceneExtraction(objects=["television"], confidence=0.88)},
     )
-    with pytest.raises(ValueError, match="length|Length|token|Token"):
-        _act(policy)
-    assert vllm.prompts == []
+    _act(policy)
+    assert len(vllm.prompts) == 1
     processor_trace = engine.bundle.data_processor.last_process_diagnostic
     assert processor_trace["tokens_before_truncation"] > 120
-    assert processor_trace["tokens_after_truncation"] is None
+    assert processor_trace["tokens_after_truncation"] == 120
+    assert processor_trace["truncated"] is True
+    assert processor_trace["length_rejected"] is False
+    assert "processor truncated prompt" in caplog.text
+    assert policy.last_memory_diagnostic["injected_memory_text"]
+    assert engine.last_input_diagnostic["processor_truncated"] is True
+    assert engine.last_input_diagnostic["final_token_count"] == 120
+    assert engine.last_input_diagnostic["vllm_prompt_matches_final_tokens"] is True
+    policy.close_episode()
+
+
+def _temporal_observations():
+    return {
+        0: SceneExtraction(objects=["couch"], confidence=0.4),
+        5: SceneExtraction(objects=["couch"], confidence=0.4),
+    }
+
+
+def test_c_without_temporal_support_keeps_original_final_input(monkeypatch):
+    baseline_engine, _, baseline_vllm = _make_engine(monkeypatch)
+    baseline, _ = _make_policy(baseline_engine, memory_enabled=False)
+    _act(baseline, instruction="Find sofa", steps=6)
+    engine, _, vllm = _make_engine(monkeypatch)
+    policy, _ = _make_policy(
+        engine, config=RGMConfig(enabled=True, yolo_temporal_enabled=False),
+        detections=_temporal_observations(),
+    )
+    _act(policy, instruction="Find sofa", steps=6)
+    assert engine.last_input_diagnostic["step_id"] == 5
+    assert engine.last_input_diagnostic["memory_text_present_in_final_tokens"] is False
+    assert policy.last_memory_diagnostic["injected_records"] == 0
+    assert _prompt_ids(vllm) == _prompt_ids(baseline_vllm)
+    baseline.close_episode()
+    policy.close_episode()
+
+
+def test_d_temporal_support_reaches_final_model_input(monkeypatch):
+    engine, processor, vllm = _make_engine(monkeypatch)
+    policy, _ = _make_policy(
+        engine, config=RGMConfig(enabled=True, yolo_temporal_enabled=True),
+        detections=_temporal_observations(),
+    )
+    _act(policy, instruction="Find sofa", steps=6)
+    assert engine.last_input_diagnostic["step_id"] == 5
+    assert engine.last_input_diagnostic["memory_text_present_in_final_tokens"] is True
+    assert engine.last_input_diagnostic["memory_text_present_in_vllm_prompt"] is True
+    assert engine.last_input_diagnostic["vllm_prompt_matches_final_tokens"] is True
+    assert "instruction landmark couch" in processor.tokenizer.decode(_prompt_ids(vllm))
+    assert any(row["reason"] == "temporally_supported_category" and row["accepted"]
+               for row in policy.last_memory_diagnostic["write_gate_decisions"])
     policy.close_episode()
 
 
 def test_d_temporal_evidence_changes_final_model_input(monkeypatch):
-    observations = {
-        0: SceneExtraction(objects=["couch"], confidence=0.4),
-        5: SceneExtraction(objects=["couch"], confidence=0.4),
-    }
     c_engine, _, c_vllm = _make_engine(monkeypatch)
     c_policy, _ = _make_policy(
         c_engine, config=RGMConfig(enabled=True, yolo_temporal_enabled=False),
-        detections=observations,
+        detections=_temporal_observations(),
     )
     _act(c_policy, instruction="Find sofa", steps=6)
 
-    d_engine, processor, d_vllm = _make_engine(monkeypatch)
+    d_engine, _, d_vllm = _make_engine(monkeypatch)
     d_policy, _ = _make_policy(
         d_engine, config=RGMConfig(enabled=True, yolo_temporal_enabled=True),
-        detections=observations,
+        detections=_temporal_observations(),
     )
     _act(d_policy, instruction="Find sofa", steps=6)
 
-    assert c_engine.last_input_diagnostic["memory_text_present_in_final_tokens"] is False
-    assert d_engine.last_input_diagnostic["memory_text_present_in_final_tokens"] is True
-    assert c_engine.last_input_diagnostic["step_id"] == 5
-    assert d_engine.last_input_diagnostic["step_id"] == 5
     assert _prompt_ids(c_vllm) != _prompt_ids(d_vllm)
     assert (c_engine.last_input_diagnostic["final_token_ids_sha256"]
             != d_engine.last_input_diagnostic["final_token_ids_sha256"])
-    assert "instruction landmark couch" in processor.tokenizer.decode(_prompt_ids(d_vllm))
     c_policy.close_episode()
     d_policy.close_episode()
 
@@ -345,7 +391,7 @@ def test_d_verified_visual_place_changes_final_model_input(monkeypatch):
     d_policy.close_episode()
 
 
-def test_d_step0_place_object_relation_reaches_final_tokens(monkeypatch):
+def test_c_step0_object_reaches_final_tokens_without_place_claim(monkeypatch):
     detections = {0: SceneExtraction(objects=["couch"], confidence=0.88)}
     c_engine, c_processor, c_vllm = _make_engine(monkeypatch)
     c_policy, _ = _make_policy(
@@ -353,7 +399,15 @@ def test_d_step0_place_object_relation_reaches_final_tokens(monkeypatch):
         place_extractor=_PlaceExtractorSpy(),
     )
     _act(c_policy, instruction="Find the sofa")
+    c_text = c_processor.tokenizer.decode(_prompt_ids(c_vllm))
+    assert "instruction landmark couch" in c_text
+    assert "visual place hypothesis" not in c_text
+    assert c_engine.last_input_diagnostic["memory_text_present_in_vllm_prompt"] is True
+    c_policy.close_episode()
 
+
+def test_d_step0_place_object_relation_reaches_final_tokens(monkeypatch):
+    detections = {0: SceneExtraction(objects=["couch"], confidence=0.88)}
     d_engine, d_processor, d_vllm = _make_engine(monkeypatch)
     d_policy, _ = _make_policy(
         d_engine, config=RGMConfig(
@@ -362,13 +416,30 @@ def test_d_step0_place_object_relation_reaches_final_tokens(monkeypatch):
         ), detections=detections, place_extractor=_PlaceExtractorSpy(),
     )
     _act(d_policy, instruction="Find the sofa")
-
-    c_text = c_processor.tokenizer.decode(_prompt_ids(c_vllm))
     d_text = d_processor.tokenizer.decode(_prompt_ids(d_vllm))
-    assert "instruction landmark couch" in c_text
-    assert "visual place hypothesis" not in c_text
     assert "instruction landmark couch while visual place hypothesis" in d_text
     assert d_engine.last_input_diagnostic["memory_text_present_in_vllm_prompt"] is True
+    assert d_engine.last_input_diagnostic["vllm_prompt_matches_final_tokens"] is True
+    d_policy.close_episode()
+
+
+def test_c_d_step0_place_object_inputs_differ(monkeypatch):
+    detections = {0: SceneExtraction(objects=["couch"], confidence=0.88)}
+    c_engine, _, c_vllm = _make_engine(monkeypatch)
+    c_policy, _ = _make_policy(
+        c_engine, config=RGMConfig(enabled=True), detections=detections,
+        place_extractor=_PlaceExtractorSpy(),
+    )
+    _act(c_policy, instruction="Find the sofa")
+    d_engine, _, d_vllm = _make_engine(monkeypatch)
+    d_policy, _ = _make_policy(
+        d_engine, config=RGMConfig(
+            enabled=True, yolo_temporal_enabled=True,
+            place_two_stage_enabled=True, topology_motion_validation_enabled=True,
+        ), detections=detections, place_extractor=_PlaceExtractorSpy(),
+    )
+    _act(d_policy, instruction="Find the sofa")
+    assert _prompt_ids(c_vllm) != _prompt_ids(d_vllm)
     assert c_engine.last_input_diagnostic["vllm_prompt_token_ids_sha256"] != (
         d_engine.last_input_diagnostic["vllm_prompt_token_ids_sha256"]
     )
