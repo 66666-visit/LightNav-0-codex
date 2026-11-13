@@ -1,4 +1,4 @@
-"""Inference must reject a token limit that would silently cut the task suffix."""
+"""V3 rejects overflow; baseline and Legacy retain reported truncation."""
 
 from __future__ import annotations
 
