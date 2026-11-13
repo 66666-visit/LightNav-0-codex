@@ -14,6 +14,11 @@ from lightnav.memory.schemas import MemoryContext
 
 _TASK_END = "</navigation_task>"
 _DEFAULT_MAX_CHARS = 600
+_CONTEXT_HEADERS = {
+    "Episode observations (may be uncertain):",
+    "[Navigation memory; uncertain RGB observations]",
+    "[Navigation memory; evidence-linked observations]",
+}
 
 
 def build_context_text(context: MemoryContext, *, max_chars: int = _DEFAULT_MAX_CHARS) -> str:
@@ -41,7 +46,7 @@ def build_context_text(context: MemoryContext, *, max_chars: int = _DEFAULT_MAX_
             used += length
         # A retrieved context starts with a heading. It is not useful to
         # inject that heading without any complete observation below it.
-        if len(included) == 1 and included[0] == "Episode observations (may be uncertain):":
+        if len(included) == 1 and included[0] in _CONTEXT_HEADERS:
             return ""
         return "\n".join(included)
     if max_chars < 2:

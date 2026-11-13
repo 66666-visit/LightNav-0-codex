@@ -44,6 +44,7 @@ from lightnav.habitat.results import (
     print_vlnce_summary,
 )
 from lightnav.memory.rgm_config import RGMConfig
+from lightnav.memory.v3_config import RGMV3Config, RGM_V3_PROTOCOL_VERSION
 from lightnav.serving.protocol import pointing_payload
 from lightnav.serving.token_budget import decode_token_budget, probe_grounding_tokens
 from lightnav.tracking import load_centroids
@@ -57,7 +58,7 @@ _CENTROIDS_FILENAME = "centroids_whole_chunk_K{K}_h{H}.npy"
 
 @dataclass
 class MemoryConfig:
-    """Habitat policy's episode-local explicit memory settings."""
+    """Habitat policy's explicit memory settings and isolated RGM backends."""
 
     enabled: bool = False
     top_k: int = 5
@@ -75,6 +76,7 @@ class MemoryConfig:
     place_similarity_threshold: float = 0.85
     place_device: str = "cpu"
     rgm: RGMConfig = field(default_factory=RGMConfig)
+    rgm_v3: RGMV3Config = field(default_factory=RGMV3Config)
 
     def __post_init__(self) -> None:
         if self.top_k < 1 or self.max_context_chars < 1:
@@ -111,6 +113,14 @@ class MemoryConfig:
             raise ValueError("memory.place_device must be nonempty")
         if self.rgm.enabled and not self.enabled:
             raise ValueError("RGM requires memory_enabled")
+        if self.rgm_v3.enabled and not self.enabled:
+            raise ValueError("RGM V3 requires memory_enabled")
+        if self.rgm_v3.enabled and self.rgm.enabled:
+            raise ValueError("legacy RGM and RGM V3 cannot run together")
+        if self.rgm_v3.enabled and self.strategy != "hierarchical":
+            raise ValueError("RGM V3 requires hierarchical memory")
+        if self.rgm_v3.enabled and set(self.layers) != {"short", "mid", "long"}:
+            raise ValueError("RGM V3 requires short, mid and long memory layers")
 
 
 @dataclass
@@ -168,6 +178,8 @@ class HabitatEvalConfig:
             or not 0 <= self.progress_shard_index < self.progress_shard_count
         ):
             raise ValueError("progress shard index/count are invalid")
+        if self.memory.rgm_v3.enabled and self.output_dir == "output/habitat_eval":
+            raise ValueError("RGM V3 requires an explicit independent output_dir")
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +406,7 @@ def build_velocity_policy(
             place_every_n_steps=cfg.memory.place_extract_every_n_steps,
             place_similarity_threshold=cfg.memory.place_similarity_threshold,
             rgm_config=cfg.memory.rgm,
+            v3_config=cfg.memory.rgm_v3,
         )
     return TrajVocabVLNCEPolicy(
         engine,
@@ -685,6 +698,34 @@ def _format_action(action: Any) -> str:
     return str(action)
 
 
+def _prepare_v3_output_dir(output_dir: str, config: RGMV3Config, *, resume: bool) -> None:
+    """Keep V3 results and scope metadata separate from immutable Pilot outputs."""
+    path = Path(output_dir)
+    if {"rgm_pilot_88_v1", "rgm_pilot_88_v2"} & set(path.parts):
+        raise ValueError("RGM V3 cannot write inside a legacy RGM Pilot result directory")
+    marker = path / "rgm_v3_protocol.json"
+    expected = {
+        "protocol_version": RGM_V3_PROTOCOL_VERSION,
+        "scope": config.scope,
+        "prompt_max_records": config.prompt_max_records,
+        "prompt_max_chars": config.prompt_max_chars,
+    }
+    if marker.is_file():
+        if not resume:
+            raise FileExistsError("RGM V3 result directory already has a protocol marker")
+        if json.loads(marker.read_text(encoding="utf-8")) != expected:
+            raise ValueError("RGM V3 resume configuration differs from its protocol marker")
+        return
+    if resume:
+        raise FileNotFoundError("RGM V3 resume requires rgm_v3_protocol.json")
+    if path.exists() and any(path.iterdir()):
+        raise FileExistsError("RGM V3 requires a new empty output directory")
+    path.mkdir(parents=True, exist_ok=True)
+    with marker.open("x", encoding="utf-8") as stream:
+        json.dump(expected, stream, indent=2)
+        stream.write("\n")
+
+
 def run_habitat_eval(
     cfg: HabitatEvalConfig,
     *,
@@ -723,6 +764,8 @@ def run_habitat_eval(
             torch.manual_seed(cfg.seed)
 
     output_dir = cfg.output_dir or "output/habitat_eval"
+    if cfg.memory.rgm_v3.enabled:
+        _prepare_v3_output_dir(output_dir, cfg.memory.rgm_v3, resume=cfg.resume)
     os.makedirs(output_dir, exist_ok=True)
     results_jsonl = os.path.join(output_dir, "results.jsonl")
     diagnostics_jsonl = os.path.join(output_dir, "memory_diagnostics.jsonl")
@@ -885,11 +928,18 @@ def run_habitat_eval(
             instruction = extract_instruction(obs)
             if policy is None:
                 policy = policy_factory(cfg, engine, bundle, info)
-            if cfg.memory.rgm.enabled and isinstance(policy, TrajVocabVLNCEPolicy):
+            if (cfg.memory.rgm.enabled or cfg.memory.rgm_v3.enabled) and isinstance(
+                policy, TrajVocabVLNCEPolicy,
+            ):
+                # V3 evidence keys already contain the Scene. Avoid nesting it
+                # again in episode_id, which wastes the fixed prompt budget.
+                memory_episode_id = (
+                    str(habitat_ep_id) if cfg.memory.rgm_v3.enabled
+                    else json.dumps([habitat_scene_id, habitat_ep_id], separators=(",", ":"))
+                )
                 policy.reset(
-                    obs, memory_episode_id=json.dumps(
-                        [habitat_scene_id, habitat_ep_id], separators=(",", ":"),
-                    ),
+                    obs, memory_episode_id=memory_episode_id,
+                    memory_scene_id=str(habitat_scene_id), memory_rollout_idx=0,
                 )
             else:
                 policy.reset(obs)

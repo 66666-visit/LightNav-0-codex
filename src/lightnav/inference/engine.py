@@ -5,12 +5,14 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
+from hashlib import sha256
 from typing import Any
 
 import torch
 
 from lightnav.inference.model import ModelBundle
 from lightnav.inference.samples import build_tracking_sample, build_vln_traj_sample
+from lightnav.inference.token_diagnostics import memory_token_checks, token_ids_sha256
 from lightnav.inference.vit_cache import VitTubeletCache
 
 
@@ -22,6 +24,8 @@ class VitResult:
     video_embeds: "torch.Tensor | None"  # CPU tensor, post-pool
     video_grid_thw: "torch.Tensor | None"  # CPU tensor
     timings: dict = field(default_factory=dict)
+    trace: dict[str, Any] | None = None
+    process_diagnostic: dict[str, Any] | None = None
 
 
 def _get_sampling_params() -> dict[str, float | int | bool]:
@@ -106,6 +110,94 @@ class VLNInferenceEngine:
         self._traj_allowed_token_ids: list[int] | None = None
         self._last_generate_timings: dict[str, float] = {}
         self.last_prompt_chars: int | None = None
+        self.last_input_diagnostic: dict[str, Any] | None = None
+        self._last_vllm_prompt_diagnostics: list[dict[str, Any]] = []
+
+    def _record_input_diagnostic(
+        self, sample: dict[str, Any], prompt_ids: list[int],
+        process_diagnostic: dict[str, Any] | None,
+        vllm_diagnostic: dict[str, Any] | None = None,
+    ) -> None:
+        trace = sample.get("_rgm_trace")
+        if not isinstance(trace, dict):
+            return
+        human_prompt = next((
+            turn.get("value") for turn in sample.get("conversations", [])
+            if isinstance(turn, dict) and turn.get("from") == "human"
+            and isinstance(turn.get("value"), str)
+        ), "")
+        checks = memory_token_checks(self.bundle.tokenizer, prompt_ids, trace)
+        process = process_diagnostic or {}
+        final_hash = token_ids_sha256(prompt_ids)
+        diagnostic = {
+            "episode_id": trace.get("episode_id"),
+            "scene_id": trace.get("scene_id"),
+            "rollout_idx": trace.get("rollout_idx"),
+            "memory_backend": trace.get("memory_backend"),
+            "step_id": trace.get("step_id"),
+            "prompt_sha256": sha256(human_prompt.encode("utf-8")).hexdigest(),
+            "processor_tokens_before_truncation": process.get("tokens_before_truncation"),
+            "processor_tokens_after_truncation": process.get("tokens_after_truncation"),
+            "processor_truncated": process.get("truncated"),
+            "processor_length_rejected": process.get("length_rejected"),
+            "processor_max_seq_len": process.get("max_seq_len"),
+            "final_token_count": len(prompt_ids),
+            "final_token_ids_sha256": final_hash,
+            "original_instruction_present_in_final_tokens": checks["instruction_text_present"],
+            "assistant_generation_boundary_present_in_final_tokens": (
+                checks["assistant_generation_boundary_present"]
+            ),
+            "memory_text_present_in_final_tokens": checks["memory_text_present"],
+            "accepted_records": checks["accepted_records"],
+            "model_visible_evidence_ids": checks["model_visible_evidence_ids"],
+            "literal_model_visible_evidence_ids": checks[
+                "literal_model_visible_evidence_ids"
+            ],
+        }
+        if vllm_diagnostic is not None and "token_ids_sha256" in vllm_diagnostic:
+            vllm_hash = vllm_diagnostic["token_ids_sha256"]
+            matches = (
+                vllm_hash == final_hash
+                and vllm_diagnostic["token_count"] == len(prompt_ids)
+            )
+            diagnostic.update({
+                "vllm_prompt_token_count": vllm_diagnostic["token_count"],
+                "vllm_prompt_token_ids_sha256": vllm_hash,
+                "vllm_prompt_matches_final_tokens": matches,
+                "memory_text_present_in_vllm_prompt": (
+                    vllm_diagnostic.get("memory_text_present") if matches else None
+                ),
+                "original_instruction_present_in_vllm_prompt": (
+                    vllm_diagnostic.get("instruction_text_present") if matches else None
+                ),
+                "assistant_generation_boundary_present_in_vllm_prompt": (
+                    vllm_diagnostic.get("assistant_generation_boundary_present")
+                    if matches else None
+                ),
+            })
+            vllm_records = vllm_diagnostic.get("accepted_records", [])
+            for record, sent in zip(diagnostic["accepted_records"], vllm_records):
+                record["present_in_vllm_prompt"] = (
+                    sent.get("present_in_final_tokens") if matches else None
+                )
+                record["literal_evidence_ids_in_vllm_prompt"] = (
+                    sent.get("literal_evidence_ids_in_final_tokens") if matches else None
+                )
+            diagnostic["model_visible_evidence_ids"] = (
+                vllm_diagnostic.get("model_visible_evidence_ids", []) if matches else []
+            )
+            diagnostic["literal_model_visible_evidence_ids"] = (
+                vllm_diagnostic.get("literal_model_visible_evidence_ids", []) if matches else []
+            )
+        elif self.backend == "vllm_local":
+            diagnostic["vllm_prompt_matches_final_tokens"] = None
+            diagnostic["memory_text_present_in_vllm_prompt"] = None
+            diagnostic["model_visible_evidence_ids"] = []
+            diagnostic["literal_model_visible_evidence_ids"] = []
+            for record in diagnostic["accepted_records"]:
+                record["present_in_vllm_prompt"] = None
+                record["literal_evidence_ids_in_vllm_prompt"] = None
+        self.last_input_diagnostic = diagnostic
 
     def _get_traj_allowed_token_ids(self) -> list[int]:
         """IDs of {<traj_*>, <tpos_*>, <act_l*>, <apos_*>, <opos_*>, <pos_*>, eos} present
@@ -248,6 +340,8 @@ class VLNInferenceEngine:
         Returns:
             (generated_text, latency_ms)
         """
+        self.last_input_diagnostic = None
+        self._last_vllm_prompt_diagnostics = []
         self.last_prompt_chars = next(
             (
                 len(message["value"])
@@ -265,7 +359,7 @@ class VLNInferenceEngine:
                 add_generation_prompt=True,
                 validate_video_shapes=False,
             )
-            return self._generate_hf(inputs, max_tok)
+            return self._generate_hf(inputs, max_tok, sample=sample)
 
         if self.backend == "vllm_local":
             # ViT through the episode-local tubelet cache (the same path the batched
@@ -276,6 +370,11 @@ class VLNInferenceEngine:
                 res = self.vit_forward(sample)
             t0 = time.monotonic()
             text = self.llm_generate_batch([res], max_tok)[0]
+            self._record_input_diagnostic(
+                sample, res.prompt_ids, res.process_diagnostic,
+                self._last_vllm_prompt_diagnostics[0]
+                if self._last_vllm_prompt_diagnostics else None,
+            )
             llm_ms = (time.monotonic() - t0) * 1000
             data_prep_ms = res.timings.get(
                 "data_prep_ms",
@@ -372,10 +471,16 @@ class VLNInferenceEngine:
         self,
         inputs: dict[str, Any],
         max_new_tokens: int,
+        sample: dict[str, Any] | None = None,
     ) -> tuple[str, float]:
         prep_t0 = time.monotonic()
         gen = self._prepare_inputs(inputs)
         prepare_inputs_ms = (time.monotonic() - prep_t0) * 1000
+        if sample is not None:
+            self._record_input_diagnostic(
+                sample, gen["input_ids"][0].tolist(),
+                getattr(self.bundle.data_processor, "last_process_diagnostic", None),
+            )
 
         # Drop the data-processor's precomputed mrope position_ids: it is built by
         # the data processor's position_ids closure, whose layout differs from
@@ -514,6 +619,9 @@ class VLNInferenceEngine:
             video_embeds=None if video_embeds_packed is None else video_embeds_packed.cpu(),
             video_grid_thw=None if vgt is None else vgt.cpu(),
             timings={"data_prep_ms": data_prep_ms, "vit_ms": vit_ms},
+            process_diagnostic=getattr(
+                self.bundle.data_processor, "last_process_diagnostic", None,
+            ),
         )
 
     def vit_forward(self, sample: dict[str, Any]) -> "VitResult":
@@ -529,6 +637,7 @@ class VLNInferenceEngine:
         process_sample_ms = (time.monotonic() - proc_t0) * 1000
         res = self._vit_forward_from_inputs(inputs)
         res.timings["data_prep_ms"] = res.timings.get("data_prep_ms", 0.0) + process_sample_ms
+        res.trace = sample.get("_rgm_trace")
         return res
 
     def vit_forward_batch(
@@ -643,6 +752,10 @@ class VLNInferenceEngine:
                 "vit_cache_misses": float(cache_stats.get("miss", 0)),
                 "vit_cache_size": float(len(vit_cache.cached_keys())),
             },
+            trace=sample.get("_rgm_trace"),
+            process_diagnostic=getattr(
+                self.bundle.data_processor, "last_process_diagnostic", None,
+            ),
         )
 
     def llm_generate_batch(self, items: list["VitResult"], max_new_tokens: int) -> list[str]:
@@ -652,6 +765,28 @@ class VLNInferenceEngine:
         prompt_dicts = [
             _build_prompt_dict(it.prompt_ids, it.video_embeds, it.video_grid_thw) for it in items
         ]
+        self._last_vllm_prompt_diagnostics = []
+        for item, prompt in zip(items, prompt_dicts):
+            trace = item.trace
+            if not isinstance(trace, dict):
+                self._last_vllm_prompt_diagnostics.append({})
+                continue
+            ids = prompt["prompt_token_ids"]
+            checks = memory_token_checks(self.bundle.tokenizer, ids, trace)
+            self._last_vllm_prompt_diagnostics.append({
+                "token_count": len(ids),
+                "token_ids_sha256": token_ids_sha256(ids),
+                "memory_text_present": checks["memory_text_present"],
+                "instruction_text_present": checks["instruction_text_present"],
+                "assistant_generation_boundary_present": (
+                    checks["assistant_generation_boundary_present"]
+                ),
+                "accepted_records": checks["accepted_records"],
+                "model_visible_evidence_ids": checks["model_visible_evidence_ids"],
+                "literal_model_visible_evidence_ids": checks[
+                    "literal_model_visible_evidence_ids"
+                ],
+            })
         sp = _get_sampling_params()
         sp_kwargs: dict[str, Any] = {
             "max_tokens": max_new_tokens,

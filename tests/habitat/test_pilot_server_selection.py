@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import types
@@ -183,6 +184,111 @@ class PilotServerSelectionTest(unittest.TestCase):
         self.assertEqual(_keys(first.episodes) | _keys(second.episodes),
                          _keys(self.all_episodes))
         self.assertFalse(_keys(first.episodes) & _keys(second.episodes))
+
+
+class PilotScenePathNormalizationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        data = self.root / "actual_data"
+        data.mkdir()
+        (self.root / "data").symlink_to(data, target_is_directory=True)
+        previous_cwd = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous_cwd)
+
+        self.scene_paths = []
+        for scene in range(11):
+            path = data / "scene_datasets" / "mp3d" / f"scene_{scene:02d}" / "scene.glb"
+            path.parent.mkdir(parents=True)
+            path.touch()
+            self.scene_paths.append(path)
+        self.episodes = [
+            types.SimpleNamespace(
+                scene_id=f"data/scene_datasets/mp3d/scene_{index % 11:02d}/scene.glb",
+                episode_id=f"episode_{index:04d}",
+            )
+            for index in range(1839)
+        ]
+        self.rows = []
+        for scene, path in enumerate(self.scene_paths):
+            episodes = [ep for ep in self.episodes
+                        if ep.scene_id.endswith(f"scene_{scene:02d}/scene.glb")][:8]
+            for index, episode in enumerate(episodes):
+                self.rows.append({
+                    "scene_id": str(path), "habitat_episode_id": episode.episode_id,
+                    "distance_group": "short" if index < 3 else "medium" if index < 6 else "long",
+                })
+        self.manifest = self.root / "pilot_manifest.json"
+        self._write_manifest(self.rows)
+
+    def _write_manifest(self, rows: list[dict[str, str]]) -> None:
+        self.manifest.write_text(json.dumps({
+            "protocol_version": "rgm_pilot_88_v1", "dataset_split": "val_unseen",
+            "sample_seed": 42, "expected_count": 88, "per_scene": 8,
+            "episodes": rows,
+        }), encoding="utf-8")
+
+    def _select(self, episodes: list[types.SimpleNamespace] | None = None) -> FakeHabitatEnv:
+        env = FakeHabitatEnv(self.episodes if episodes is None else episodes)
+        wrapper = VLNCEEnv.__new__(VLNCEEnv)
+        wrapper.pilot_manifest_path = str(self.manifest)
+        wrapper._apply_pilot_selection(env)
+        return env
+
+    def test_absolute_manifest_matches_relative_symlink_scene_paths(self) -> None:
+        env = self._select()
+        self.assertEqual(len(env.episodes), 88)
+        self.assertEqual(env.setter_calls, 1)
+        self.assertEqual({ep.episode_id for ep in env.episodes},
+                         {row["habitat_episode_id"] for row in self.rows})
+        self.assertTrue(all(ep.scene_id.startswith("data/") for ep in env.episodes))
+
+    def test_different_episode_id_still_rejected(self) -> None:
+        rows = [dict(row) for row in self.rows]
+        rows[0]["habitat_episode_id"] = "different_episode"
+        self._write_manifest(rows)
+        with self.assertRaisesRegex(ValueError, "missing="):
+            self._select()
+
+    def test_different_scene_file_still_rejected(self) -> None:
+        other_scene = self.scene_paths[0].with_name("other.glb")
+        other_scene.touch()
+        rows = [dict(row) for row in self.rows]
+        for row in rows[:8]:
+            row["scene_id"] = str(other_scene)
+        self._write_manifest(rows)
+        with self.assertRaisesRegex(ValueError, "missing="):
+            self._select()
+
+    def test_duplicate_episode_with_scene_alias_still_rejected(self) -> None:
+        rows = [dict(row) for row in self.rows]
+        rows[0]["scene_id"] = self.episodes[0].scene_id
+        rows[0]["habitat_episode_id"] = rows[1]["habitat_episode_id"]
+        self._write_manifest(rows)
+        with self.assertRaisesRegex(ValueError, "duplicate Episode"):
+            self._select()
+
+    def test_duplicate_loaded_episode_still_rejected(self) -> None:
+        episodes = list(self.episodes)
+        episodes[-1] = types.SimpleNamespace(
+            scene_id=episodes[0].scene_id, episode_id=episodes[0].episode_id,
+        )
+        with self.assertRaisesRegex(ValueError, "Pilot IDs differ"):
+            self._select(episodes)
+
+    def test_rgm_88_count_and_scene_quotas_still_required(self) -> None:
+        rows = [dict(row) for row in self.rows[:-1]]
+        self._write_manifest(rows)
+        with self.assertRaisesRegex(ValueError, "exactly 88"):
+            self._select()
+
+        rows = [dict(row) for row in self.rows]
+        rows[0]["distance_group"] = "long"
+        self._write_manifest(rows)
+        with self.assertRaisesRegex(ValueError, "3/3/2"):
+            self._select()
 
 
 if __name__ == "__main__":

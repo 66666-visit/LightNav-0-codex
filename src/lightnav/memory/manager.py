@@ -1,8 +1,9 @@
-"""Coordinate working, episodic, and graph memory for one R2R episode at a time."""
+"""Coordinate legacy memory or the independent RGM V3 memory backend."""
 
 from __future__ import annotations
 
 import logging
+import re
 from copy import deepcopy
 from time import perf_counter
 from uuid import uuid4
@@ -29,6 +30,11 @@ from lightnav.memory.schemas import (
 )
 from lightnav.memory.semantic_index import SemanticIndex
 from lightnav.memory.topological_memory import PlaceObservationResult, TopologicalMemory
+from lightnav.memory.v3_config import RGMV3Config
+from lightnav.memory.v3_formatter import V3PromptFormatter
+from lightnav.memory.v3_retrieval import V3Retriever
+from lightnav.memory.v3_schemas import EvidenceRecord
+from lightnav.memory.v3_store import V3MemoryStore
 from lightnav.memory.working_memory import WorkingMemoryStore
 
 _LAYERS = frozenset({"short", "mid", "long"})
@@ -36,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryManager:
-    """Episode-local memory. No records survive ``close_episode`` or a new reset."""
+    """Select one memory backend; V3 scope controls cross-Episode retention."""
 
     def __init__(
         self,
@@ -51,6 +57,7 @@ class MemoryManager:
         place_every_n_steps: int = 5,
         place_similarity_threshold: float = 0.85,
         rgm_config: RGMConfig | None = None,
+        v3_config: RGMV3Config | None = None,
     ) -> None:
         if top_k < 0:
             raise ValueError("top_k must be nonnegative")
@@ -78,8 +85,15 @@ class MemoryManager:
         self.place_extractor = place_extractor
         self.place_every_n_steps = place_every_n_steps
         self.rgm_config = rgm_config or RGMConfig()
+        self.v3_config = v3_config or RGMV3Config()
+        if self.rgm_config.enabled and self.v3_config.enabled:
+            raise ValueError("legacy RGM and RGM V3 cannot run together")
         if self.rgm_config.enabled and strategy != "hierarchical":
             raise ValueError("RGM requires hierarchical memory")
+        if self.v3_config.enabled and strategy != "hierarchical":
+            raise ValueError("RGM V3 requires hierarchical memory")
+        if self.v3_config.enabled and set(self.layers) != _LAYERS:
+            raise ValueError("RGM V3 requires short, mid and long memory layers")
         if self.rgm_config.enabled and self.rgm_config.place_two_stage_enabled and not place_enabled:
             raise ValueError("RGM two-stage place recognition requires place memory")
         self.topology_active = (
@@ -94,6 +108,25 @@ class MemoryManager:
         self.topological_memory = TopologicalMemory(similarity_threshold=place_similarity_threshold)
         self.retriever = MemoryRetriever()
         self.fusion = MemoryFusion()
+        self.v3_store = (
+            V3MemoryStore(scope=self.v3_config.scope,
+                          place_similarity_threshold=place_similarity_threshold)
+            if self.v3_config.enabled else None
+        )
+        self.v3_retriever = V3Retriever(self.v3_store) if self.v3_store else None
+        self.v3_formatter = (
+            V3PromptFormatter(max_records=self.v3_config.prompt_max_records,
+                              max_chars=min(self.v3_config.prompt_max_chars,
+                                            self.max_context_chars))
+            if self.v3_config.enabled else None
+        )
+        self.v3_scene_id: str | None = None
+        self.v3_rollout_idx = 0
+        self.v3_place_id: str | None = None
+        self.v3_descriptor: tuple[float, ...] | None = None
+        self._v3_prior_place_id: str | None = None
+        self._v3_pending_descriptors: dict[str, tuple[float, ...]] = {}
+        self.last_v3_diagnostic: dict = {}
         self.last_layer_results: dict[str, list[LayerMemoryItem]] = {}
         self.last_place_result: PlaceObservationResult | None = None
         self.last_place_error: str | None = None
@@ -109,6 +142,7 @@ class MemoryManager:
             max_chars=self.rgm_config.prompt_max_chars,
             step0_conditional=self.rgm_config.step0_conditional,
             min_current_confidence=self.rgm_config.min_instruction_landmark_confidence,
+            temporal_min_support=self.rgm_config.temporal_min_support,
         )
         self.place_verifier = TwoStagePlaceVerifier(self.rgm_config)
         self._writer: MemoryWriter | None = None
@@ -119,10 +153,22 @@ class MemoryManager:
     def active(self) -> bool:
         return self._writer is not None
 
-    def reset_episode(self, episode_id: str | None = None, instruction: str = "") -> None:
-        """Begin a new episode, discarding all previous episode data."""
+    def reset_episode(self, episode_id: str | None = None, instruction: str = "",
+                      *, scene_id: str | None = None, rollout_idx: int = 0) -> None:
+        """Begin an Episode; V3 retains prior Scene history only when configured."""
         self.close_episode()
         episode_id = episode_id or uuid4().hex
+        if self.v3_store is not None:
+            # Callers without a scene identity must remain isolated by Episode.
+            self.v3_scene_id = scene_id or episode_id
+            self.v3_rollout_idx = rollout_idx
+            self.v3_place_id = None
+            self.v3_descriptor = None
+            self._v3_prior_place_id = None
+            self._v3_pending_descriptors = {}
+            self.v3_store.begin_episode(
+                self.v3_scene_id, episode_id, instruction, rollout_idx=rollout_idx,
+            )
         self.extractor.reset_episode(episode_id, instruction)
         if self.topology_active:
             assert self.place_extractor is not None
@@ -135,6 +181,7 @@ class MemoryManager:
         self.last_place_extraction_ms = None
         self.last_place_decision = None
         self.last_topology_edge_status = None
+        self.last_v3_diagnostic = {}
         self.write_gate = (
             MemoryWriteGate(episode_id, instruction, self.rgm_config)
             if self.rgm_config.enabled else None
@@ -166,18 +213,26 @@ class MemoryManager:
         self.last_place_decision = None
         self.last_topology_edge_status = None
         self.place_verifier.last_topk = []
+        if self.v3_store is not None:
+            self.v3_descriptor = None
+            if MemoryWriter._has_positive_forward_command(action):
+                # The command is not proof of travel. Drop the carried current
+                # place until a new visual descriptor is observed.
+                self.v3_place_id = None
         events = writer.observe(safe_packet)
         if self.strategy == "hierarchical":
             if "short" in self.layers:
                 self.working.record_observation(packet.step_id, events)
-            if "long" in self.layers:
+            if "long" in self.layers and self.v3_store is None:
                 adopted = (
                     [event for event in events if event.metadata.get("rgm_adopted", False)]
                     if self.rgm_config.enabled else events
                 )
                 self.semantic_index.update(adopted, self.scene_graph, self.working.state.instruction)
         if self.topology_active and packet.step_id % self.place_every_n_steps == 0:
-            if self.rgm_config.enabled and self.rgm_config.place_two_stage_enabled:
+            if self.v3_store is not None:
+                self._observe_place_v3(safe_packet, events)
+            elif self.rgm_config.enabled and self.rgm_config.place_two_stage_enabled:
                 self._observe_place_rgm(safe_packet, events)
             else:
                 self._observe_place(
@@ -185,6 +240,8 @@ class MemoryManager:
                     [event for event in events if event.metadata.get("rgm_adopted", False)]
                     if self.rgm_config.enabled else events,
                 )
+        if self.v3_store is not None:
+            self._persist_v3_events(events)
         self._pending_action = None
         self._pending_prediction = None
         return events
@@ -200,6 +257,61 @@ class MemoryManager:
     def retrieve(self, query: MemoryQuery | None = None) -> MemoryContext:
         self.working._require_state()
         query = query or self._default_query()
+        if self.v3_store is not None:
+            assert self.v3_retriever is not None and self.v3_formatter is not None
+            result = self.v3_retriever.retrieve(
+                scene_id=self.v3_scene_id, instruction=query.instruction,
+                current_step=query.current_step, visual_descriptor=self.v3_descriptor,
+                place_id=self.v3_place_id, episode_id=self.working.state.episode_id,
+                rollout_idx=self.v3_rollout_idx, top_k=query.top_k,
+            )
+            context = self.v3_formatter.format(result.records, current_step=query.current_step)
+            active_identity = (self.working.state.episode_id, self.v3_rollout_idx)
+
+            def is_historical_ref(ref: str) -> bool:
+                record = self.v3_store.get_evidence(ref)
+                return bool(record is not None and (
+                    (record.episode_id, record.rollout_idx) != active_identity
+                    or record.step < query.current_step
+                ))
+
+            historical_prompt_records = sum(
+                any(is_historical_ref(ref.event_id) for ref in item.evidence_refs)
+                for item in context.layer_items
+            )
+            historical_supported_records = sum(
+                any(is_historical_ref(ref) for ref in
+                    item.metadata.get("supporting_evidence_ids", ()))
+                for item in context.layer_items
+            )
+            self.last_v3_diagnostic.update(result.counts)
+            self.last_v3_diagnostic.update({
+                "retrieval_nonempty": result.merged_candidates > 0,
+                "fusion_nonempty": bool(result.records),
+                "formatter_nonempty": bool(context.text and context.layer_items),
+                "prompt_historical_records_serialized": historical_prompt_records,
+                "prompt_historical_supported_records": historical_supported_records,
+                "prompt_current_step_only_records_serialized": (
+                    len(context.layer_items) - historical_prompt_records
+                ),
+                "prompt_records_selected": self.v3_formatter.last_selected,
+                "prompt_records_considered": len(
+                    self.v3_formatter.last_candidate_line_chars
+                ),
+                "prompt_records_serialized": self.v3_formatter.last_serialized,
+                "prompt_chars": len(context.text),
+                "prompt_candidate_line_chars": list(
+                    self.v3_formatter.last_candidate_line_chars
+                ),
+                "prompt_serialized_line_chars": list(
+                    self.v3_formatter.last_serialized_line_chars
+                ),
+                "effective_prompt_max_chars": self.v3_formatter.max_chars,
+                "selected_evidence_ids": list(dict.fromkeys(
+                    ref.event_id for item in context.layer_items for ref in item.evidence_refs
+                )),
+            })
+            return context
         if self.strategy == "flat":
             self.last_layer_results = {}
             return self.retriever.retrieve(
@@ -247,7 +359,7 @@ class MemoryManager:
     def get_context(self, query: MemoryQuery | None = None) -> MemoryContext:
         return self.retrieve(query)
 
-    def close_episode(self) -> None:
+    def close_episode(self, *, outcome: str = "unknown") -> None:
         """Clear all episode-local records, including staged actions and RGB summary."""
         try:
             if self._writer is not None:
@@ -258,6 +370,13 @@ class MemoryManager:
                         assert self.place_extractor is not None
                         self.place_extractor.close_episode()
         finally:
+            if self.v3_store is not None:
+                self.v3_store.close_episode(outcome=outcome)
+                self.v3_scene_id = None
+                self.v3_place_id = None
+                self.v3_descriptor = None
+                self._v3_prior_place_id = None
+                self._v3_pending_descriptors = {}
             self._writer = None
             self._pending_action = None
             self._pending_prediction = None
@@ -279,6 +398,149 @@ class MemoryManager:
             self.place_verifier.clear()
             self.retrieval_gate.decisions = []
             self.prompt_gate.last_selection = MemorySelection((), (), (), "")
+            self.last_v3_diagnostic = {}
+
+    def _observe_place_v3(self, packet: ObservationPacket, events: list[MemoryEvent]) -> None:
+        """Capture one DINO observation without claiming physical traversal."""
+        assert self.place_extractor is not None
+        self.last_place_extraction_attempted = True
+        started = perf_counter()
+        try:
+            feature_method = getattr(self.place_extractor, "extract_features", None)
+            features = (feature_method(packet) if feature_method is not None
+                        else self.place_extractor.extract(packet))
+            if features is None:
+                return
+            values = getattr(features, "global_descriptor", features)
+            descriptor = tuple(float(value) for value in values)
+            if not descriptor:
+                return
+            event_id = f"place_observation_{packet.step_id}"
+            self._v3_pending_descriptors[event_id] = descriptor
+            event = MemoryEvent(
+                event_id=event_id, step_id=packet.step_id,
+                kind="place_observation",
+                description="Observed RGB visual place descriptor",
+                confidence=1.0, source=self.place_extractor.source,
+                importance=0.6, episode_id=self.working.state.episode_id,
+                metadata={"descriptor_dim": len(descriptor)},
+            )
+            self.episodic.add(event)
+            self.working.record_event(event)
+            events.append(event)
+            self.v3_descriptor = descriptor
+        except Exception as exc:
+            self.last_place_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("V3 place extraction failed at step=%s: %s",
+                           packet.step_id, exc, exc_info=True)
+        finally:
+            self.last_place_extraction_ms = (perf_counter() - started) * 1000.0
+
+    def _persist_v3_events(self, events: list[MemoryEvent]) -> None:
+        """Write every valid observed event with a Scene/Episode-qualified key."""
+        assert self.v3_store is not None and self.v3_scene_id is not None
+        instruction = self.working.state.instruction
+        instruction_words = set(re.findall(r"[a-z0-9]+", instruction.casefold()))
+        direct_by_label: dict[str, str] = {}
+        persisted = 0
+        low_confidence = 0
+        repeated = 0
+        visible_landmarks: list[tuple[str, str]] = []
+        for event in events:
+            is_detection = event.kind in {"object_observation", "landmark"}
+            label = (event.description.removeprefix("Observed ").strip()
+                     if is_detection else None)
+            payload = {"description": event.description}
+            if event.kind in {"action", "turn"}:
+                action = event.metadata.get("action")
+                if isinstance(action, dict):
+                    payload["action"] = deepcopy(action)
+            source_refs: tuple[str, ...] = ()
+            if event.kind == "instruction_match":
+                matched_label = event.description.removeprefix(
+                    "Observed instruction-related ",
+                ).strip().casefold()
+                if matched_label in direct_by_label:
+                    source_refs = (direct_by_label[matched_label],)
+            terms = tuple(sorted(instruction_words & set(
+                re.findall(r"[a-z0-9]+", (label or event.description).casefold())
+            )))
+            record = EvidenceRecord(
+                evidence_id=event.event_id, scene_id=self.v3_scene_id,
+                episode_id=event.episode_id, rollout_idx=self.v3_rollout_idx,
+                step=event.step_id, event_type=event.kind, semantic_label=label,
+                payload=payload, visual_descriptor=self._v3_pending_descriptors.pop(
+                    event.event_id, None,
+                ), detector_name=event.source if is_detection else None,
+                raw_detector_confidence=event.confidence if is_detection else None,
+                instruction_terms=terms, source_evidence_ids=source_refs,
+                observation_status=("observed" if is_detection or event.kind in {
+                    "place_observation", "visual_change", "place_visit",
+                } else "unknown"),
+                spatial_status="observed" if event.kind == "place_observation" else "unknown",
+                traversability_status="unknown",
+                provenance_validity=(event.kind != "instruction_match" or bool(source_refs)),
+            )
+            stored = self.v3_store.add(record)
+            persisted += 1
+            if (stored.raw_detector_confidence is not None
+                    and stored.raw_detector_confidence < self.v3_config.low_confidence_threshold):
+                low_confidence += 1
+            if stored.support_count > 1:
+                repeated += 1
+            if is_detection:
+                direct_by_label[label.casefold()] = stored.key
+                if "long" in self.layers:
+                    landmark = self.v3_store.add_landmark(stored)
+                    visible_landmarks.append((landmark.node_id, stored.key))
+            elif event.kind == "place_observation" and "long" in self.layers:
+                node = self.v3_store.add_place(stored)
+                for landmark_id, landmark_key in visible_landmarks:
+                    self.v3_store.add_relation(
+                        node.node_id, landmark_id, "inferred_relation",
+                        evidence_keys=(stored.key, landmark_key),
+                    )
+                prior = self._v3_prior_place_id
+                if prior is not None and prior != node.node_id:
+                    prior_node = next((item for item in self.v3_store.nodes_for_scene(
+                        self.v3_scene_id,
+                    ) if item.node_id == prior), None)
+                    if prior_node is not None and prior_node.evidence_ids:
+                        self.v3_store.add_relation(
+                            prior, node.node_id, "inferred_relation",
+                            evidence_keys=(prior_node.evidence_ids[-1], stored.key),
+                        )
+                self.v3_place_id = node.node_id
+                self._v3_prior_place_id = node.node_id
+        self.last_v3_diagnostic = {
+            "events_observed": len(events), "events_parsed": len(events),
+            "events_persisted": persisted,
+            "short_memory_records": len(self.v3_store.current_short),
+            "mid_memory_records": (
+                len(self.v3_store.episodes_for_scene(self.v3_scene_id))
+                + int(self.v3_store.active_segment(
+                    before_step=self.working.state.step_id,
+                ) is not None)
+            ),
+            "long_memory_nodes": len(self.v3_store.nodes_for_scene(self.v3_scene_id)),
+            "long_memory_edges": len(self.v3_store.edges_for_scene(self.v3_scene_id)),
+            "promoted_records": self.v3_store.promoted_records,
+            "updated_records": self.v3_store.updated_records,
+            "low_confidence_records": low_confidence,
+            "repeated_observations": repeated,
+            "spatial_unknown_records": sum(
+                edge.traversability_status == "unknown"
+                for edge in self.v3_store.edges_for_scene(self.v3_scene_id)
+            ),
+            "verified_transitions": sum(
+                edge.traversability_status in {"traversed", "verified"}
+                for edge in self.v3_store.edges_for_scene(self.v3_scene_id)
+            ),
+            "failed_experiences": sum(
+                episode.outcome == "failure"
+                for episode in self.v3_store.episodes_for_scene(self.v3_scene_id)
+            ),
+        }
 
     def _observe_place(self, packet: ObservationPacket, events: list[MemoryEvent]) -> None:
         """Index one current RGB descriptor; never use Habitat evaluator information."""

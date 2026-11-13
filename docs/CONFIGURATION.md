@@ -183,6 +183,35 @@ A reuse and cause the launcher to run A on the same 88 IDs. B is absent from
 the RGM protocol. The legacy 220 and full 1839 launch modes above remain
 available separately.
 
+### RGM V3 memory backend
+
+RGM V3 is selected independently of the RGM V1 `--rgm_enabled` switch. Use
+`--rgm_v3_enabled` with `--memory_enabled --memory_strategy hierarchical`
+and `--memory_layers short,mid,long`.
+Do not combine V1 and V3 switches in one run. The V3 flags are:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--rgm_v3_enabled` | off | Run the V3 evidence store, multichannel retrieval and prompt formatter |
+| `--rgm_v3_scope` | `episode_local` | `episode_local` clears online memory at episode end; `scene_persistent` retains autonomous observations within the same scene |
+| `--rgm_v3_prompt_max_records` | `3` | Maximum complete memory statements in the prompt |
+| `--rgm_v3_prompt_max_chars` | `400` | Maximum characters in the formatted memory block |
+
+An enabled V3 run requires an explicit `--output_dir` pointing to a new, empty
+directory. The runner writes `rgm_v3_protocol.json` with protocol version
+`rgm_v3_v1` and the selected scope. Do not reuse the V1 A/C/D output directory
+or its Pilot Manifest. For the first comparison with unmodified LightNav, select
+`episode_local`; `scene_persistent` is a separate experimental setting and must
+be reported separately. The two scopes must never be combined into one metric.
+
+V3 uses scene, episode, rollout and local event ID together as a provenance key.
+An issued action or RGB appearance change records an unverified spatial cue;
+only an independently measured displacement can verify a physical traversal.
+The available Habitat client does not provide such a measurement to the online
+memory, so its traversability status remains `unknown`. Evaluator metrics such
+as `info.success` and oracle distance are excluded from online memory.
+See [RGM_V3.md](RGM_V3.md) for the memory and token-level diagnostic contract.
+
 The underlying `scripts/eval_habitat.sh` also accepts `STRICT_FULL_EVAL=1`
 for the full-split gate, `RESUME=1` to skip existing completed Episodes,
 `EPISODE_MANIFEST_PATH` to create or compare a shared manifest, `SEED` for

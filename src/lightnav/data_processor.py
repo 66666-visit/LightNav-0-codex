@@ -235,6 +235,7 @@ class Qwen3VLDataProcessor:
         self._sync_processor_settings()
         self.tokenizer = processor.tokenizer
         self.model_max_length = model_max_length
+        self.last_process_diagnostic: dict[str, int | bool | None] | None = None
 
         # Get token IDs from tokenizer (not hardcoded)
         self.image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
@@ -292,6 +293,7 @@ class Qwen3VLDataProcessor:
         ``validate_video_shapes`` is accepted for interface compatibility and ignored:
         frames are resized to the checkpoint's ``video_size`` before they get here.
         """
+        self.last_process_diagnostic = None
         self._sync_processor_settings()
 
         # When the caller has pre-normalized video frames, temporarily disable
@@ -485,7 +487,21 @@ class Qwen3VLDataProcessor:
                 )
                 result["labels"] = torch.cat([result["labels"], torch.full_like(added_ids, IGNORE_INDEX)])
 
-        result = self._apply_max_length(result)
+        before_limit = int(result["input_ids"].size(0))
+        self.last_process_diagnostic = {
+            "tokens_before_truncation": before_limit,
+            "tokens_after_truncation": None,
+            "truncated": False,
+            "length_rejected": False,
+            "max_seq_len": self.model_max_length,
+        }
+        trace = sample.get("_rgm_trace")
+        result = self._apply_max_length(
+            result, strict_prompt=(
+                isinstance(trace, dict) and trace.get("memory_backend") == "rgm_v3"
+            ),
+        )
+        self.last_process_diagnostic["tokens_after_truncation"] = int(result["input_ids"].size(0))
 
         input_mask = result["labels"] == IGNORE_INDEX
         result["image_mask"] = (result["input_ids"] == self.image_token_id) & input_mask
@@ -493,34 +509,45 @@ class Qwen3VLDataProcessor:
 
         return result
 
-    def _apply_max_length(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Truncate sequences to max length."""
+    def _apply_max_length(self, data: Dict[str, torch.Tensor], *,
+                          strict_prompt: bool = True) -> Dict[str, torch.Tensor]:
+        """Report legacy truncation; reject overlong V3 memory prompts."""
         if self.model_max_length is None:
             return data
 
         max_len = self.model_max_length
-        if data["input_ids"].size(0) <= max_len:
-            return data
-
-        data["input_ids"] = data["input_ids"][:max_len]
-        data["attention_mask"] = data["attention_mask"][:max_len]
-        data["labels"] = data["labels"][:max_len]
-        pos = data["position_ids"]
-        if pos.dim() == 1:
-            data["position_ids"] = pos[:max_len]
-        else:
-            # Qwen3-VL position ids are typically (3, seq_len): truncate on seq dim.
-            data["position_ids"] = pos[..., :max_len]
-
-        pos_len = data["position_ids"].size(-1) if data["position_ids"].dim() > 1 else data["position_ids"].size(0)
-        if pos_len != data["input_ids"].size(0):
-            raise ValueError(
-                f"position_ids length ({pos_len}) does not match input_ids length ({data['input_ids'].size(0)}) "
-                f"after truncation."
+        actual = int(data["input_ids"].size(0))
+        if actual > max_len:
+            if strict_prompt:
+                if getattr(self, "last_process_diagnostic", None) is not None:
+                    self.last_process_diagnostic["length_rejected"] = True
+                raise ValueError(
+                    f"processor input length {actual} exceeds model_max_length {max_len}; "
+                    "refusing to truncate the navigation instruction, memory, or answer boundary"
+                )
+            logger.warning(
+                "processor truncated prompt from %d to %d tokens", actual, max_len,
             )
-
-        last_token = data["input_ids"][-1].item()
-        if last_token in (self.image_token_id, self.video_token_id):
-            raise ValueError(f"Truncation cut off vision token at position {max_len}")
-
+            if getattr(self, "last_process_diagnostic", None) is not None:
+                self.last_process_diagnostic["truncated"] = True
+            data["input_ids"] = data["input_ids"][:max_len]
+            data["attention_mask"] = data["attention_mask"][:max_len]
+            data["labels"] = data["labels"][:max_len]
+            pos = data["position_ids"]
+            if pos.dim() == 1:
+                data["position_ids"] = pos[:max_len]
+            else:
+                data["position_ids"] = pos[..., :max_len]
+            pos_len = (
+                data["position_ids"].size(-1) if data["position_ids"].dim() > 1
+                else data["position_ids"].size(0)
+            )
+            if pos_len != data["input_ids"].size(0):
+                raise ValueError(
+                    f"position_ids length ({pos_len}) does not match input_ids length "
+                    f"({data['input_ids'].size(0)}) after truncation."
+                )
+            last_token = data["input_ids"][-1].item()
+            if last_token in (self.image_token_id, self.video_token_id):
+                raise ValueError(f"Truncation cut off vision token at position {max_len}")
         return data

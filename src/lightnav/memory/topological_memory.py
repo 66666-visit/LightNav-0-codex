@@ -419,6 +419,7 @@ class TopologicalMemory:
                     metadata={
                         "place_id": semantic_place.place_id,
                         "current": is_current_place and last_step == query.current_step,
+                        "descriptor_event_ids": list(semantic_place.descriptor_event_ids),
                     },
                 )))
         for edge in self._edges.values():
@@ -455,6 +456,7 @@ class TopologicalMemory:
                     "source_place_id": edge.source_place_id,
                     "target_place_id": edge.target_place_id,
                     "evidence_event_ids": list(edge.evidence_event_ids),
+                    "motion_event_ids": list(edge.motion_event_ids),
                     "relation_id": f"place_shift_{edge.last_observed_step}",
                     "current": edge.last_observed_step == query.current_step,
                 },

@@ -92,6 +92,15 @@ class ContextBuilderTest(unittest.TestCase):
         original = sample()
         self.assertEqual(inject_memory_context(original, context, max_chars=50), original)
 
+    def test_no_rgm_header_only_prompt_after_html_escaping(self) -> None:
+        context = MemoryContext(text=(
+            "[Navigation memory; uncertain RGB observations]\n"
+            "Current RGB observed instruction landmark " + "<&>" * 60
+        ))
+        self.assertEqual(build_context_text(context, max_chars=100), "")
+        original = sample()
+        self.assertEqual(inject_memory_context(original, context, max_chars=100), original)
+
     def test_missing_navigation_tag_fails_loudly(self) -> None:
         original = sample()
         original["conversations"][0]["value"] = "an unsupported prompt"

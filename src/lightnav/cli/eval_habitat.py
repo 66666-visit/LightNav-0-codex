@@ -16,6 +16,7 @@ import sys
 
 from lightnav.habitat.runner import HabitatEvalConfig, MemoryConfig, run_habitat_eval
 from lightnav.memory.rgm_config import RGMConfig
+from lightnav.memory.v3_config import RGMV3Config
 
 # Argparse defaults come from the dataclass so the CLI and the Python API cannot drift.
 _DEFAULTS = HabitatEvalConfig(model_path="")
@@ -200,6 +201,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--rgm_enabled", action="store_true",
                    help="Enable Reliability-Gated Memory within hierarchical memory.")
+    p.add_argument("--rgm_v3_enabled", action="store_true",
+                   help="Enable the independent evidence-driven RGM V3 backend.")
+    p.add_argument("--rgm_v3_scope", choices=("episode_local", "scene_persistent"),
+                   default="episode_local",
+                   help="V3 online memory scope; default episode_local.")
+    p.add_argument("--rgm_v3_prompt_max_records", type=int, default=3,
+                   help="Maximum complete V3 memory statements in the prompt.")
+    p.add_argument("--rgm_v3_prompt_max_chars", type=int, default=400,
+                   help="Maximum characters in the V3 memory block.")
     for name, default in (
         ("step0_conditional", True), ("write_gate_enabled", True),
         ("retrieval_gate_enabled", True), ("prompt_gate_enabled", True),
@@ -345,6 +355,11 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                 prompt_max_records=args.rgm_prompt_max_records,
                 prompt_max_chars=args.rgm_prompt_max_chars,
             ),
+            rgm_v3=RGMV3Config(
+                enabled=args.rgm_v3_enabled, scope=args.rgm_v3_scope,
+                prompt_max_records=args.rgm_v3_prompt_max_records,
+                prompt_max_chars=args.rgm_v3_prompt_max_chars,
+            ),
         ),
         save_video=args.save_video,
         video_fps=args.video_fps,
@@ -362,7 +377,14 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_args = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+    args = parser.parse_args(raw_args)
+    if args.rgm_v3_enabled and not any(
+        token == "--output_dir" or token.startswith("--output_dir=")
+        for token in raw_args
+    ):
+        parser.error("RGM V3 requires an explicit --output_dir for a new result directory")
     run_habitat_eval(config_from_args(args))
     return 0
 

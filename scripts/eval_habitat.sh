@@ -203,6 +203,26 @@ PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" "$CLIENT_PYTHON" -c "impo
 TS=$(date +%Y%m%d_%H%M%S)
 ATTEMPT_ID="${TS}_$$"
 OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/output/habitat_${TASK}_${TS}}
+# Use the same shell word splitting as the client invocation below. Checking a
+# space-delimited substring misses flags separated by tabs or newlines.
+# shellcheck disable=SC2206
+client_extra_args=($CLIENT_ARGS)
+v3_client_enabled=0
+for token in "${client_extra_args[@]}"; do
+    [ "$token" = --rgm_v3_enabled ] && v3_client_enabled=1
+done
+if [ "$v3_client_enabled" -eq 1 ]; then
+    case "$OUTPUT_ROOT" in
+        */rgm_pilot_88_v1|*/rgm_pilot_88_v1/*|*/rgm_pilot_88_v2|*/rgm_pilot_88_v2/*)
+            echo "$TAG ERROR: RGM V3 requires an independent output directory" >&2
+            exit 1
+            ;;
+    esac
+    if [ -n "$PILOT_MANIFEST_PATH" ]; then
+        echo "$TAG ERROR: RGM V3 cannot use a legacy Pilot Manifest" >&2
+        exit 1
+    fi
+fi
 LOG_DIR=${LOG_DIR:-$OUTPUT_ROOT/logs/$ATTEMPT_ID}
 READY_DIR="$OUTPUT_ROOT/.ready/$ATTEMPT_ID"
 mkdir -p "$OUTPUT_ROOT" "$LOG_DIR" "$READY_DIR"
@@ -233,6 +253,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from lightnav.memory.rgm_config import RGMConfig
+from lightnav.memory.v3_config import RGMV3Config
 
 env = os.environ
 habitat_config = Path(env["SNAPSHOT_HABITAT_CONFIG"]).resolve()
@@ -276,6 +297,8 @@ for directory in (repo / "src" / "lightnav", repo / "habitat_server" / "lightnav
 bundle = Path(env["SNAPSHOT_ACTION_BUNDLE"]) if env["SNAPSHOT_ACTION_BUNDLE"] else model_path / "action_tokenizer"
 rgm_values = asdict(RGMConfig())
 for index, token in enumerate(tokens):
+    if token.startswith("--rgm_v3_"):
+        continue
     negative = token.startswith("--no-rgm_")
     if not (token.startswith("--rgm_") or negative):
         continue
@@ -290,6 +313,23 @@ for index, token in enumerate(tokens):
     else:
         rgm_values[name] = type(default)(tokens[index + 1])
 rgm_effective = asdict(RGMConfig(**rgm_values))
+v3_values = asdict(RGMV3Config())
+for index, token in enumerate(tokens):
+    if not token.startswith("--rgm_v3_"):
+        continue
+    name = token.removeprefix("--rgm_v3_")
+    if name not in v3_values:
+        raise SystemExit(f"unknown RGM V3 setting in snapshot: {token}")
+    default = v3_values[name]
+    if isinstance(default, bool):
+        v3_values[name] = True
+    elif index + 1 >= len(tokens):
+        raise SystemExit(f"missing value for RGM V3 setting: {token}")
+    else:
+        v3_values[name] = type(default)(tokens[index + 1])
+v3_effective = asdict(RGMV3Config(**v3_values))
+if v3_effective["enabled"] and rgm_effective["enabled"]:
+    raise SystemExit("legacy RGM and RGM V3 cannot share one run")
 
 snapshot = {
     "common": {
@@ -330,6 +370,9 @@ snapshot = {
     "client_args": tokens,
     "server_args": shlex.split(env["SNAPSHOT_SERVER_ARGS"]),
 }
+if v3_effective["enabled"]:
+    snapshot["protocol_version"] = v3_effective["protocol_version"]
+    snapshot["memory_effective"]["rgm_v3"] = v3_effective
 if env["SNAPSHOT_PILOT_MANIFEST"]:
     pilot_path = Path(env["SNAPSHOT_PILOT_MANIFEST"])
     snapshot["pilot_manifest_path"] = str(pilot_path)
@@ -439,8 +482,7 @@ client_args=(--model_path "$MODEL_PATH" --backend "$BACKEND" --episodes "$EPISOD
 [ -n "$ACTION_TOKENIZER_BUNDLE" ] && client_args+=(--action_tokenizer_bundle "$ACTION_TOKENIZER_BUNDLE")
 # shellcheck disable=SC2206
 [ -n "$LANGUAGES" ] && client_args+=(--languages $LANGUAGES)
-# shellcheck disable=SC2206
-[ -n "$CLIENT_ARGS" ] && client_args+=($CLIENT_ARGS)
+client_args+=("${client_extra_args[@]}")
 
 for ((i = 0; i < N; i++)); do
     g=${GPUS[$i]}

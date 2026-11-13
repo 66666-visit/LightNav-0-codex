@@ -168,7 +168,9 @@ class TrajVocabVLNCEPolicy:
         self._last_raw_text = ""
 
     def reset(self, obs: dict[str, Any] | None = None, *,
-              memory_episode_id: str | None = None) -> None:
+              memory_episode_id: str | None = None,
+              memory_scene_id: str | None = None,
+              memory_rollout_idx: int = 0) -> None:
         """Reset the frame buffer and seed the instruction from ``obs`` if given."""
         self.close_episode()
         self.instruction = extract_instruction(obs) if obs is not None else ""
@@ -176,22 +178,28 @@ class TrajVocabVLNCEPolicy:
         self._clear_last()
         if self.memory_manager is not None:
             self._memory_episode_index += 1
-            self.memory_manager.reset_episode(
-                episode_id=memory_episode_id or f"policy_episode_{self._memory_episode_index}",
-                instruction=self.instruction,
-            )
+            reset_kwargs = {
+                "episode_id": memory_episode_id or f"policy_episode_{self._memory_episode_index}",
+                "instruction": self.instruction,
+            }
+            if memory_scene_id is not None:
+                reset_kwargs.update(scene_id=memory_scene_id, rollout_idx=memory_rollout_idx)
+            self.memory_manager.reset_episode(**reset_kwargs)
             self._memory_episode_open = True
             self._memory_step = 0
             self._last_executed_action = None
             self._last_prediction = None
 
-    def close_episode(self) -> None:
+    def close_episode(self, *, outcome: str | None = None) -> None:
         """Release the explicit memory of the current episode, if enabled."""
         self.last_memory_diagnostic = None
         self.last_model_inference_ms = None
         self.last_prompt_chars = None
         if self._memory_episode_open:
-            self.memory_manager.close_episode()
+            if outcome is None:
+                self.memory_manager.close_episode()
+            else:
+                self.memory_manager.close_episode(outcome=outcome)
             self._memory_episode_open = False
             self._last_executed_action = None
             self._last_prediction = None
@@ -247,9 +255,13 @@ class TrajVocabVLNCEPolicy:
             context = self.memory_manager.get_context()
             base_sample = sample
             prompt_fallback_reason = None
-            rgm_enabled = getattr(
+            legacy_rgm_enabled = getattr(
                 getattr(self.memory_manager, "rgm_config", None), "enabled", False,
             )
+            v3_enabled = getattr(
+                getattr(self.memory_manager, "v3_config", None), "enabled", False,
+            )
+            rgm_enabled = legacy_rgm_enabled or v3_enabled
             try:
                 if rgm_enabled and not build_context_text(
                     context, max_chars=getattr(self.memory_manager, "max_context_chars", 600),
@@ -270,17 +282,60 @@ class TrajVocabVLNCEPolicy:
                 sample = base_sample
                 prompt_audit = None
                 prompt_fallback_reason = str(exc)
+            memory_text = build_context_text(
+                context, max_chars=getattr(self.memory_manager, "max_context_chars", 600),
+            )
+            if prompt_fallback_reason is not None:
+                memory_text = ""
+            injected_lines = memory_text.splitlines()
+            if injected_lines and injected_lines[0] in {
+                "Episode observations (may be uncertain):",
+                "[Navigation memory; uncertain RGB observations]",
+                "[Navigation memory; evidence-linked observations]",
+            }:
+                injected_lines = injected_lines[1:]
+            if rgm_enabled:
+                if v3_enabled:
+                    accepted_records = []
+                    if memory_text and sample is not base_sample:
+                        for item in context.layer_items:
+                            line = item.metadata.get("serialized_text")
+                            if not isinstance(line, str) or line not in memory_text:
+                                raise ValueError("V3 formatted memory/evidence alignment failed")
+                            accepted_records.append({
+                                "evidence_ids": list(dict.fromkeys(
+                                    ref.event_id for ref in item.evidence_refs
+                                )),
+                                "text": line,
+                            })
+                    if len(accepted_records) != len(injected_lines):
+                        raise ValueError("V3 serialized record count differs from prompt lines")
+                else:
+                    accepted_records = [
+                        {
+                            "evidence_ids": list(dict.fromkeys(
+                                ref.event_id for ref in item.evidence_refs
+                            )),
+                            "text": line,
+                        }
+                        for item, line in zip(context.layer_items, injected_lines)
+                    ]
+                sample = {
+                    **sample,
+                    "_rgm_trace": {
+                        "episode_id": self.memory_manager.working.state.episode_id,
+                        "scene_id": self.memory_manager.v3_scene_id if v3_enabled else None,
+                        "rollout_idx": self.memory_manager.v3_rollout_idx if v3_enabled else 0,
+                        "memory_backend": "rgm_v3" if v3_enabled else "legacy_rgm",
+                        "step_id": self._memory_step - 1,
+                        "original_instruction": self.instruction,
+                        "memory_text": memory_text,
+                        "accepted_records": accepted_records,
+                    },
+                }
             if self.memory_verbose or hasattr(self.memory_manager, "scene_graph"):
                 extractor = self.memory_manager.extractor
                 attempted = getattr(extractor, "last_attempt_step", None) == self._memory_step - 1
-                memory_text = build_context_text(
-                    context, max_chars=getattr(self.memory_manager, "max_context_chars", 600),
-                )
-                if prompt_fallback_reason is not None:
-                    memory_text = ""
-                injected_lines = memory_text.splitlines()
-                if injected_lines and injected_lines[0] == "Episode observations (may be uncertain):":
-                    injected_lines = injected_lines[1:]
                 diagnostic = {
                     "step": self._memory_step - 1,
                     "extractor": type(extractor).__name__,
@@ -300,12 +355,12 @@ class TrajVocabVLNCEPolicy:
                     "retrieved_records": (
                         len(context.events) + len(context.nodes) + len(context.edges)
                         + len(context.layer_items)
-                    ),
-                    "injected_records": len(injected_lines),
+                    ) if not v3_enabled else None,
+                    "injected_records": len(accepted_records) if v3_enabled else len(injected_lines),
                     "injected_memory_chars": len(memory_text),
                     "injected_memory_text": memory_text,
                 }
-                if rgm_enabled:
+                if legacy_rgm_enabled:
                     from dataclasses import asdict
 
                     gate = self.memory_manager.write_gate
@@ -338,6 +393,10 @@ class TrajVocabVLNCEPolicy:
                             for item in items
                         ],
                         "fusion_selected_records": [item.kind for item in context.layer_items],
+                        "injected_evidence_ids": list(dict.fromkeys(
+                            evidence_id for record in accepted_records
+                            for evidence_id in record["evidence_ids"]
+                        )),
                         "prompt_gate_decision": asdict(
                             self.memory_manager.prompt_gate.last_selection,
                         ),
@@ -359,6 +418,43 @@ class TrajVocabVLNCEPolicy:
                         "last_confirmed_place_step": (
                             self.memory_manager.topological_memory.last_observation_step
                         ),
+                    })
+                if v3_enabled:
+                    from dataclasses import asdict
+
+                    diagnostic.pop("retrieved_records", None)
+                    tokenizer = getattr(self.engine.bundle, "tokenizer", None)
+                    token_delta = None
+                    if tokenizer is not None:
+                        try:
+                            base_human = next(
+                                turn["value"] for turn in base_sample["conversations"]
+                                if turn.get("from") == "human"
+                            )
+                            augmented_human = next(
+                                turn["value"] for turn in sample["conversations"]
+                                if turn.get("from") == "human"
+                            )
+                            token_delta = (
+                                len(tokenizer.encode(augmented_human, add_special_tokens=False))
+                                - len(tokenizer.encode(base_human, add_special_tokens=False))
+                            )
+                        except (KeyError, StopIteration, TypeError, ValueError):
+                            token_delta = None
+                    v3_diagnostic = dict(self.memory_manager.last_v3_diagnostic)
+                    v3_diagnostic.update({
+                        "prompt_chars": len(memory_text),
+                        "prompt_token_delta": token_delta,
+                        "prompt_token_delta_basis": "human_text_tokenizer_encode"
+                        if token_delta is not None else "unverified",
+                    })
+                    diagnostic.update({
+                        "episode_id": self.memory_manager.working.state.episode_id,
+                        "memory_backend": "rgm_v3",
+                        "rgm_v3_config": asdict(self.memory_manager.v3_config),
+                        "v3_diagnostic": v3_diagnostic,
+                        "prompt_hash": prompt_audit,
+                        "injected_evidence_ids": [],
                     })
                 if getattr(self.memory_manager, "strategy", "flat") == "hierarchical":
                     diagnostic["memory_strategy"] = "hierarchical"
@@ -427,6 +523,55 @@ class TrajVocabVLNCEPolicy:
             self.last_prompt_chars = len(sample["conversations"][0]["value"])
         if diagnostic is not None:
             diagnostic["prompt_chars"] = self.last_prompt_chars
+            if rgm_enabled:
+                model_input = getattr(self.engine, "last_input_diagnostic", None)
+                diagnostic["model_input_diagnostic"] = (
+                    dict(model_input) if isinstance(model_input, dict) else None
+                )
+                if v3_enabled:
+                    v3_diag = diagnostic["v3_diagnostic"]
+                    verified = isinstance(model_input, dict)
+                    block_visible = (
+                        model_input.get("memory_text_present_in_final_tokens") is True
+                        if verified else None
+                    )
+                    if verified and getattr(self.engine, "backend", None) == "vllm_local":
+                        block_visible = (
+                            block_visible and
+                            model_input.get("memory_text_present_in_vllm_prompt") is True and
+                            model_input.get("vllm_prompt_matches_final_tokens") is True
+                        )
+                    visible_ids = (
+                        list(model_input.get("literal_model_visible_evidence_ids", []))
+                        if block_visible else []
+                    )
+                    active_identity = (
+                        self.memory_manager.working.state.episode_id,
+                        self.memory_manager.v3_rollout_idx,
+                    )
+                    historical_visible_ids = []
+                    for evidence_id in visible_ids:
+                        record = self.memory_manager.v3_store.get_evidence(evidence_id)
+                        if record is not None and (
+                            (record.episode_id, record.rollout_idx) != active_identity
+                            or record.step < self._memory_step - 1
+                        ):
+                            historical_visible_ids.append(evidence_id)
+                    v3_diag.update({
+                        "prompt_hash_before": prompt_audit["base_sha256"]
+                        if prompt_audit else None,
+                        "prompt_hash_after": prompt_audit["augmented_sha256"]
+                        if prompt_audit else None,
+                        "actual_injection": bool(block_visible and visible_ids)
+                        if verified or not memory_text else None,
+                        "actual_historical_injection": bool(
+                            block_visible and historical_visible_ids
+                        ) if verified or not memory_text else None,
+                        "injected_evidence_ids": visible_ids,
+                        "injected_historical_evidence_ids": historical_visible_ids,
+                        "final_token_count": model_input.get("final_token_count")
+                        if verified else None,
+                    })
             self.last_memory_diagnostic = diagnostic
             if self.memory_verbose:
                 print("[memory] " + json.dumps(diagnostic, ensure_ascii=False), flush=True)

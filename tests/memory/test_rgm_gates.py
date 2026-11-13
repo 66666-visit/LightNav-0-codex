@@ -97,6 +97,8 @@ class RGMGateTests(unittest.TestCase):
         layers = {"short": [item], "mid": [], "long": []}
         retrieval = MemoryRetrievalGate()
         self.assertEqual(retrieval.filter(query, layers, set())["short"], [])
+        self.assertEqual(retrieval.decisions[0]["evidence_ids"], ["event_0"])
+        self.assertEqual(retrieval.decisions[0]["approved_evidence_ids"], [])
         self.assertEqual(len(retrieval.filter(query, layers, {"event_0"})["short"]), 1)
         self.assertIsNot(retrieval.filter(query, layers, {"event_0"}), layers)
         prompt = MemoryPromptGate()
@@ -111,6 +113,150 @@ class RGMGateTests(unittest.TestCase):
         self.assertIn("couch", prompt.select(
             later, MemoryContext(layer_items=[live]), {"event_5"}, {"event_5": 2},
         ).text)
+
+    def test_temporal_prompt_threshold_uses_configured_support(self) -> None:
+        config = RGMConfig(enabled=True, temporal_window=4, temporal_min_support=3)
+        prompt = MemoryPromptGate(temporal_min_support=config.temporal_min_support)
+        self.assertEqual(prompt.temporal_min_support, 3)
+        query = MemoryQuery("Find the sofa", current_step=5)
+        item = _item("event_5", step=5)
+        context = MemoryContext(layer_items=[item])
+        self.assertEqual(prompt.select(query, context, {"event_5"}, {"event_5": 2}).text, "")
+        self.assertIn("couch", prompt.select(
+            query, context, {"event_5"}, {"event_5": 3},
+        ).text)
+
+    def test_visually_supported_place_semantics_keeps_place_context(self) -> None:
+        query = MemoryQuery("Find the sofa", current_step=6)
+        item = LayerMemoryItem(
+            layer="long", kind="place_semantics", description="couch at visual place",
+            step_id=5, confidence=0.8, source="mock_yolo", label="couch",
+            evidence_refs=[ObservationEvidence("event_5", 5, "couch", 0.8, "mock_yolo")],
+            metadata={"place_id": "place_001", "descriptor_event_ids": ["place_observation_5"]},
+        )
+        layers = {"short": [], "mid": [], "long": [item]}
+        retrieval = MemoryRetrievalGate()
+        self.assertEqual(retrieval.filter(query, layers, {"event_5"})["long"], [])
+        self.assertEqual(retrieval.decisions[0]["reason"], "unverified_spatial_assertion")
+        filtered = retrieval.filter(query, layers, {"event_5", "place_observation_5"})
+        self.assertEqual(filtered["long"], [item])
+        context = MemoryFusion().build(query, [], [], filtered["long"])
+        prompt = MemoryPromptGate().select(
+            query, context, {"event_5", "place_observation_5"},
+        )
+        self.assertIn("visual place hypothesis place_001", prompt.text)
+        self.assertIn("place and object identity uncertain", prompt.text)
+        self.assertEqual(len(prompt.layer_items), 1)
+        self.assertEqual(prompt.layer_items[0].kind, "place_semantics")
+        self.assertEqual(prompt.layer_items[0].evidence_refs[0].event_id, "event_5")
+        current = MemoryPromptGate().select(
+            MemoryQuery("Find the sofa", current_step=5), context,
+            {"event_5", "place_observation_5"}, {"event_5": 1},
+        )
+        self.assertIn("visual place hypothesis place_001", current.text)
+
+    def test_step0_place_relation_survives_cross_layer_deduplication(self) -> None:
+        query = MemoryQuery("Find the sofa", current_step=0)
+        generic = _item("event_0", label="couch")
+        relation = LayerMemoryItem(
+            layer="long", kind="place_semantics", description="couch at visual place",
+            step_id=0, confidence=0.8, source="mock_yolo", label="couch",
+            evidence_refs=[ObservationEvidence("event_0", 0, "couch", 0.8, "mock_yolo")],
+            metadata={
+                "place_id": "place_000", "current": True,
+                "descriptor_event_ids": ["place_observation_0"],
+            },
+        )
+        descriptor = LayerMemoryItem(
+            layer="long", kind="current_place", description="current visual descriptor",
+            step_id=0, confidence=0.5, source="mock_dino", label="place_000",
+            evidence_refs=[ObservationEvidence(
+                "place_observation_0", 0, "place_000", 1.0, "mock_dino",
+            )],
+            metadata={"place_id": "place_000", "current": True},
+        )
+        accepted = {"event_0", "place_observation_0"}
+        filtered = MemoryRetrievalGate().filter(
+            query, {"short": [generic], "mid": [], "long": [descriptor, relation]},
+            accepted,
+        )
+        fused = MemoryFusion().build(
+            query, filtered["short"], filtered["mid"], filtered["long"],
+        )
+        selected = MemoryPromptGate().select(query, fused, accepted)
+        self.assertEqual([item.kind for item in selected.layer_items], ["place_semantics"])
+        self.assertIn("instruction landmark couch while visual place hypothesis place_000",
+                      selected.text)
+
+    def test_visual_shift_requires_both_descriptors_and_motion_and_never_claims_passability(self) -> None:
+        query = MemoryQuery("Find the sofa", current_step=10)
+        refs = [
+            ObservationEvidence("place_observation_5", 5, "place_000", 1.0, "mock_dino"),
+            ObservationEvidence("place_observation_10", 10, "place_001", 1.0, "mock_dino"),
+        ]
+        metadata = {
+            "source_place_id": "place_000", "target_place_id": "place_001",
+            "motion_event_ids": ["event_9"],
+            "evidence_event_ids": ["place_observation_5", "event_9", "place_observation_10"],
+        }
+        item = LayerMemoryItem(
+            layer="long", kind="observed_transition", description="observed shift",
+            step_id=10, confidence=0.5, source="mock_dino", evidence_refs=refs,
+            metadata=metadata,
+        )
+        layers = {"short": [], "mid": [], "long": [item]}
+        retrieval = MemoryRetrievalGate()
+        self.assertEqual(retrieval.filter(query, layers, {"place_observation_10"})["long"], [])
+        self.assertEqual(retrieval.decisions[0]["evidence_ids"], [
+            "place_observation_5", "place_observation_10",
+        ])
+        self.assertEqual(retrieval.filter(
+            query, layers, {"place_observation_5", "place_observation_10"},
+        )["long"], [item])
+        context = MemoryFusion().build(query, [], [], [item])
+        prompt = MemoryPromptGate().select(
+            query, context, {"place_observation_5", "place_observation_10"},
+        )
+        self.assertIn("visual shift from place_000 to place_001", prompt.text)
+        self.assertIn("traversability unverified", prompt.text)
+        self.assertNotIn("traversable path", prompt.text)
+        no_motion = LayerMemoryItem(
+            layer="long", kind="observed_transition", description="unsupported shift",
+            step_id=10, confidence=0.5, source="mock_dino", evidence_refs=refs,
+            metadata={**metadata, "motion_event_ids": []},
+        )
+        self.assertEqual(retrieval.filter(
+            query, {"short": [], "mid": [], "long": [no_motion]},
+            {"place_observation_5", "place_observation_10"},
+        )["long"], [])
+        unrelated_motion = LayerMemoryItem(
+            layer="long", kind="observed_transition", description="unsupported shift",
+            step_id=10, confidence=0.5, source="mock_dino", evidence_refs=refs,
+            metadata={**metadata, "evidence_event_ids": [
+                "place_observation_5", "place_observation_10",
+            ]},
+        )
+        self.assertEqual(retrieval.filter(
+            query, {"short": [], "mid": [], "long": [unrelated_motion]},
+            {"place_observation_5", "place_observation_10"},
+        )["long"], [])
+
+    def test_prompt_budget_keeps_complete_accepted_record(self) -> None:
+        query = MemoryQuery("Find the couch and TV", current_step=0)
+        couch = _item("event_0", label="couch")
+        television = _item("event_1", label="television")
+        first = MemoryPromptGate().select(
+            query, MemoryContext(layer_items=[couch]), {"event_0"},
+        )
+        prompt = MemoryPromptGate(max_chars=len(first.text) + 1)
+        selected = prompt.select(
+            query, MemoryContext(layer_items=[couch, television]),
+            {"event_0", "event_1"},
+        )
+        self.assertEqual(len(selected.layer_items), 1)
+        self.assertEqual(selected.layer_items[0].evidence_refs[0].event_id, "event_0")
+        self.assertEqual(selected.text, first.text)
+        self.assertIn(("event_1", "character_budget"), prompt.last_selection.rejected_records)
 
     def test_retrieval_ranks_before_deduplicating_and_switches_are_independent(self) -> None:
         query = MemoryQuery("Find the sofa", current_step=5)

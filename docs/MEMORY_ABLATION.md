@@ -270,3 +270,25 @@ Each completed group writes exact coverage artifacts and a Pilot marker.
 and seeded Episode-bootstrap 95% intervals. A missing marker, diagnostic step
 or incompatible C/D configuration prevents a complete comparison. RGB and
 unverified traversal claims are not retained as validated physical state.
+
+RGM steps also write `model_input_diagnostic` into `memory_diagnostics.jsonl`.
+It records the Episode and step, the human Prompt hash, Processor token counts
+before and after the length check, the final token count/hash, and the count/hash
+of the `prompt_token_ids` sent to vLLM. `memory_text_present_in_final_tokens` and
+`memory_text_present_in_vllm_prompt` check the decoded token sequences, while
+`accepted_records` links each Prompt Gate evidence ID and line hash to a token
+presence result. `model_visible_evidence_ids` contains only IDs whose rendered
+line survived at the navigation-task insertion point in the vLLM prompt.
+A missing or false token-presence check is not
+evidence that memory reached the model. Compare C and D hashes only at the same
+Episode and step; token hashes do not include the video embeddings. An input
+exceeding the checkpoint's `max_seq_len` now fails before generation instead of
+silently truncating the instruction, memory, or answer boundary.
+`original_instruction_present_in_*` checks the navigation task span and
+`assistant_generation_boundary_present_in_*` checks the token suffix used to
+start the answer; neither is inferred from the sample text alone.
+At step zero, an instruction-matched object tied to an accepted RGB place
+descriptor may be rendered as an uncertain place-object relation. A bare place
+hypothesis still does not pass the step-zero Prompt Gate.
+At later steps, this relation uses the accepted descriptor and object evidence;
+the category-only duplicate threshold does not discard that independent spatial cue.
