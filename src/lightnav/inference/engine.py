@@ -113,6 +113,32 @@ class VLNInferenceEngine:
         self.last_input_diagnostic: dict[str, Any] | None = None
         self._last_vllm_prompt_diagnostics: list[dict[str, Any]] = []
 
+    def _capture_v4_baseline_tokens(self, sample: dict[str, Any]) -> None:
+        """Measure the exact Processor token delta for one V4 augmented sample.
+
+        The baseline is processed through the same chat template and video
+        segments. This costs one extra CPU processor pass on injected V4 steps,
+        but does not run the vision tower or alter model generation.
+        """
+        trace = sample.get("_rgm_trace")
+        if not isinstance(trace, dict) or trace.get("memory_backend") != "rgm_v4":
+            return
+        base_sample = trace.get("_v4_base_sample")
+        if not trace.get("memory_text") or not isinstance(base_sample, dict):
+            return
+        baseline = self.bundle.data_processor.process_sample(
+            base_sample, add_generation_prompt=True, validate_video_shapes=False,
+        )
+        # process_sample retains the training answer placeholder. vLLM receives
+        # only the prompt cut by _prepare_inputs, so compare that exact prefix.
+        ids = self._prepare_inputs(baseline)["input_ids"][0].tolist()
+        trace["baseline_final_token_count"] = len(ids)
+        trace["baseline_final_token_ids_sha256"] = token_ids_sha256(ids)
+        baseline_process = getattr(self.bundle.data_processor, "last_process_diagnostic", None)
+        trace["baseline_processor_truncated"] = bool(
+            baseline_process and baseline_process.get("truncated")
+        )
+
     def _record_input_diagnostic(
         self, sample: dict[str, Any], prompt_ids: list[int],
         process_diagnostic: dict[str, Any] | None,
@@ -120,6 +146,22 @@ class VLNInferenceEngine:
     ) -> None:
         trace = sample.get("_rgm_trace")
         if not isinstance(trace, dict):
+            final_hash = token_ids_sha256(prompt_ids)
+            generic = {
+                "memory_backend": None,
+                "final_token_count": len(prompt_ids),
+                "final_token_ids_sha256": final_hash,
+            }
+            if vllm_diagnostic is not None and "token_ids_sha256" in vllm_diagnostic:
+                generic.update({
+                    "vllm_prompt_token_count": vllm_diagnostic["token_count"],
+                    "vllm_prompt_token_ids_sha256": vllm_diagnostic["token_ids_sha256"],
+                    "vllm_prompt_matches_final_tokens": (
+                        vllm_diagnostic["token_count"] == len(prompt_ids)
+                        and vllm_diagnostic["token_ids_sha256"] == final_hash
+                    ),
+                })
+            self.last_input_diagnostic = generic
             return
         human_prompt = next((
             turn.get("value") for turn in sample.get("conversations", [])
@@ -154,6 +196,23 @@ class VLNInferenceEngine:
                 "literal_model_visible_evidence_ids"
             ],
         }
+        if trace.get("memory_backend") == "rgm_v4":
+            baseline_count = trace.get("baseline_final_token_count")
+            diagnostic.update({
+                "memory_use_mode": trace.get("memory_use_mode"),
+                "original_prompt_sha256": trace.get("original_prompt_sha256"),
+                "injected_prompt_sha256": trace.get("injected_prompt_sha256"),
+                "injected_memory_chars": trace.get("injected_memory_chars", 0),
+                "injected_memory_tokens": (
+                    len(prompt_ids) - baseline_count
+                    if isinstance(baseline_count, int) else 0 if not trace.get("memory_text") else None
+                ),
+                "baseline_final_token_count": baseline_count,
+                "baseline_final_token_ids_sha256": trace.get("baseline_final_token_ids_sha256"),
+                "baseline_processor_truncated": trace.get("baseline_processor_truncated"),
+                "dropped_candidates": trace.get("dropped_candidates", []),
+                "evidence_provenance": trace.get("evidence_provenance", []),
+            })
         if vllm_diagnostic is not None and "token_ids_sha256" in vllm_diagnostic:
             vllm_hash = vllm_diagnostic["token_ids_sha256"]
             matches = (
@@ -351,6 +410,7 @@ class VLNInferenceEngine:
             ),
             None,
         )
+        self._capture_v4_baseline_tokens(sample)
         max_tok = max_new_tokens or self.max_new_tokens
 
         if self.backend == "hf":
@@ -768,10 +828,13 @@ class VLNInferenceEngine:
         self._last_vllm_prompt_diagnostics = []
         for item, prompt in zip(items, prompt_dicts):
             trace = item.trace
-            if not isinstance(trace, dict):
-                self._last_vllm_prompt_diagnostics.append({})
-                continue
             ids = prompt["prompt_token_ids"]
+            if not isinstance(trace, dict):
+                self._last_vllm_prompt_diagnostics.append({
+                    "token_count": len(ids),
+                    "token_ids_sha256": token_ids_sha256(ids),
+                })
+                continue
             checks = memory_token_checks(self.bundle.tokenizer, ids, trace)
             self._last_vllm_prompt_diagnostics.append({
                 "token_count": len(ids),

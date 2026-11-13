@@ -212,6 +212,45 @@ memory, so its traversability status remains `unknown`. Evaluator metrics such
 as `info.success` and oracle distance are excluded from online memory.
 See [RGM_V3.md](RGM_V3.md) for the memory and token-level diagnostic contract.
 
+### RGM V4 selective memory fusion
+
+RGM V4 uses the V3 evidence store and retriever, then updates an explicit
+navigation state and selects only history that can help the current decision.
+It leaves the checkpoint, instruction, RGB frame sequence, processor chat
+template, generation settings, and action decoder unchanged. Enable it with
+`--memory_enabled --memory_strategy hierarchical --memory_layers short,mid,long
+--rgm_v4_enabled`. The Legacy RGM, V3, and V4 switches are mutually exclusive.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--rgm_v4_enabled` | off | Select the independent V4 fusion backend |
+| `--rgm_v4_scope` | `episode_local` | Clear memory after each Episode, or retain observations within a scene using `scene_persistent` |
+| `--rgm_v4_prompt_max_records` | `3` | Maximum complete evidence statements |
+| `--rgm_v4_prompt_max_chars` | `400` | Maximum characters in the whole memory block |
+| `--rgm_v4_revisit_enabled` / `--no-rgm_v4_revisit_enabled` | on | Include or exclude uncertain visual revisit candidates |
+
+Online revisit candidates also require the existing DINO place extractor,
+configured with `--memory_place_enabled --memory_place_model_path <local_path>`.
+Without descriptors, V4 still provides history and progress audits and makes
+no revisit claim.
+
+Pass an explicit, new `--output_dir`, for example
+`output/rgm_v4_pilot_88/`. V4 creates `rgm_v4_protocol.json` with protocol
+`rgm_v4_v1` and rejects a nonempty directory or a mismatched resume. The runner
+and launcher protect the V2 and V3 Pilot directories from reuse. A V4 run does
+not start by setting these flags alone; launch Habitat separately when the
+evaluation environment and selected episodes are ready.
+
+The four use modes are `NONE`, `HISTORY_REFERENCE`, `REVISIT_AUDIT`, and
+`PROGRESS_AUDIT`. `NONE` passes the original Policy sample unchanged. The other
+modes add at most the configured number of source-qualified facts. A visual
+match remains a possible revisit, an issued action remains unverified, and
+unknown traversal is reported as unknown. Diagnostics record the original and
+injected prompt hashes, final Processor token hash, vLLM token hash when used,
+Evidence IDs and Episode/Step provenance, dropped candidates, exact token
+delta, and whether memory actually entered model input. See
+[RGM_V4.md](RGM_V4.md) for the implementation and source mapping.
+
 The underlying `scripts/eval_habitat.sh` also accepts `STRICT_FULL_EVAL=1`
 for the full-split gate, `RESUME=1` to skip existing completed Episodes,
 `EPISODE_MANIFEST_PATH` to create or compare a shared manifest, `SEED` for

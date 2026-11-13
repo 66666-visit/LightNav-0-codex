@@ -27,8 +27,8 @@ from typing import Any, Callable
 import numpy as np
 
 from lightnav.eval_config import get_task_params, load_eval_config, resolve_asset_path
+from lightnav.habitat.experiment_integrity import _key as episode_key
 from lightnav.habitat.experiment_integrity import (
-    _key as episode_key,
     archive_unfinished_diagnostics,
     check_coverage,
     read_jsonl,
@@ -44,7 +44,8 @@ from lightnav.habitat.results import (
     print_vlnce_summary,
 )
 from lightnav.memory.rgm_config import RGMConfig
-from lightnav.memory.v3_config import RGMV3Config, RGM_V3_PROTOCOL_VERSION
+from lightnav.memory.v3_config import RGM_V3_PROTOCOL_VERSION, RGMV3Config
+from lightnav.memory.v4_config import RGM_V4_PROTOCOL_VERSION, RGMV4Config
 from lightnav.serving.protocol import pointing_payload
 from lightnav.serving.token_budget import decode_token_budget, probe_grounding_tokens
 from lightnav.tracking import load_centroids
@@ -77,6 +78,7 @@ class MemoryConfig:
     place_device: str = "cpu"
     rgm: RGMConfig = field(default_factory=RGMConfig)
     rgm_v3: RGMV3Config = field(default_factory=RGMV3Config)
+    rgm_v4: RGMV4Config = field(default_factory=RGMV4Config)
 
     def __post_init__(self) -> None:
         if self.top_k < 1 or self.max_context_chars < 1:
@@ -115,12 +117,16 @@ class MemoryConfig:
             raise ValueError("RGM requires memory_enabled")
         if self.rgm_v3.enabled and not self.enabled:
             raise ValueError("RGM V3 requires memory_enabled")
-        if self.rgm_v3.enabled and self.rgm.enabled:
-            raise ValueError("legacy RGM and RGM V3 cannot run together")
-        if self.rgm_v3.enabled and self.strategy != "hierarchical":
-            raise ValueError("RGM V3 requires hierarchical memory")
-        if self.rgm_v3.enabled and set(self.layers) != {"short", "mid", "long"}:
-            raise ValueError("RGM V3 requires short, mid and long memory layers")
+        if self.rgm_v4.enabled and not self.enabled:
+            raise ValueError("RGM V4 requires memory_enabled")
+        if sum((self.rgm.enabled, self.rgm_v3.enabled, self.rgm_v4.enabled)) > 1:
+            raise ValueError("legacy RGM, RGM V3 and RGM V4 cannot run together")
+        if (self.rgm_v3.enabled or self.rgm_v4.enabled) and self.strategy != "hierarchical":
+            raise ValueError("RGM V3/V4 requires hierarchical memory")
+        if (self.rgm_v3.enabled or self.rgm_v4.enabled) and set(self.layers) != {
+            "short", "mid", "long",
+        }:
+            raise ValueError("RGM V3/V4 requires short, mid and long memory layers")
 
 
 @dataclass
@@ -180,6 +186,8 @@ class HabitatEvalConfig:
             raise ValueError("progress shard index/count are invalid")
         if self.memory.rgm_v3.enabled and self.output_dir == "output/habitat_eval":
             raise ValueError("RGM V3 requires an explicit independent output_dir")
+        if self.memory.rgm_v4.enabled and self.output_dir == "output/habitat_eval":
+            raise ValueError("RGM V4 requires an explicit independent output_dir")
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +415,7 @@ def build_velocity_policy(
             place_similarity_threshold=cfg.memory.place_similarity_threshold,
             rgm_config=cfg.memory.rgm,
             v3_config=cfg.memory.rgm_v3,
+            v4_config=cfg.memory.rgm_v4,
         )
     return TrajVocabVLNCEPolicy(
         engine,
@@ -702,7 +711,11 @@ def _prepare_v3_output_dir(output_dir: str, config: RGMV3Config, *, resume: bool
     """Keep V3 results and scope metadata separate from immutable Pilot outputs."""
     path = Path(output_dir)
     if {"rgm_pilot_88_v1", "rgm_pilot_88_v2"} & set(path.parts):
-        raise ValueError("RGM V3 cannot write inside a legacy RGM Pilot result directory")
+        raise ValueError("RGM V3 cannot reuse a legacy Pilot output directory")
+    if "rgm_v4_pilot_88" in path.parts:
+        raise ValueError("RGM V3 requires an independent output directory")
+    if (path / "rgm_v4_protocol.json").is_file():
+        raise ValueError("RGM V3 cannot write inside a V4 result directory")
     marker = path / "rgm_v3_protocol.json"
     expected = {
         "protocol_version": RGM_V3_PROTOCOL_VERSION,
@@ -724,6 +737,48 @@ def _prepare_v3_output_dir(output_dir: str, config: RGMV3Config, *, resume: bool
     with marker.open("x", encoding="utf-8") as stream:
         json.dump(expected, stream, indent=2)
         stream.write("\n")
+
+
+def _prepare_v4_output_dir(output_dir: str, config: RGMV4Config, *, resume: bool) -> None:
+    """Reserve a new V4 result directory and match its protocol on resume."""
+    path = Path(output_dir)
+    if {"rgm_pilot_88_v1", "rgm_pilot_88_v2", "rgm_v3_pilot_88"} & set(path.parts):
+        raise ValueError("RGM V4 requires an independent output directory")
+    if (path / "rgm_v3_protocol.json").is_file():
+        raise ValueError("RGM V4 cannot write inside a V3 result directory")
+    marker = path / "rgm_v4_protocol.json"
+    expected = {
+        "protocol_version": RGM_V4_PROTOCOL_VERSION,
+        "scope": config.scope,
+        "prompt_max_records": config.prompt_max_records,
+        "prompt_max_chars": config.prompt_max_chars,
+        "revisit_enabled": config.revisit_enabled,
+    }
+    if marker.is_file():
+        if not resume:
+            raise FileExistsError("RGM V4 result directory already has a protocol marker")
+        if json.loads(marker.read_text(encoding="utf-8")) != expected:
+            raise ValueError("RGM V4 resume configuration differs from its protocol marker")
+        return
+    if resume:
+        raise FileNotFoundError("RGM V4 resume requires rgm_v4_protocol.json")
+    if path.exists() and any(path.iterdir()):
+        raise FileExistsError("RGM V4 requires a new empty output directory")
+    path.mkdir(parents=True, exist_ok=True)
+    with marker.open("x", encoding="utf-8") as stream:
+        json.dump(expected, stream, indent=2)
+        stream.write("\n")
+
+
+def _guard_non_v3_v4_output_dir(output_dir: str) -> None:
+    """Prevent Baseline/Legacy runs from reusing reserved V3/V4 results."""
+    path = Path(output_dir)
+    if {"rgm_v3_pilot_88", "rgm_v4_pilot_88"} & set(path.parts):
+        raise ValueError("V3/V4 Pilot results require their matching memory backend")
+    if any((path / name).is_file() for name in (
+        "rgm_v3_protocol.json", "rgm_v4_protocol.json",
+    )):
+        raise ValueError("V3/V4 result directory cannot be reused by another backend")
 
 
 def run_habitat_eval(
@@ -766,6 +821,10 @@ def run_habitat_eval(
     output_dir = cfg.output_dir or "output/habitat_eval"
     if cfg.memory.rgm_v3.enabled:
         _prepare_v3_output_dir(output_dir, cfg.memory.rgm_v3, resume=cfg.resume)
+    elif cfg.memory.rgm_v4.enabled:
+        _prepare_v4_output_dir(output_dir, cfg.memory.rgm_v4, resume=cfg.resume)
+    else:
+        _guard_non_v3_v4_output_dir(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     results_jsonl = os.path.join(output_dir, "results.jsonl")
     diagnostics_jsonl = os.path.join(output_dir, "memory_diagnostics.jsonl")
@@ -928,13 +987,16 @@ def run_habitat_eval(
             instruction = extract_instruction(obs)
             if policy is None:
                 policy = policy_factory(cfg, engine, bundle, info)
-            if (cfg.memory.rgm.enabled or cfg.memory.rgm_v3.enabled) and isinstance(
+            if (cfg.memory.rgm.enabled or cfg.memory.rgm_v3.enabled
+                    or cfg.memory.rgm_v4.enabled) and isinstance(
                 policy, TrajVocabVLNCEPolicy,
             ):
                 # V3 evidence keys already contain the Scene. Avoid nesting it
                 # again in episode_id, which wastes the fixed prompt budget.
                 memory_episode_id = (
-                    str(habitat_ep_id) if cfg.memory.rgm_v3.enabled
+                    str(habitat_ep_id) if (
+                        cfg.memory.rgm_v3.enabled or cfg.memory.rgm_v4.enabled
+                    )
                     else json.dumps([habitat_scene_id, habitat_ep_id], separators=(",", ":"))
                 )
                 policy.reset(

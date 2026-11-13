@@ -498,7 +498,9 @@ class Qwen3VLDataProcessor:
         trace = sample.get("_rgm_trace")
         result = self._apply_max_length(
             result, strict_prompt=(
-                isinstance(trace, dict) and trace.get("memory_backend") == "rgm_v3"
+                isinstance(trace, dict)
+                and trace.get("memory_backend") in {"rgm_v3", "rgm_v4"}
+                and (trace.get("memory_backend") == "rgm_v3" or bool(trace.get("memory_text")))
             ),
         )
         self.last_process_diagnostic["tokens_after_truncation"] = int(result["input_ids"].size(0))
@@ -511,7 +513,7 @@ class Qwen3VLDataProcessor:
 
     def _apply_max_length(self, data: Dict[str, torch.Tensor], *,
                           strict_prompt: bool = True) -> Dict[str, torch.Tensor]:
-        """Report legacy truncation; reject overlong V3 memory prompts."""
+        """Report legacy truncation; reject overlong V3/V4 memory prompts."""
         if self.model_max_length is None:
             return data
 

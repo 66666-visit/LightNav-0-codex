@@ -1,10 +1,11 @@
-"""Coordinate legacy memory or the independent RGM V3 memory backend."""
+"""Coordinate legacy, V3, or selective V4 explicit memory backends."""
 
 from __future__ import annotations
 
 import logging
 import re
 from copy import deepcopy
+from dataclasses import asdict, replace
 from time import perf_counter
 from uuid import uuid4
 
@@ -35,6 +36,15 @@ from lightnav.memory.v3_formatter import V3PromptFormatter
 from lightnav.memory.v3_retrieval import V3Retriever
 from lightnav.memory.v3_schemas import EvidenceRecord
 from lightnav.memory.v3_store import V3MemoryStore
+from lightnav.memory.v4_config import RGMV4Config
+from lightnav.memory.v4_context import (
+    DroppedCandidate,
+    NavigationMemoryContext,
+    build_navigation_memory_context,
+)
+from lightnav.memory.v4_formatter import V4PromptFormatter
+from lightnav.memory.v4_navigation_state import NavigationStateUpdater
+from lightnav.memory.v4_utilization import REVISIT_AUDIT, FrameKey, MemoryUtilizationManager
 from lightnav.memory.working_memory import WorkingMemoryStore
 
 _LAYERS = frozenset({"short", "mid", "long"})
@@ -42,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryManager:
-    """Select one memory backend; V3 scope controls cross-Episode retention."""
+    """Select one memory backend; V3/V4 scopes control Scene retention."""
 
     def __init__(
         self,
@@ -58,6 +68,7 @@ class MemoryManager:
         place_similarity_threshold: float = 0.85,
         rgm_config: RGMConfig | None = None,
         v3_config: RGMV3Config | None = None,
+        v4_config: RGMV4Config | None = None,
     ) -> None:
         if top_k < 0:
             raise ValueError("top_k must be nonnegative")
@@ -86,14 +97,15 @@ class MemoryManager:
         self.place_every_n_steps = place_every_n_steps
         self.rgm_config = rgm_config or RGMConfig()
         self.v3_config = v3_config or RGMV3Config()
-        if self.rgm_config.enabled and self.v3_config.enabled:
-            raise ValueError("legacy RGM and RGM V3 cannot run together")
+        self.v4_config = v4_config or RGMV4Config()
+        if sum((self.rgm_config.enabled, self.v3_config.enabled, self.v4_config.enabled)) > 1:
+            raise ValueError("legacy RGM, RGM V3 and RGM V4 cannot run together")
         if self.rgm_config.enabled and strategy != "hierarchical":
             raise ValueError("RGM requires hierarchical memory")
-        if self.v3_config.enabled and strategy != "hierarchical":
-            raise ValueError("RGM V3 requires hierarchical memory")
-        if self.v3_config.enabled and set(self.layers) != _LAYERS:
-            raise ValueError("RGM V3 requires short, mid and long memory layers")
+        if (self.v3_config.enabled or self.v4_config.enabled) and strategy != "hierarchical":
+            raise ValueError("RGM V3/V4 requires hierarchical memory")
+        if (self.v3_config.enabled or self.v4_config.enabled) and set(self.layers) != _LAYERS:
+            raise ValueError("RGM V3/V4 requires short, mid and long memory layers")
         if self.rgm_config.enabled and self.rgm_config.place_two_stage_enabled and not place_enabled:
             raise ValueError("RGM two-stage place recognition requires place memory")
         self.topology_active = (
@@ -109,9 +121,10 @@ class MemoryManager:
         self.retriever = MemoryRetriever()
         self.fusion = MemoryFusion()
         self.v3_store = (
-            V3MemoryStore(scope=self.v3_config.scope,
+            V3MemoryStore(scope=(self.v4_config.scope if self.v4_config.enabled
+                                 else self.v3_config.scope),
                           place_similarity_threshold=place_similarity_threshold)
-            if self.v3_config.enabled else None
+            if self.v3_config.enabled or self.v4_config.enabled else None
         )
         self.v3_retriever = V3Retriever(self.v3_store) if self.v3_store else None
         self.v3_formatter = (
@@ -120,6 +133,23 @@ class MemoryManager:
                                             self.max_context_chars))
             if self.v3_config.enabled else None
         )
+        self.v4_state_updater = (
+            NavigationStateUpdater(self.v3_store, revisit_enabled=self.v4_config.revisit_enabled)
+            if self.v4_config.enabled else None
+        )
+        self.v4_utilization = MemoryUtilizationManager() if self.v4_config.enabled else None
+        self.v4_formatter = (
+            V4PromptFormatter(max_records=self.v4_config.prompt_max_records,
+                              max_chars=min(self.v4_config.prompt_max_chars,
+                                            self.max_context_chars))
+            if self.v4_config.enabled else None
+        )
+        self.v4_frame_ids_by_step: dict[FrameKey, int] = {}
+        self.last_v4_context: NavigationMemoryContext | None = None
+        self._v4_structured_context: NavigationMemoryContext | None = None
+        self._v4_visible_frame_ids: tuple[int, ...] = ()
+        self._v4_dropped_candidates: list[dict] = []
+        self.last_v4_diagnostic: dict = {}
         self.v3_scene_id: str | None = None
         self.v3_rollout_idx = 0
         self.v3_place_id: str | None = None
@@ -169,6 +199,18 @@ class MemoryManager:
             self.v3_store.begin_episode(
                 self.v3_scene_id, episode_id, instruction, rollout_idx=rollout_idx,
             )
+        if self.v4_state_updater is not None:
+            self.v4_state_updater.reset_episode(
+                self.v3_scene_id, episode_id, instruction, rollout_idx=rollout_idx,
+            )
+            assert self.v4_utilization is not None
+            self.v4_utilization.reset_episode(self.v3_scene_id, episode_id, rollout_idx)
+            self.v4_frame_ids_by_step = {}
+            self.last_v4_context = None
+            self._v4_structured_context = None
+            self._v4_visible_frame_ids = ()
+            self._v4_dropped_candidates = []
+            self.last_v4_diagnostic = {}
         self.extractor.reset_episode(episode_id, instruction)
         if self.topology_active:
             assert self.place_extractor is not None
@@ -242,6 +284,8 @@ class MemoryManager:
                 )
         if self.v3_store is not None:
             self._persist_v3_events(events)
+        if self.v4_state_updater is not None:
+            self.v4_state_updater.update(packet.step_id)
         self._pending_action = None
         self._pending_prediction = None
         return events
@@ -254,9 +298,100 @@ class MemoryManager:
         self._pending_action = deepcopy(action)
         self._pending_prediction = prediction
 
-    def retrieve(self, query: MemoryQuery | None = None) -> MemoryContext:
+    def record_v4_frame_id(self, step: int, frame_id: int) -> None:
+        """Bind one memory Step to the TrackingAgent frame actually observed."""
+        if self.v4_state_updater is None or self.v4_state_updater.state is None:
+            raise RuntimeError("V4 navigation state is not active")
+        state = self.v4_state_updater.state
+        if (type(step) is not int or step != state.last_update_step
+                or type(frame_id) is not int or frame_id < 0):
+            raise ValueError("V4 frame mapping requires the current step and a frame ID")
+        key = (state.scene_id, state.episode_id, state.rollout_idx, step)
+        previous = self.v4_frame_ids_by_step.get(key)
+        if previous is not None and previous != frame_id:
+            raise ValueError("memory step cannot be rebound to another RGB frame")
+        self.v4_frame_ids_by_step[key] = frame_id
+
+    def _record_v4_drops(self, *groups: tuple[DroppedCandidate, ...] | list[DroppedCandidate]) -> None:
+        for group in groups:
+            for item in group:
+                record = asdict(item)
+                if record not in self._v4_dropped_candidates:
+                    self._v4_dropped_candidates.append(record)
+
+    def _v4_history_fallback(
+        self, selected: NavigationMemoryContext, formatted: MemoryContext | None, *,
+        excluded_evidence_ids: frozenset[str] = frozenset(),
+    ) -> tuple[NavigationMemoryContext, MemoryContext | None]:
+        """Try relevant history if a whole revisit statement cannot fit."""
+        if formatted is not None or selected.mode != REVISIT_AUDIT:
+            return selected, formatted
+        assert self._v4_structured_context is not None
+        assert self.v4_utilization is not None and self.v4_formatter is not None
+        assert self.v4_state_updater is not None and self.v4_state_updater.state is not None
+        self.v4_utilization.discard_uninjected_selection()
+        history_only = replace(self._v4_structured_context, revisit_evidence=())
+        fallback = self.v4_utilization.select(
+            history_only, self.v4_state_updater.state,
+            visible_frame_ids=self._v4_visible_frame_ids,
+            frame_ids_by_step=self.v4_frame_ids_by_step,
+        )
+        formatted = self.v4_formatter.format(
+            fallback, excluded_evidence_ids=excluded_evidence_ids,
+        )
+        self._record_v4_drops(fallback.dropped_candidates, self.v4_formatter.last_dropped)
+        return fallback, formatted
+
+    def retrieve(self, query: MemoryQuery | None = None, *,
+                 visible_frame_ids: tuple[int, ...] = ()) -> MemoryContext | None:
         self.working._require_state()
         query = query or self._default_query()
+        if self.v4_config.enabled:
+            assert self.v3_store is not None and self.v3_retriever is not None
+            assert self.v4_state_updater is not None and self.v4_state_updater.state is not None
+            assert self.v4_utilization is not None and self.v4_formatter is not None
+            result = self.v3_retriever.retrieve(
+                scene_id=self.v3_scene_id, instruction=query.instruction,
+                current_step=query.current_step, visual_descriptor=self.v3_descriptor,
+                place_id=self.v3_place_id, episode_id=self.working.state.episode_id,
+                rollout_idx=self.v3_rollout_idx,
+                top_k=max(query.top_k, self.v4_config.prompt_max_records * 3),
+            )
+            structured = build_navigation_memory_context(
+                result, self.v3_store, self.v4_state_updater.state,
+            )
+            self._v4_structured_context = structured
+            self._v4_visible_frame_ids = tuple(visible_frame_ids)
+            self._v4_dropped_candidates = []
+            selected = self.v4_utilization.select(
+                structured, self.v4_state_updater.state,
+                visible_frame_ids=visible_frame_ids,
+                frame_ids_by_step=self.v4_frame_ids_by_step,
+            )
+            formatted = self.v4_formatter.format(selected)
+            self._record_v4_drops(selected.dropped_candidates, self.v4_formatter.last_dropped)
+            attempted_mode = selected.mode
+            selected, formatted = self._v4_history_fallback(selected, formatted)
+            self.last_v4_context = selected
+            if formatted is None and selected.mode != "NONE":
+                self.v4_utilization.discard_uninjected_selection()
+            self.last_v4_diagnostic = {
+                **result.counts,
+                "navigation_progress_status": self.v4_state_updater.state.progress_status,
+                "navigation_uncertainty": self.v4_state_updater.state.uncertainty,
+                "memory_use_mode": selected.mode if formatted is not None else "NONE",
+                "attempted_memory_use_mode": attempted_mode,
+                "retrieval_candidate_memory_ids": list(selected.candidate_memory_ids),
+                "visible_frame_ids": list(visible_frame_ids),
+                "known_step_frame_mappings": len(self.v4_frame_ids_by_step),
+                "selected_evidence_ids": list(dict.fromkeys(
+                    ref.event_id for item in formatted.layer_items for ref in item.evidence_refs
+                )) if formatted is not None else [],
+                "prompt_records_serialized": self.v4_formatter.last_serialized,
+                "prompt_chars": len(formatted.text) if formatted is not None else 0,
+                "dropped_candidates": list(self._v4_dropped_candidates),
+            }
+            return formatted
         if self.v3_store is not None:
             assert self.v3_retriever is not None and self.v3_formatter is not None
             result = self.v3_retriever.retrieve(
@@ -356,8 +491,38 @@ class MemoryManager:
         self.last_layer_results = results
         return results
 
-    def get_context(self, query: MemoryQuery | None = None) -> MemoryContext:
-        return self.retrieve(query)
+    def get_context(self, query: MemoryQuery | None = None, *,
+                    visible_frame_ids: tuple[int, ...] = ()) -> MemoryContext | None:
+        return self.retrieve(query, visible_frame_ids=visible_frame_ids)
+
+    def reformat_v4_context(self, excluded_evidence_ids: frozenset[str]) -> MemoryContext | None:
+        """Retry a V4 token overflow with a whole evidence item removed."""
+        if self.v4_formatter is None or self.last_v4_context is None:
+            raise RuntimeError("no V4 selection available for reformatting")
+        formatted = self.v4_formatter.format(
+            self.last_v4_context, excluded_evidence_ids=excluded_evidence_ids,
+        )
+        self._record_v4_drops(
+            self.last_v4_context.dropped_candidates, self.v4_formatter.last_dropped,
+        )
+        selected, formatted = self._v4_history_fallback(
+            self.last_v4_context, formatted,
+            excluded_evidence_ids=excluded_evidence_ids,
+        )
+        self.last_v4_context = selected
+        self.last_v4_diagnostic.update({
+            "memory_use_mode": selected.mode if formatted is not None else "NONE",
+            "selected_evidence_ids": list(dict.fromkeys(
+                ref.event_id for item in formatted.layer_items for ref in item.evidence_refs
+            )) if formatted is not None else [],
+            "prompt_records_serialized": self.v4_formatter.last_serialized,
+            "prompt_chars": len(formatted.text) if formatted is not None else 0,
+            "dropped_candidates": list(self._v4_dropped_candidates),
+        })
+        if formatted is None:
+            assert self.v4_utilization is not None
+            self.v4_utilization.discard_uninjected_selection()
+        return formatted
 
     def close_episode(self, *, outcome: str = "unknown") -> None:
         """Clear all episode-local records, including staged actions and RGB summary."""
@@ -377,6 +542,13 @@ class MemoryManager:
                 self.v3_descriptor = None
                 self._v3_prior_place_id = None
                 self._v3_pending_descriptors = {}
+            if self.v4_state_updater is not None:
+                self.v4_state_updater.state = None
+                self.v4_frame_ids_by_step = {}
+                self.last_v4_context = None
+                self._v4_structured_context = None
+                self._v4_visible_frame_ids = ()
+                self._v4_dropped_candidates = []
             self._writer = None
             self._pending_action = None
             self._pending_prediction = None

@@ -208,18 +208,56 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/output/habitat_${TASK}_${TS}}
 # shellcheck disable=SC2206
 client_extra_args=($CLIENT_ARGS)
 v3_client_enabled=0
+v4_client_enabled=0
 for token in "${client_extra_args[@]}"; do
     [ "$token" = --rgm_v3_enabled ] && v3_client_enabled=1
+    [ "$token" = --rgm_v4_enabled ] && v4_client_enabled=1
 done
+if [ "$v3_client_enabled" -eq 1 ] && [ "$v4_client_enabled" -eq 1 ]; then
+    echo "$TAG ERROR: RGM V3 and V4 cannot share one run" >&2
+    exit 1
+fi
 if [ "$v3_client_enabled" -eq 1 ]; then
     case "$OUTPUT_ROOT" in
-        */rgm_pilot_88_v1|*/rgm_pilot_88_v1/*|*/rgm_pilot_88_v2|*/rgm_pilot_88_v2/*)
+        */rgm_pilot_88_v1|*/rgm_pilot_88_v1/*|*/rgm_pilot_88_v2|*/rgm_pilot_88_v2/*|*/rgm_v4_pilot_88|*/rgm_v4_pilot_88/*)
             echo "$TAG ERROR: RGM V3 requires an independent output directory" >&2
             exit 1
             ;;
     esac
+    if [ -f "$OUTPUT_ROOT/rgm_v4_protocol.json" ]; then
+        echo "$TAG ERROR: RGM V3 cannot use a V4 result directory" >&2
+        exit 1
+    fi
     if [ -n "$PILOT_MANIFEST_PATH" ]; then
         echo "$TAG ERROR: RGM V3 cannot use a legacy Pilot Manifest" >&2
+        exit 1
+    fi
+fi
+if [ "$v4_client_enabled" -eq 1 ]; then
+    case "$OUTPUT_ROOT" in
+        */rgm_pilot_88_v1|*/rgm_pilot_88_v1/*|*/rgm_pilot_88_v2|*/rgm_pilot_88_v2/*|*/rgm_v3_pilot_88|*/rgm_v3_pilot_88/*)
+            echo "$TAG ERROR: RGM V4 requires an independent output directory" >&2
+            exit 1
+            ;;
+    esac
+    if [ -f "$OUTPUT_ROOT/rgm_v3_protocol.json" ]; then
+        echo "$TAG ERROR: RGM V4 cannot use a V3 result directory" >&2
+        exit 1
+    fi
+    if [ -n "$PILOT_MANIFEST_PATH" ]; then
+        echo "$TAG ERROR: RGM V4 cannot use a legacy Pilot Manifest" >&2
+        exit 1
+    fi
+fi
+if [ "$v3_client_enabled" -eq 0 ] && [ "$v4_client_enabled" -eq 0 ]; then
+    case "$OUTPUT_ROOT" in
+        */rgm_v3_pilot_88|*/rgm_v3_pilot_88/*|*/rgm_v4_pilot_88|*/rgm_v4_pilot_88/*)
+            echo "$TAG ERROR: reserved V3/V4 result directory requires its backend" >&2
+            exit 1
+            ;;
+    esac
+    if [ -f "$OUTPUT_ROOT/rgm_v3_protocol.json" ] || [ -f "$OUTPUT_ROOT/rgm_v4_protocol.json" ]; then
+        echo "$TAG ERROR: V3/V4 result directory cannot be reused by another backend" >&2
         exit 1
     fi
 fi
@@ -254,6 +292,7 @@ from pathlib import Path
 
 from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.v3_config import RGMV3Config
+from lightnav.memory.v4_config import RGMV4Config
 
 env = os.environ
 habitat_config = Path(env["SNAPSHOT_HABITAT_CONFIG"]).resolve()
@@ -297,7 +336,7 @@ for directory in (repo / "src" / "lightnav", repo / "habitat_server" / "lightnav
 bundle = Path(env["SNAPSHOT_ACTION_BUNDLE"]) if env["SNAPSHOT_ACTION_BUNDLE"] else model_path / "action_tokenizer"
 rgm_values = asdict(RGMConfig())
 for index, token in enumerate(tokens):
-    if token.startswith("--rgm_v3_"):
+    if token.startswith(("--rgm_v3_", "--rgm_v4_", "--no-rgm_v4_")):
         continue
     negative = token.startswith("--no-rgm_")
     if not (token.startswith("--rgm_") or negative):
@@ -328,8 +367,24 @@ for index, token in enumerate(tokens):
     else:
         v3_values[name] = type(default)(tokens[index + 1])
 v3_effective = asdict(RGMV3Config(**v3_values))
-if v3_effective["enabled"] and rgm_effective["enabled"]:
-    raise SystemExit("legacy RGM and RGM V3 cannot share one run")
+v4_values = asdict(RGMV4Config())
+for index, token in enumerate(tokens):
+    negative = token.startswith("--no-rgm_v4_")
+    if not (token.startswith("--rgm_v4_") or negative):
+        continue
+    name = token.removeprefix("--no-rgm_v4_" if negative else "--rgm_v4_")
+    if name not in v4_values:
+        raise SystemExit(f"unknown RGM V4 setting in snapshot: {token}")
+    default = v4_values[name]
+    if isinstance(default, bool):
+        v4_values[name] = not negative
+    elif negative or index + 1 >= len(tokens):
+        raise SystemExit(f"missing value for RGM V4 setting: {token}")
+    else:
+        v4_values[name] = type(default)(tokens[index + 1])
+v4_effective = asdict(RGMV4Config(**v4_values))
+if sum((rgm_effective["enabled"], v3_effective["enabled"], v4_effective["enabled"])) > 1:
+    raise SystemExit("legacy RGM, RGM V3 and RGM V4 cannot share one run")
 
 snapshot = {
     "common": {
@@ -373,6 +428,9 @@ snapshot = {
 if v3_effective["enabled"]:
     snapshot["protocol_version"] = v3_effective["protocol_version"]
     snapshot["memory_effective"]["rgm_v3"] = v3_effective
+if v4_effective["enabled"]:
+    snapshot["protocol_version"] = v4_effective["protocol_version"]
+    snapshot["memory_effective"]["rgm_v4"] = v4_effective
 if env["SNAPSHOT_PILOT_MANIFEST"]:
     pilot_path = Path(env["SNAPSHOT_PILOT_MANIFEST"])
     snapshot["pilot_manifest_path"] = str(pilot_path)

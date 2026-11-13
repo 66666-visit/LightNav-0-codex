@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import asdict
+from hashlib import sha256
 from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
@@ -221,6 +223,195 @@ class TrajVocabVLNCEPolicy:
             self._last_executed_action = action
         return action
 
+    def _generate_with_v4_memory(
+        self, obs: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        """Build one unchanged LightNav sample, then selectively add V4 facts."""
+        from lightnav.memory.memory_context_builder import (
+            audit_prompt_injection,
+            build_context_text,
+            inject_memory_context,
+        )
+        from lightnav.memory.schemas import ObservationPacket
+
+        manager = self.memory_manager
+        step = self._memory_step
+        events = manager.observe(ObservationPacket(
+            step_id=step, rgb=obs["rgb"], instruction=self.instruction,
+            last_action=self._last_executed_action, prediction=self._last_prediction,
+        ))
+        self._memory_step += 1
+        # TrackingAgent assigns this ID to the RGB just observed. Keeping the
+        # explicit mapping matters when policy.observe() preloaded other frames.
+        manager.record_v4_frame_id(step, self.agent._history_frame_ids[-1])
+        base_sample = build_vln_traj_sample(
+            self.agent._get_video_tensor(), self.agent.instruction,
+            list(self.agent._history_frame_ids), self.engine.bundle,
+        )
+        visible_frame_ids = tuple(
+            int(frame_id)
+            for segment in base_sample["video_segments"]
+            for frame_id in (segment.get("frame_indices") or ())
+        )
+        context = manager.get_context(visible_frame_ids=visible_frame_ids)
+        budget = min(manager.v4_config.prompt_max_chars, manager.max_context_chars)
+        base_prompt = next(
+            turn["value"] for turn in base_sample["conversations"]
+            if turn.get("from") == "human"
+        )
+        base_hash = sha256(base_prompt.encode("utf-8")).hexdigest()
+        excluded: set[str] = set()
+        overflow_drops: list[dict[str, Any]] = []
+        fallback_reason: str | None = None
+        prompt_audit: dict[str, Any] | None = None
+        memory_text = ""
+        accepted_records: list[dict[str, Any]] = []
+        sample = base_sample
+        started = perf_counter()
+        while True:
+            if context is not None:
+                try:
+                    augmented = inject_memory_context(base_sample, context, max_chars=budget)
+                    prompt_audit = audit_prompt_injection(
+                        base_sample, augmented, context, max_chars=budget,
+                    )
+                    memory_text = build_context_text(context, max_chars=budget)
+                    if not memory_text:
+                        raise ValueError("V4 formatter returned no prompt-safe text")
+                    accepted_records = []
+                    for item in context.layer_items:
+                        line = item.metadata.get("serialized_text")
+                        if not isinstance(line, str) or line not in memory_text:
+                            raise ValueError("V4 evidence text did not match the injected block")
+                        accepted_records.append({
+                            "evidence_ids": list(item.metadata["evidence_ids"]),
+                            "text": line,
+                        })
+                    sample = {
+                        **augmented,
+                        "_rgm_trace": {
+                            "episode_id": manager.working.state.episode_id,
+                            "scene_id": manager.v3_scene_id,
+                            "rollout_idx": manager.v3_rollout_idx,
+                            "memory_backend": "rgm_v4",
+                            "memory_use_mode": manager.last_v4_diagnostic["memory_use_mode"],
+                            "step_id": step,
+                            "original_instruction": self.instruction,
+                            "memory_text": memory_text,
+                            "accepted_records": accepted_records,
+                            "original_prompt_sha256": prompt_audit["base_sha256"],
+                            "injected_prompt_sha256": prompt_audit["augmented_sha256"],
+                            "injected_memory_chars": len(memory_text),
+                            "dropped_candidates": [
+                                *manager.last_v4_diagnostic["dropped_candidates"],
+                                *overflow_drops,
+                            ],
+                            "evidence_provenance": [
+                                source for item in context.layer_items
+                                for source in item.metadata["provenance"]
+                            ],
+                            "_v4_base_sample": base_sample,
+                        },
+                    }
+                except ValueError as exc:
+                    fallback_reason = f"prompt_contract: {exc}"
+                    manager.v4_utilization.discard_uninjected_selection()
+                    context = None
+                    sample = base_sample
+                    prompt_audit = None
+                    memory_text = ""
+                    accepted_records = []
+            try:
+                text, _ = self.engine.generate(sample)
+                break
+            except ValueError as exc:
+                if context is None or "processor input length" not in str(exc):
+                    raise
+                # Drop the longest complete item, then let the formatter try a
+                # later candidate. Never truncate instruction or visual tokens.
+                victim = max(
+                    context.layer_items,
+                    key=lambda item: len(item.metadata["serialized_text"]),
+                )
+                victim_ids = tuple(victim.metadata["evidence_ids"])
+                excluded.update(victim_ids)
+                overflow_drops.append({
+                    "memory_id": victim.metadata["memory_id"],
+                    "evidence_ids": list(victim_ids),
+                    "reason": "processor_token_budget",
+                })
+                context = manager.reformat_v4_context(frozenset(excluded))
+                sample = base_sample
+                prompt_audit = None
+                memory_text = ""
+                accepted_records = []
+                if context is None:
+                    fallback_reason = "all V4 memory items exceeded the Processor token budget"
+        self.last_model_inference_ms = (perf_counter() - started) * 1000.0
+
+        model_input = getattr(self.engine, "last_input_diagnostic", None)
+        checked = isinstance(model_input, dict)
+        block_visible = bool(
+            context is not None and checked
+            and model_input.get("memory_text_present_in_final_tokens") is True
+        )
+        if block_visible and getattr(self.engine, "backend", None) == "vllm_local":
+            block_visible = bool(
+                model_input.get("memory_text_present_in_vllm_prompt") is True
+                and model_input.get("vllm_prompt_matches_final_tokens") is True
+            )
+        visible_ids = list(model_input.get("model_visible_evidence_ids", [])) if block_visible else []
+        active_identity = (manager.working.state.episode_id, manager.v3_rollout_idx)
+        historical_visible_ids = []
+        for evidence_id in visible_ids:
+            record = manager.v3_store.get_evidence(evidence_id)
+            if record is not None and (
+                (record.episode_id, record.rollout_idx) != active_identity or record.step < step
+            ):
+                historical_visible_ids.append(evidence_id)
+        actual_injection = bool(context is not None and block_visible and visible_ids)
+        if context is not None and not actual_injection:
+            manager.v4_utilization.discard_uninjected_selection()
+        v4_diagnostic = dict(manager.last_v4_diagnostic)
+        v4_diagnostic.update({
+            "prompt_hash_before": base_hash,
+            "prompt_hash_after": (
+                prompt_audit["augmented_sha256"] if prompt_audit is not None else base_hash
+            ),
+            "prompt_roundtrip_ok": prompt_audit["roundtrip_ok"] if prompt_audit else True,
+            "sample_identity_is_baseline": sample is base_sample,
+            "memory_use_mode": (
+                manager.last_v4_diagnostic["memory_use_mode"] if context is not None else "NONE"
+            ),
+            "injected_memory_chars": len(memory_text),
+            "injected_memory_tokens": (
+                0 if context is None else
+                model_input.get("injected_memory_tokens") if checked else None
+            ),
+            "final_token_ids_sha256": model_input.get("final_token_ids_sha256") if checked else None,
+            "vllm_prompt_token_ids_sha256": (
+                model_input.get("vllm_prompt_token_ids_sha256") if checked else None
+            ),
+            "actual_injection": actual_injection if checked or context is None else None,
+            "actual_historical_injection": bool(historical_visible_ids)
+            if checked or context is None else None,
+            "injected_evidence_ids": visible_ids,
+            "injected_historical_evidence_ids": historical_visible_ids,
+            "dropped_candidates": [*v4_diagnostic["dropped_candidates"], *overflow_drops],
+            "processor_length_rejections": len(overflow_drops),
+            "prompt_fallback_reason": fallback_reason,
+        })
+        diagnostic = {
+            "episode_id": manager.working.state.episode_id,
+            "memory_backend": "rgm_v4",
+            "rgm_v4_config": asdict(manager.v4_config),
+            "step": step,
+            "events_written": len(events),
+            "v4_diagnostic": v4_diagnostic,
+            "model_input_diagnostic": dict(model_input) if checked else None,
+        }
+        return text, sample, diagnostic
+
     def act(self, obs: dict[str, Any], info: dict[str, Any] | None = None) -> dict:
         """Run one inference step and return a Habitat ``velocity_control`` action dict."""
         self.last_memory_diagnostic = None
@@ -228,9 +419,19 @@ class TrajVocabVLNCEPolicy:
         self.last_prompt_chars = None
         diagnostic: dict[str, Any] | None = None
         self.agent.observe(obs["rgb"])
-        if self._memory_episode_open:
+        v4_enabled = bool(
+            self._memory_episode_open and getattr(
+                getattr(self.memory_manager, "v4_config", None), "enabled", False,
+            )
+        )
+        if v4_enabled:
+            text, sample, diagnostic = self._generate_with_v4_memory(obs)
+            rgm_enabled = False  # V4 diagnostics are finalized in the helper.
+        elif self._memory_episode_open:
             from lightnav.memory.memory_context_builder import (
-                audit_prompt_injection, build_context_text, inject_memory_context,
+                audit_prompt_injection,
+                build_context_text,
+                inject_memory_context,
             )
             from lightnav.memory.schemas import ObservationPacket
 
