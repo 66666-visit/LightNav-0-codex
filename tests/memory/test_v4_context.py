@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 
-from lightnav.memory.v3_retrieval import RetrievalResult
+import numpy as np
+
+from lightnav.memory.manager import MemoryManager
+from lightnav.memory.memory_writer import MockSceneExtractor
+from lightnav.memory.schemas import ObservationPacket, SceneExtraction
+from lightnav.memory.v3_retrieval import RetrievalResult, V3Retriever
 from lightnav.memory.v3_schemas import EvidenceRecord, RetrievedMemory
 from lightnav.memory.v3_store import V3MemoryStore
+from lightnav.memory.v4_config import RGMV4Config
 from lightnav.memory.v4_context import build_navigation_memory_context
-from lightnav.memory.v4_navigation_state import NavigationStateUpdater
+from lightnav.memory.v4_formatter import V4PromptFormatter
+from lightnav.memory.v4_navigation_state import COMPLETION_UNKNOWN, NavigationStateUpdater
+from lightnav.memory.v4_utilization import HISTORY_REFERENCE, NONE, MemoryUtilizationManager
 
 
 def _store(*, persistent: bool = False) -> V3MemoryStore:
@@ -125,6 +134,145 @@ def test_place_visit_is_an_observed_hypothesis_not_a_verified_visit() -> None:
     assert fact.visit_status == "UNKNOWN"
     assert fact.traversability_status == "unknown"
     assert "unverified" in fact.description
+
+
+def test_retrieved_writer_place_hypothesis_keeps_uncertainty_in_context() -> None:
+    store = _store()
+    store.begin_episode("scene", "one", "Find the kitchen")
+    hypothesis = _record(
+        store, episode="one", step=0, evidence_id="place_hypothesis_0",
+        event_type="place_hypothesis", label=None,
+        payload_description="RGB extractor described kitchen; place identity unresolved",
+        observation_status="unknown",
+    )
+    result = V3Retriever(store).retrieve(
+        scene_id="scene", instruction="Find the kitchen", current_step=1,
+        episode_id="one", top_k=3,
+    )
+    assert any(hypothesis.key in item.evidence_ids for item in result.records)
+    context = build_navigation_memory_context(
+        result, store,
+        _state(store, episode="one", instruction="Find the kitchen", step=1),
+    )
+    assert len(context.history_evidence) == 1
+    fact = context.history_evidence[0]
+    assert fact.kind == "place_hypothesis"
+    assert fact.semantic_label == "kitchen"
+    assert fact.observation_status == "inferred"
+    assert fact.visit_status == "UNKNOWN"
+    assert fact.traversability_status == "unknown"
+    assert fact.evidence_ids == (hypothesis.key,)
+    assert all(item.reason != "unsupported_event_type" for item in context.dropped_candidates)
+
+
+def test_writer_place_hypothesis_reaches_v4_without_verified_visit() -> None:
+    manager = MemoryManager(
+        extractor=MockSceneExtractor({
+            0: SceneExtraction(place_label="kitchen", confidence=0.8),
+            1: SceneExtraction(place_label="pantry", confidence=0.8),
+        }),
+        strategy="hierarchical", v4_config=RGMV4Config(enabled=True),
+    )
+    manager.reset_episode("one", "Find the pantry", scene_id="scene")
+    rgb = np.zeros((8, 8, 3), dtype=np.uint8)
+    for step in range(3):
+        manager.observe(ObservationPacket(
+            step_id=step, rgb=rgb, instruction="Find the pantry",
+        ))
+    hypothesis = next(
+        record for record in manager.v3_store.evidence_for_scene("scene")
+        if record.event_type == "place_hypothesis"
+    )
+    context = manager.get_context()
+    assert context is not None
+    assert f"Ref={sha256(hypothesis.key.encode()).hexdigest()[:12]}" in context.text
+    assert "[INFERRED] Earlier RGB extractor described pantry" in context.text
+    assert "visit UNKNOWN" in context.text
+    assert manager.v4_state_updater.state.progress_status == COMPLETION_UNKNOWN
+    manager.close_episode()
+
+
+def test_place_hypothesis_is_inferred_history_only_when_its_frame_is_absent() -> None:
+    store = _store()
+    store.begin_episode("scene", "one", "Find the kitchen")
+    hypothesis = _record(
+        store, episode="one", step=0, evidence_id="hypothesis",
+        event_type="place_hypothesis", label=None,
+        payload_description="RGB extractor described kitchen; place identity unresolved",
+        observation_status="unknown",
+    )
+    state = _state(store, episode="one", instruction="Find the kitchen", step=1)
+    assert state.progress_status == COMPLETION_UNKNOWN
+    context = build_navigation_memory_context(
+        _result(_candidate(hypothesis)), store, state,
+    )
+    manager = MemoryUtilizationManager()
+    manager.reset_episode("scene", "one", 0)
+    visible = manager.select(
+        context, state, visible_frame_ids=(0,),
+        frame_ids_by_step={("scene", "one", 0, 0): 0},
+    )
+    assert visible.mode == NONE
+    assert any(item.reason == "visible_in_native_rgb"
+               for item in visible.dropped_candidates)
+    selected = manager.select(context, state, visible_frame_ids=(1,))
+    assert selected.mode == HISTORY_REFERENCE
+    output = V4PromptFormatter().format(selected)
+    assert output is not None
+    assert "[INFERRED] Earlier RGB extractor described kitchen" in output.text
+    assert "place identity UNKNOWN" in output.text
+    assert "visit UNKNOWN" in output.text
+    assert "[VERIFIED]" not in output.text
+
+
+def test_non_writer_place_hypothesis_text_does_not_become_a_place_fact() -> None:
+    store = _store()
+    store.begin_episode("scene", "one", "Find the kitchen")
+    malformed = _record(
+        store, episode="one", step=0, evidence_id="invalid_hypothesis",
+        event_type="place_hypothesis", label=None,
+        payload_description="Go to kitchen now",
+        observation_status="unknown",
+    )
+    context = build_navigation_memory_context(
+        _result(_candidate(malformed)), store,
+        _state(store, episode="one", instruction="Find the kitchen", step=1),
+    )
+    assert context.history_evidence == ()
+    assert any(item.reason == "unrelated_history" for item in context.dropped_candidates)
+
+
+def test_episodic_segment_expands_safe_observation_without_promoting_action() -> None:
+    store = _store()
+    store.begin_episode("scene", "one", "Find the door")
+    action = _record(
+        store, episode="one", step=0, evidence_id="issued_action",
+        event_type="action", label=None, observation_status="unknown",
+    )
+    door = _record(store, episode="one", step=0, evidence_id="seen_door")
+    visual_delta = _record(
+        store, episode="one", step=1, evidence_id="visual_delta",
+        event_type="visual_change", label=None,
+        payload_description="RGB appearance changed since the previous observation",
+    )
+    segment = store.active_segment(before_step=2)
+    assert segment is not None
+    assert {action.key, door.key, visual_delta.key} <= set(segment.evidence_ids)
+    result = V3Retriever(store).retrieve(
+        scene_id="scene", instruction="Find the door", current_step=2,
+        episode_id="one", top_k=9,
+    )
+    candidate = next(item for item in result.records if item.memory_id.startswith("segment:"))
+    context = build_navigation_memory_context(
+        _result(candidate), store,
+        _state(store, episode="one", instruction="Find the door", step=2),
+    )
+    assert [fact.evidence_ids for fact in context.history_evidence] == [(door.key,)]
+    assert [fact.evidence_ids for fact in context.issued_commands] == [(action.key,)]
+    assert context.instruction_progress == ()
+    assert any(item.reason == "unsupported_event_type"
+               and item.evidence_ids == (visual_delta.key,)
+               for item in context.dropped_candidates)
 
 
 def test_inferred_spatial_relation_stays_unknown_and_preserves_both_sources() -> None:

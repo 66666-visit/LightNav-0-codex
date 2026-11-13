@@ -7,6 +7,7 @@ from lightnav.memory.v4_context import (
     NavigationMemoryContext,
     RevisitEvidence,
 )
+from lightnav.memory.v4_formatter import V4PromptFormatter
 from lightnav.memory.v4_navigation_state import EvidenceProvenance, NavigationState
 from lightnav.memory.v4_utilization import (
     HISTORY_REFERENCE,
@@ -257,3 +258,36 @@ def test_unchanged_context_is_suppressed_until_new_evidence() -> None:
     assert manager.select(_context(first, second), _state()).mode == HISTORY_REFERENCE
     manager.reset_episode("scene", "active", 0)
     assert manager.select(_context(first), _state()).mode == HISTORY_REFERENCE
+
+
+def test_confirmed_injection_filters_old_fact_when_topk_gains_new_fact() -> None:
+    manager = _manager()
+    old = _fact("old-door", step=0)
+    new = _fact("new-door", step=1)
+    first = manager.select(_context(old), _state())
+    assert first.selected_facts == (old,)
+    manager.confirm_injected_evidence(old.evidence_ids)
+    second = manager.select(_context(old, new), _state())
+    assert second.mode == HISTORY_REFERENCE
+    assert second.selected_facts == (new,)
+    assert any(item.reason == "repeated_without_new_evidence"
+               and item.evidence_ids == old.evidence_ids
+               for item in second.dropped_candidates)
+    manager.confirm_injected_evidence(new.evidence_ids)
+    assert manager.select(_context(old, new), _state()).mode == NONE
+
+
+def test_unformatted_topk_change_cannot_reinject_the_same_formatted_fact() -> None:
+    manager = _manager()
+    formatter = V4PromptFormatter(max_records=1)
+    old = _fact("old-door", step=0)
+    filler_a = _fact("filler-a", step=1)
+    filler_b = _fact("filler-b", step=2)
+    first = formatter.format(manager.select(_context(old, filler_a), _state()))
+    assert first is not None
+    assert [ref.event_id for ref in first.layer_items[0].evidence_refs] == ["old-door"]
+    manager.confirm_injected_evidence(["old-door"])
+    second = formatter.format(manager.select(_context(old, filler_b), _state()))
+    assert second is not None
+    assert [ref.event_id for ref in second.layer_items[0].evidence_refs] == ["filler-b"]
+    assert first.text != second.text

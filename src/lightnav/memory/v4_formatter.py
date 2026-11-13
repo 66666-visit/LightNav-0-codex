@@ -28,7 +28,9 @@ from lightnav.memory.v4_utilization import (
 )
 
 _HEADER = "[Navigation Memory]"
-_VISUAL_EVENTS = frozenset({"object_observation", "landmark", "place_visit"})
+_VISUAL_EVENTS = frozenset({
+    "object_observation", "landmark", "place_visit", "place_hypothesis",
+})
 _ISSUED_EVENTS = frozenset({"action", "turn", "issued_command", "prediction"})
 _RELATION_EVENTS = frozenset({
     "inferred_relation", "observed_transition", "spatial_relation",
@@ -66,10 +68,16 @@ def _fact_line(fact: NavigationFact, mode: str) -> str | None:
         return None
 
     if fact.kind in _VISUAL_EVENTS:
-        if fact.observation_status != "observed":
+        expected_status = "inferred" if fact.kind == "place_hypothesis" else "observed"
+        if fact.observation_status != expected_status:
             return None
         label = _clean(fact.semantic_label or "unspecified landmark")
-        if fact.kind == "place_visit":
+        if fact.kind == "place_hypothesis":
+            if not fact.semantic_label:
+                return None
+            claim = (f"[INFERRED] Earlier RGB extractor described {label}; "
+                     "place identity UNKNOWN; visit UNKNOWN")
+        elif fact.kind == "place_visit":
             claim = f"[OBSERVED] Earlier RGB place-label hypothesis: {label}; visit UNKNOWN"
         else:
             claim = f"[OBSERVED] Earlier RGB detector reported {label}; visit UNKNOWN"

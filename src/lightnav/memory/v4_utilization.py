@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from lightnav.memory.v4_context import (
     DroppedCandidate,
@@ -26,6 +26,7 @@ PROGRESS_AUDIT = "PROGRESS_AUDIT"
 
 _VISUAL_EVENTS = frozenset({
     "object_observation", "landmark", "place_observation", "place_visit",
+    "place_hypothesis",
 })
 _PASSAGE_TERMS = frozenset({"through", "pass", "past", "enter", "exit", "cross", "across"})
 _WORDS = re.compile(r"[^\W_]+", re.UNICODE)
@@ -76,17 +77,32 @@ class MemoryUtilizationManager:
         self._episode: tuple[str, str, int] | None = None
         self._last_signatures: dict[str, tuple[tuple[str, ...], ...]] = {}
         self._reserved_mode: str | None = None
+        self._reserved_evidence_ids: set[str] = set()
+        self._injected_evidence_ids: set[str] = set()
 
     def reset_episode(self, scene_id: str, episode_id: str, rollout_idx: int) -> None:
         self._episode = (scene_id, episode_id, rollout_idx)
         self._last_signatures = {}
         self._reserved_mode = None
+        self._reserved_evidence_ids = set()
+        self._injected_evidence_ids = set()
+
+    def confirm_injected_evidence(self, evidence_ids: Iterable[str]) -> None:
+        """Commit only the source IDs verified in final model input."""
+        confirmed = set(evidence_ids)
+        if (self._reserved_mode is None or not confirmed
+                or not confirmed.issubset(self._reserved_evidence_ids)):
+            raise ValueError("injected evidence must belong to the selected V4 context")
+        self._injected_evidence_ids.update(confirmed)
+        self._reserved_mode = None
+        self._reserved_evidence_ids.clear()
 
     def discard_uninjected_selection(self) -> None:
         """Permit a later retry when the chosen text never reached the model."""
         if self._reserved_mode is not None:
             self._last_signatures.pop(self._reserved_mode, None)
             self._reserved_mode = None
+            self._reserved_evidence_ids.clear()
 
     def select(
         self, context: NavigationMemoryContext, state: NavigationState, *,
@@ -111,8 +127,17 @@ class MemoryUtilizationManager:
                     fact.source_memory_id, fact.evidence_ids, "current_observation",
                 ))
                 continue
+            if fact.evidence_ids and set(fact.evidence_ids).issubset(
+                self._injected_evidence_ids
+            ):
+                dropped.append(DroppedCandidate(
+                    fact.source_memory_id, fact.evidence_ids,
+                    "repeated_without_new_evidence",
+                ))
+                continue
             if fact.kind in _VISUAL_EVENTS:
-                if fact.observation_status != "observed":
+                expected_status = "inferred" if fact.kind == "place_hypothesis" else "observed"
+                if fact.observation_status != expected_status:
                     dropped.append(DroppedCandidate(
                         fact.source_memory_id, fact.evidence_ids, "unverified_observation",
                     ))
@@ -140,6 +165,13 @@ class MemoryUtilizationManager:
 
         credible_revisits: list[RevisitEvidence] = []
         for candidate in context.revisit_evidence:
+            if candidate.historical_evidence_ids and set(
+                candidate.historical_evidence_ids
+            ).issubset(self._injected_evidence_ids):
+                dropped.append(DroppedCandidate(
+                    "revisit", _revisit_key(candidate), "repeated_without_new_evidence",
+                ))
+                continue
             if candidate.identity_status != "unknown" or not candidate.instruction_related:
                 dropped.append(DroppedCandidate(
                     "revisit", _revisit_key(candidate), "unrelated_or_overstated_revisit",
@@ -192,6 +224,12 @@ class MemoryUtilizationManager:
             )
             self._last_signatures[mode] = signature
             self._reserved_mode = mode
+            self._reserved_evidence_ids = {
+                evidence_id for fact in candidate_facts for evidence_id in fact.evidence_ids
+            } | {
+                evidence_id for revisit in candidate_revisits
+                for evidence_id in _revisit_key(revisit)
+            }
             break
 
         return replace(

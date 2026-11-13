@@ -317,6 +317,32 @@ def test_slowfast_anchor_keeps_old_rgb_and_suppresses_duplicate_text(monkeypatch
     policy.close_episode()
 
 
+def test_new_evidence_does_not_reinject_an_older_confirmed_fact(monkeypatch):
+    engine, processor, vllm = _engine(monkeypatch)
+    policy, manager = _policy(
+        engine, memory_enabled=True,
+        detections={
+            0: SceneExtraction(objects=["archway"], confidence=0.88),
+            1: SceneExtraction(objects=["archway"], confidence=0.88),
+        },
+    )
+    _reset(policy)
+    _run_steps(policy, 5)
+    records = sorted(
+        (item for item in manager.v3_store.evidence_for_scene("scene_a")
+         if item.semantic_label == "archway"),
+        key=lambda item: item.step,
+    )
+    assert len(records) == 2
+    for record in records:
+        marker = f"Ref={sha256(record.key.encode()).hexdigest()[:12]}"
+        assert sum(marker in processor.tokenizer.decode(
+            prompt["prompt_token_ids"]
+        ) for prompt in vllm.prompts) == 1
+    assert policy.last_memory_diagnostic["v4_diagnostic"]["actual_injection"] is False
+    policy.close_episode()
+
+
 def test_processor_overflow_retries_whole_items_and_keeps_baseline(monkeypatch):
     baseline_engine, _, baseline_vllm = _engine(monkeypatch)
     baseline, _ = _policy(baseline_engine, memory_enabled=False)

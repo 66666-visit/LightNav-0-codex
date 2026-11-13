@@ -370,7 +370,9 @@ class TrajVocabVLNCEPolicy:
             ):
                 historical_visible_ids.append(evidence_id)
         actual_injection = bool(context is not None and block_visible and visible_ids)
-        if context is not None and not actual_injection:
+        if actual_injection:
+            manager.v4_utilization.confirm_injected_evidence(visible_ids)
+        elif context is not None:
             manager.v4_utilization.discard_uninjected_selection()
         v4_diagnostic = dict(manager.last_v4_diagnostic)
         v4_diagnostic.update({

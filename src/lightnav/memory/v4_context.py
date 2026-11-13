@@ -23,7 +23,7 @@ from lightnav.memory.v4_navigation_state import (
 )
 
 _LANDMARK_EVENTS = frozenset({"object_observation", "landmark"})
-_VISUAL_EVENTS = _LANDMARK_EVENTS | {"place_observation", "place_visit"}
+_VISUAL_EVENTS = _LANDMARK_EVENTS | {"place_observation", "place_visit", "place_hypothesis"}
 _ISSUED_EVENTS = frozenset({"action", "turn", "issued_command", "prediction"})
 _RELATION_KINDS = frozenset({
     "inferred_relation", "observed_transition", "verified_traversal",
@@ -110,6 +110,15 @@ def _related(record: EvidenceRecord, state: NavigationState) -> bool:
 
 
 def _semantic_label(record: EvidenceRecord) -> str | None:
+    if record.event_type == "place_hypothesis":
+        description = record.payload.get("description")
+        if isinstance(description, str):
+            match = re.fullmatch(
+                r"RGB extractor described (.+); place identity unresolved", description,
+            )
+            if match:
+                return match.group(1).strip() or None
+        return None
     if record.semantic_label:
         return record.semantic_label.strip()
     if record.event_type == "place_visit":
@@ -137,6 +146,9 @@ def _record_fact(record: EvidenceRecord, memory: RetrievedMemory,
     elif record.event_type == "place_visit":
         description = (f"RGB extractor reported place label {label}; visit unverified"
                        if label else "RGB extractor reported an unresolved place hypothesis")
+    elif record.event_type == "place_hypothesis":
+        description = (f"RGB extractor described {label}; place identity unknown"
+                       if label else "RGB extractor described an unresolved place hypothesis")
     elif record.event_type in _ISSUED_EVENTS:
         description = "Navigation command was issued before a later observation; movement unverified"
     else:
@@ -148,6 +160,7 @@ def _record_fact(record: EvidenceRecord, memory: RetrievedMemory,
         evidence_ids=(record.key,), provenance=(EvidenceProvenance.from_record(record),),
         source_memory_id=memory.memory_id, temporal_role=role,
         observation_status=("unknown" if record.event_type in _ISSUED_EVENTS
+                            else "inferred" if record.event_type == "place_hypothesis"
                             else record.observation_status),
         visit_status="UNKNOWN",
         spatial_status=("unknown" if record.event_type in _ISSUED_EVENTS
