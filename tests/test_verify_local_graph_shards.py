@@ -56,6 +56,32 @@ class VerifyLocalGraphShardsTest(unittest.TestCase):
             verify_local_graph_shards(self.root, ["2", "0"])
         self.assertEqual(marker_path.read_text(), original)
 
+    def test_no_l2_shards_require_distinct_protocol_and_mid_flag(self) -> None:
+        snapshot_path = self.root / "config_snapshot.yaml"
+        snapshot = json.loads(snapshot_path.read_text())
+        ablated = {
+            **self.effective, "mid_enabled": False,
+            "protocol_version": "local_graph_no_l2_v1",
+        }
+        snapshot["protocol_version"] = "local_graph_no_l2_v1"
+        snapshot["local_graph_effective"] = ablated
+        snapshot["memory_effective"]["local_graph_effective"] = ablated
+        snapshot_path.write_text(json.dumps(snapshot))
+        with self.assertRaisesRegex(ValueError, "differs from root snapshot"):
+            verify_local_graph_shards(self.root, ["2", "0"])
+        marker = {key: value for key, value in ablated.items() if key != "enabled"}
+        for index in range(2):
+            (self.root / f"shard_{index}" / "local_graph_protocol.json").write_text(
+                json.dumps(marker)
+            )
+        verify_local_graph_shards(self.root, ["2", "0"])
+
+        snapshot["local_graph_effective"]["mid_enabled"] = True
+        snapshot["memory_effective"]["local_graph_effective"]["mid_enabled"] = True
+        snapshot_path.write_text(json.dumps(snapshot))
+        with self.assertRaisesRegex(ValueError, "invalid Local Graph L2 protocol"):
+            verify_local_graph_shards(self.root, ["2", "0"])
+
 
 if __name__ == "__main__":
     unittest.main()

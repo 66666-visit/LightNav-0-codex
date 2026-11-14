@@ -19,6 +19,7 @@ from lightnav.inference.token_diagnostics import token_ids_sha256
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.manager import MemoryManager
 from lightnav.memory.memory_writer import MockSceneExtractor
+from lightnav.memory.place_recognition import MockPlaceDescriptorExtractor
 from lightnav.memory.schemas import SceneExtraction
 from lightnav.memory.v4_config import RGMV4Config
 from lightnav.memory.v4_navigation_state import COMPLETION_UNKNOWN
@@ -414,6 +415,78 @@ def test_local_graph_card_reaches_vllm_with_original_video_and_action_decoder(mo
     assert _ids(vllm) != _ids(baseline_vllm)
     baseline.close_episode()
     policy.close_episode()
+
+
+def test_local_graph_no_l2_has_exact_same_final_model_input(monkeypatch):
+    arms = {}
+    for mid_enabled in (True, False):
+        engine, processor, vllm = _engine(monkeypatch)
+        manager = MemoryManager(
+            extractor=MockSceneExtractor({
+                0: SceneExtraction(objects=["archway"], confidence=0.88),
+            }),
+            strategy="hierarchical", place_enabled=True,
+            place_extractor=MockPlaceDescriptorExtractor({
+                0: (1, 0), 1: (1, 0), 2: (1, 0),
+            }),
+            place_every_n_steps=1,
+            local_graph_config=LocalGraphConfig(
+                enabled=True, scope="scene_persistent", mid_enabled=mid_enabled,
+            ),
+        )
+        centroids = np.zeros((2, 10, 3), dtype=np.float32)
+        centroids[1, :, 0] = 0.25
+        policy = TrajVocabVLNCEPolicy(
+            engine, centroids, dt=1.0,
+            lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+            num_history_frames=2, memory_enabled=True, memory_manager=manager,
+        )
+        _reset(policy, episode="same_episode")
+        rows = []
+        for step in range(3):
+            action = policy.act({"rgb": np.full((8, 8, 3), step, dtype=np.uint8)})
+            diag = policy.last_memory_diagnostic
+            model_input = engine.last_input_diagnostic
+            rows.append({
+                "action": action,
+                "prompt": policy.last_prompt_text,
+                "memory_text": diag["memory_text"],
+                "actual_injection": diag["actual_injection"],
+                "actual_historical_injection": diag["actual_historical_injection"],
+                "tokens": list(_ids(vllm)),
+                "token_hash": model_input["final_token_ids_sha256"],
+                "video": processor.calls[-1]["videos"][0].clone(),
+                "l2_enabled": diag["l2_enabled"],
+                "mid_memory_records": diag["mid_memory_records"],
+                "mid_candidates": diag["mid_candidates"],
+                "mid_prompt_records": diag["mid_prompt_records"],
+                "short_memory_records": diag["short_memory_records"],
+                "long_memory_nodes": diag["long_memory_nodes"],
+                "long_memory_edges": diag["long_memory_edges"],
+            })
+            if diag["actual_injection"]:
+                assert model_input["memory_text_present_in_final_tokens"] is True
+                assert model_input["memory_text_present_in_vllm_prompt"] is True
+                assert model_input["vllm_prompt_matches_final_tokens"] is True
+            assert rows[-1]["token_hash"] == token_ids_sha256(rows[-1]["tokens"])
+        arms[mid_enabled] = rows
+        policy.close_episode()
+        assert len(manager.v3_store.episodes_for_scene("scene_a")) == int(mid_enabled)
+
+    normal, ablated = arms[True], arms[False]
+    assert "Local history: archway" in normal[1]["memory_text"]
+    assert normal[1]["actual_historical_injection"] is True
+    for a, b in zip(normal, ablated):
+        for key in ("action", "prompt", "memory_text", "actual_injection",
+                    "actual_historical_injection", "tokens", "token_hash",
+                    "mid_prompt_records", "short_memory_records", "long_memory_nodes",
+                    "long_memory_edges"):
+            assert a[key] == b[key]
+        assert torch.equal(a["video"], b["video"])
+        assert a["l2_enabled"] is True and b["l2_enabled"] is False
+        assert b["mid_memory_records"] == 0 and b["mid_candidates"] == 0
+    assert normal[2]["mid_memory_records"] > 0
+    assert normal[2]["mid_candidates"] > 0
 
 
 def test_local_graph_processor_overflow_falls_back_to_exact_baseline_tokens(monkeypatch):

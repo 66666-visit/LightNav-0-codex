@@ -97,7 +97,7 @@ class V3MemoryStore:
     def __init__(self, *, short_capacity: int = 8,
                  place_similarity_threshold: float = 0.85,
                  ambiguity_margin: float = 0.03,
-                 scope: str = "episode_local") -> None:
+                 scope: str = "episode_local", mid_enabled: bool = True) -> None:
         if not isinstance(short_capacity, int) or short_capacity < 1:
             raise ValueError("short_capacity must be positive")
         if not -1.0 <= place_similarity_threshold <= 1.0:
@@ -106,13 +106,17 @@ class V3MemoryStore:
             raise ValueError("ambiguity_margin must be in [0, 2]")
         if scope not in _SCOPES:
             raise ValueError(f"scope must be one of {sorted(_SCOPES)}")
+        if type(mid_enabled) is not bool:
+            raise ValueError("mid_enabled must be boolean")
         self.scope = scope
+        self.mid_enabled = mid_enabled
         self.short_capacity = short_capacity
         self.place_similarity_threshold = place_similarity_threshold
         self.ambiguity_margin = ambiguity_margin
         self._evidence: dict[str, EvidenceRecord] = {}
         self._scene_evidence: dict[str, list[str]] = {}
         self._episodes: dict[tuple[str, str, int], EpisodeMemory] = {}
+        self._closed_episode_ids: set[tuple[str, str, int]] = set()
         self._scene_nodes: dict[str, dict[str, SpatialNodeV3]] = {}
         self._scene_edges: dict[str, dict[tuple[str, str, str], SpatialEdgeV3]] = {}
         self._node_episode_refs: dict[tuple[str, str], set[tuple[str, str, int]]] = {}
@@ -151,7 +155,7 @@ class V3MemoryStore:
         if not isinstance(rollout_idx, int) or rollout_idx < 0:
             raise ValueError("rollout_idx must be a nonnegative integer")
         key = (scene_id, episode_id, rollout_idx)
-        if key in self._episodes:
+        if key in self._episodes or key in self._closed_episode_ids:
             raise ValueError("Episode has already been closed in this store")
         self._active = key
         self._instruction = instruction
@@ -215,6 +219,8 @@ class V3MemoryStore:
         return tuple(deepcopy(self._evidence[key]) for key in self._scene_evidence.get(scene_id, ()))
 
     def episodes_for_scene(self, scene_id: str) -> tuple[EpisodeMemory, ...]:
+        if not self.mid_enabled:
+            return ()
         return tuple(deepcopy(episode) for key, episode in self._episodes.items() if key[0] == scene_id)
 
     def active_segment(self, *, before_step: int) -> EpisodeMemory | None:
@@ -227,6 +233,8 @@ class V3MemoryStore:
             return None
         if not isinstance(before_step, int) or before_step < 0:
             raise ValueError("before_step must be a nonnegative integer")
+        if not self.mid_enabled:
+            return None
         records = [
             self._evidence[key] for key in self._journal
             if self._evidence[key].step < before_step
@@ -470,22 +478,30 @@ class V3MemoryStore:
             return None
         if outcome not in _OUTCOMES:
             raise ValueError(f"outcome must be one of {sorted(_OUTCOMES)}")
-        scene_id, episode_id, rollout_idx = self._active
-        records = [self._evidence[key] for key in self._journal]
-        steps = [record.step for record in records]
-        episode = EpisodeMemory(
-            scene_id=scene_id, episode_id=episode_id, instruction=self._instruction,
-            rollout_idx=rollout_idx,
-            observations=[record.key for record in records if record.event_type not in _ACTION_TYPES],
-            actions=[record.key for record in records if record.event_type in _ACTION_TYPES],
-            transitions=[record.key for record in records if record.event_type in _TRANSITION_TYPES],
-            landmarks=[record.key for record in records if record.event_type in _LANDMARK_TYPES],
-            outcome=outcome,
-            start_step=min(steps, default=0), end_step=max(steps, default=0),
-            evidence_ids=[record.key for record in records],
-        )
-        self._episodes[self._active] = episode
-        self.promoted_records += len(records)
+        episode = None
+        if self.mid_enabled:
+            scene_id, episode_id, rollout_idx = self._active
+            records = [self._evidence[key] for key in self._journal]
+            steps = [record.step for record in records]
+            episode = EpisodeMemory(
+                scene_id=scene_id, episode_id=episode_id, instruction=self._instruction,
+                rollout_idx=rollout_idx,
+                observations=[record.key for record in records
+                              if record.event_type not in _ACTION_TYPES],
+                actions=[record.key for record in records
+                         if record.event_type in _ACTION_TYPES],
+                transitions=[record.key for record in records
+                             if record.event_type in _TRANSITION_TYPES],
+                landmarks=[record.key for record in records
+                           if record.event_type in _LANDMARK_TYPES],
+                outcome=outcome,
+                start_step=min(steps, default=0), end_step=max(steps, default=0),
+                evidence_ids=[record.key for record in records],
+            )
+            self._episodes[self._active] = episode
+            self.promoted_records += len(records)
+        else:
+            self._closed_episode_ids.add(self._active)
         self._active = None
         self._instruction = ""
         self._journal = []
@@ -507,6 +523,7 @@ class V3MemoryStore:
         self._evidence.clear()
         self._scene_evidence.clear()
         self._episodes.clear()
+        self._closed_episode_ids.clear()
         self._scene_nodes.clear()
         self._scene_edges.clear()
         self._node_episode_refs.clear()

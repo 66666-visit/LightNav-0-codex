@@ -551,6 +551,16 @@ class TrajVocabVLNCEPolicy:
             "episode_id": manager.working.state.episode_id,
             "memory_backend": "local_graph",
             "local_graph_config": asdict(manager.local_graph_config),
+            "l2_enabled": manager.local_graph_config.mid_enabled,
+            "mid_memory_records": manager.last_v3_diagnostic["mid_memory_records"],
+            "mid_candidates": manager.last_v3_diagnostic["mid_candidates"],
+            "mid_prompt_records": (
+                sum(item.layer == "mid" for item in context.layer_items)
+                if actual_injection and context is not None else 0
+            ),
+            "short_memory_records": manager.last_v3_diagnostic["short_memory_records"],
+            "long_memory_nodes": manager.last_v3_diagnostic["long_memory_nodes"],
+            "long_memory_edges": manager.last_v3_diagnostic["long_memory_edges"],
             "step": step,
             "events_written": len(events),
             "memory_text": memory_text,

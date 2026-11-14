@@ -46,7 +46,7 @@ from lightnav.habitat.results import (
     print_objectnav_summary,
     print_vlnce_summary,
 )
-from lightnav.memory.local_graph_config import LOCAL_GRAPH_PROTOCOL_VERSION, LocalGraphConfig
+from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.v3_config import RGM_V3_PROTOCOL_VERSION, RGMV3Config
 from lightnav.memory.v4_config import RGM_V4_PROTOCOL_VERSION, RGMV4Config
@@ -856,18 +856,25 @@ def _prepare_local_graph_output_dir(output_dir: str, config: LocalGraphConfig) -
     if {"rgm_pilot_88_v1", "rgm_pilot_88_v2", "rgm_v3_pilot_88",
             "rgm_v4_pilot_88"} & set(path.parts):
         raise ValueError("local graph requires an independent output directory")
+    if (not config.mid_enabled
+            and ("local_graph_fusion_88_run2" in path.parts
+                 or "local_graph_fusion_88_run2" in path.resolve().parts)):
+        raise ValueError("L2 ablation cannot use the original Local Graph 88 result path")
     if path.exists() and any(path.iterdir()):
         raise FileExistsError("local graph requires a new empty output directory")
     path.mkdir(parents=True, exist_ok=True)
     marker = path / "local_graph_protocol.json"
     with marker.open("x", encoding="utf-8") as stream:
-        json.dump({
-            "protocol_version": LOCAL_GRAPH_PROTOCOL_VERSION,
+        marker_config = {
+            "protocol_version": config.protocol_version,
             "scope": config.scope,
             "prompt_max_chars": config.prompt_max_chars,
             "max_landmarks": config.max_landmarks,
             "reactivation_steps": config.reactivation_steps,
-        }, stream, indent=2)
+        }
+        if not config.mid_enabled:
+            marker_config["mid_enabled"] = False
+        json.dump(marker_config, stream, indent=2)
         stream.write("\n")
 
 

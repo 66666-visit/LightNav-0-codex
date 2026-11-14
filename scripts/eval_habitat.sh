@@ -210,6 +210,7 @@ client_extra_args=($CLIENT_ARGS)
 v3_client_enabled=0
 v4_client_enabled=0
 local_graph_client_enabled=0
+local_graph_mid_disabled=0
 rgm_client_enabled=0
 memory_client_enabled=0
 for token in "${client_extra_args[@]}"; do
@@ -218,6 +219,18 @@ for token in "${client_extra_args[@]}"; do
     [ "$token" = --rgm_v3_enabled ] && v3_client_enabled=1
     [ "$token" = --rgm_v4_enabled ] && v4_client_enabled=1
     [ "$token" = --local_graph_enabled ] && local_graph_client_enabled=1
+    case "${token,,}" in
+        --local_graph_mid_enabled=false|--local_graph_mid_enabled=0)
+            local_graph_mid_disabled=1
+            ;;
+    esac
+done
+for ((arg_index = 0; arg_index + 1 < ${#client_extra_args[@]}; arg_index++)); do
+    if [ "${client_extra_args[$arg_index]}" = --local_graph_mid_enabled ]; then
+        case "${client_extra_args[$((arg_index + 1))],,}" in
+            false|0) local_graph_mid_disabled=1 ;;
+        esac
+    fi
 done
 if [ "$local_graph_client_enabled" -eq 1 ]; then
     while [[ "$OUTPUT_ROOT" == */ && "$OUTPUT_ROOT" != / ]]; do
@@ -235,6 +248,14 @@ if [ "$local_graph_client_enabled" -eq 1 ]; then
     if [ "$RESUME" = 1 ]; then
         echo "$TAG ERROR: Local Graph requires a fresh output and cannot resume" >&2
         exit 1
+    fi
+    if [ "$local_graph_mid_disabled" -eq 1 ]; then
+        case "$OUTPUT_ROOT" in
+            */local_graph_fusion_88_run2|*/local_graph_fusion_88_run2/*)
+                echo "$TAG ERROR: L2 ablation cannot use the original Local Graph 88 result path" >&2
+                exit 1
+                ;;
+        esac
     fi
     case "$OUTPUT_ROOT" in
         */rgm_pilot_88_v1|*/rgm_pilot_88_v1/*|*/rgm_pilot_88_v2|*/rgm_pilot_88_v2/*|*/rgm_v3_pilot_88|*/rgm_v3_pilot_88/*|*/rgm_v4_pilot_88|*/rgm_v4_pilot_88/*)
@@ -681,7 +702,8 @@ if [ "$local_graph_client_enabled" -eq 1 ]; then
         echo "$TAG ERROR: Local Graph shard failed; refusing to merge partial results" >&2
         exit 1
     fi
-    "$CLIENT_PYTHON" "$REPO_ROOT/scripts/verify_local_graph_shards.py" \
+    PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+        "$CLIENT_PYTHON" "$REPO_ROOT/scripts/verify_local_graph_shards.py" \
         "$OUTPUT_ROOT" "${GPUS[@]}"
 fi
 PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \

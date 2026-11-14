@@ -36,6 +36,15 @@ def _memory_layers(value: str) -> tuple[str, ...]:
     return layers
 
 
+def _boolean(value: str) -> bool:
+    normalized = value.strip().casefold()
+    if normalized in {"true", "1"}:
+        return True
+    if normalized in {"false", "0"}:
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="lightnav-eval-habitat",
@@ -238,6 +247,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Maximum instruction-related landmarks in one local card.")
     p.add_argument("--local_graph_reactivation_steps", type=int, default=8,
                    help="Earliest step interval for reactivating an unchanged local card.")
+    p.add_argument("--local_graph_mid_enabled", type=_boolean, default=True,
+                   help="Keep L2 episodic indexing and EpisodeMemory; false ablates only L2.")
     for name, default in (
         ("step0_conditional", True), ("write_gate_enabled", True),
         ("retrieval_gate_enabled", True), ("prompt_gate_enabled", True),
@@ -400,6 +411,7 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                 prompt_max_chars=args.local_graph_prompt_max_chars,
                 max_landmarks=args.local_graph_max_landmarks,
                 reactivation_steps=args.local_graph_reactivation_steps,
+                mid_enabled=args.local_graph_mid_enabled,
             ),
         ),
         save_video=args.save_video,

@@ -120,7 +120,9 @@ class MemoryManager:
         )
         self.working = WorkingMemoryStore()
         self.episodic = EpisodicMemory(
-            index_enabled=strategy == "hierarchical" and "mid" in self.layers,
+            index_enabled=(strategy == "hierarchical" and "mid" in self.layers
+                           and (not self.local_graph_config.enabled
+                                or self.local_graph_config.mid_enabled)),
         )
         self.scene_graph = SceneGraph()
         self.semantic_index = SemanticIndex()
@@ -131,7 +133,9 @@ class MemoryManager:
             V3MemoryStore(scope=(self.local_graph_config.scope if self.local_graph_config.enabled
                                  else self.v4_config.scope if self.v4_config.enabled
                                  else self.v3_config.scope),
-                          place_similarity_threshold=place_similarity_threshold)
+                          place_similarity_threshold=place_similarity_threshold,
+                          mid_enabled=(not self.local_graph_config.enabled
+                                       or self.local_graph_config.mid_enabled))
             if (self.v3_config.enabled or self.v4_config.enabled
                 or self.local_graph_config.enabled) else None
         )
@@ -718,6 +722,8 @@ class MemoryManager:
                 self.v3_place_id = node.node_id
                 self._v3_prior_place_id = node.node_id
         self.last_v3_diagnostic = {
+            "l2_enabled": (not self.local_graph_config.enabled
+                           or self.local_graph_config.mid_enabled),
             "events_observed": len(events), "events_parsed": len(events),
             "events_persisted": persisted,
             "short_memory_records": len(self.v3_store.current_short),
@@ -727,6 +733,8 @@ class MemoryManager:
                     before_step=self.working.state.step_id,
                 ) is not None)
             ),
+            "mid_candidates": len(self.episodic.retrieve(self._default_query())),
+            "mid_prompt_records": 0,
             "long_memory_nodes": len(self.v3_store.nodes_for_scene(self.v3_scene_id)),
             "long_memory_edges": len(self.v3_store.edges_for_scene(self.v3_scene_id)),
             "promoted_records": self.v3_store.promoted_records,

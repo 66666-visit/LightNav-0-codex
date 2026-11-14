@@ -116,6 +116,20 @@ class LocalGraphEvalLauncherTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("independent output directory", result.stderr)
 
+    def test_no_l2_rejects_original_88_path_before_writing(self) -> None:
+        original = self.root / "local_graph_fusion_88_run2"
+        for flag in (
+            "--local_graph_mid_enabled false",
+            "--local_graph_mid_enabled=false",
+            "--local_graph_mid_enabled False",
+            "--local_graph_mid_enabled=0",
+        ):
+            with self.subTest(flag=flag):
+                result = self.launch(_LOCAL_ARGS + " " + flag, original)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("original Local Graph 88 result path", result.stderr)
+                self.assertFalse(original.exists())
+
     @unittest.skipUnless(_HAS_RUNTIME, "LightNav runtime dependencies unavailable")
     def test_snapshot_records_actual_local_graph_cli_settings(self) -> None:
         output = self.root / "snapshot"
@@ -129,7 +143,7 @@ class LocalGraphEvalLauncherTest(unittest.TestCase):
         snapshot = json.loads((output / "config_snapshot.yaml").read_text())
         expected = {
             "enabled": True, "scope": "scene_persistent", "prompt_max_chars": 280,
-            "max_landmarks": 3, "reactivation_steps": 12,
+            "max_landmarks": 3, "reactivation_steps": 12, "mid_enabled": True,
             "protocol_version": "local_graph_v1",
         }
         self.assertEqual(snapshot["local_graph_effective"], expected)
@@ -137,6 +151,25 @@ class LocalGraphEvalLauncherTest(unittest.TestCase):
         self.assertEqual(snapshot["protocol_version"], "local_graph_v1")
         self.assertIn("--local_graph_prompt_max_chars=280", snapshot["memory_args"])
         self.assertNotIn("--local_graph_enabled", snapshot["common"]["client_non_memory_args"])
+
+    @unittest.skipUnless(_HAS_RUNTIME, "LightNav runtime dependencies unavailable")
+    def test_no_l2_snapshot_records_only_ablation_as_changed_memory_setting(self) -> None:
+        output = self.root / "no_l2_snapshot"
+        result = self.launch(_LOCAL_ARGS + " --local_graph_mid_enabled false", output)
+        self.assertNotEqual(result.returncode, 0)  # fake server never becomes ready
+        snapshot = json.loads((output / "config_snapshot.yaml").read_text())
+        effective = snapshot["local_graph_effective"]
+        assert effective == {
+            "enabled": True, "scope": "episode_local", "prompt_max_chars": 320,
+            "max_landmarks": 2, "reactivation_steps": 8, "mid_enabled": False,
+            "protocol_version": "local_graph_no_l2_v1",
+        }
+        self.assertEqual(snapshot["protocol_version"], "local_graph_no_l2_v1")
+        self.assertEqual(snapshot["memory_effective"]["local_graph_effective"], effective)
+        self.assertEqual(
+            snapshot["memory_args"][-2:],
+            ["--local_graph_mid_enabled", "false"],
+        )
 
     @unittest.skipUnless(_HAS_RUNTIME, "LightNav runtime dependencies unavailable")
     def test_formal_88_two_gpu_snapshot_keeps_pilot_and_shard_order(self) -> None:

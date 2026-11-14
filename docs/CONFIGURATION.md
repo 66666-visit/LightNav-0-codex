@@ -282,12 +282,18 @@ and is mutually exclusive with `--rgm_enabled`, `--rgm_v3_enabled` and
 | `--local_graph_prompt_max_chars` | `320` | Entire navigation card character budget |
 | `--local_graph_max_landmarks` | `2` | Maximum current/local historical landmark lines |
 | `--local_graph_reactivation_steps` | `8` | Minimum interval before reusing an unchanged card |
+| `--local_graph_mid_enabled true|false` | `true` | Keep L2 episodic index, segments and V3 EpisodeMemory; `false` ablates only L2 while preserving raw events, Evidence and the Local Graph |
 
 The runner requires a new, empty explicit output directory and writes
-`local_graph_protocol.json` (`local_graph_v1`). Current YOLO box position is a
+`local_graph_protocol.json` (`local_graph_v1` normally,
+`local_graph_no_l2_v1` with `--local_graph_mid_enabled false`). The no-L2
+configuration cannot write under `output/local_graph_fusion_88_run2`.
+Current YOLO box position is a
 camera-sector observation; a DINO-linked earlier landmark is labelled as a
 possible revisit with unknown current direction and traversability. The module
 does not infer a route or change the action decoder.
+The Local Graph path does not consume L2 retrieval; see
+[LOCAL_GRAPH_L2_ABLATION.md](research/LOCAL_GRAPH_L2_ABLATION.md).
 
 The underlying `scripts/eval_habitat.sh` also accepts `STRICT_FULL_EVAL=1`
 for the full-split gate, `RESUME=1` to skip existing completed Episodes,
