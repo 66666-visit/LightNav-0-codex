@@ -121,9 +121,11 @@ class VLNInferenceEngine:
         but does not run the vision tower or alter model generation.
         """
         trace = sample.get("_rgm_trace")
-        if not isinstance(trace, dict) or trace.get("memory_backend") != "rgm_v4":
+        if not isinstance(trace, dict) or trace.get("memory_backend") not in {
+            "rgm_v4", "local_graph",
+        }:
             return
-        base_sample = trace.get("_v4_base_sample")
+        base_sample = trace.get("_v4_base_sample") or trace.get("_base_sample")
         if not trace.get("memory_text") or not isinstance(base_sample, dict):
             return
         baseline = self.bundle.data_processor.process_sample(
@@ -196,7 +198,7 @@ class VLNInferenceEngine:
                 "literal_model_visible_evidence_ids"
             ],
         }
-        if trace.get("memory_backend") == "rgm_v4":
+        if trace.get("memory_backend") in {"rgm_v4", "local_graph"}:
             baseline_count = trace.get("baseline_final_token_count")
             diagnostic.update({
                 "memory_use_mode": trace.get("memory_use_mode"),

@@ -19,12 +19,15 @@ import logging
 import math
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+from PIL import Image
 
 from lightnav.eval_config import get_task_params, load_eval_config, resolve_asset_path
 from lightnav.habitat.experiment_integrity import _key as episode_key
@@ -43,6 +46,7 @@ from lightnav.habitat.results import (
     print_objectnav_summary,
     print_vlnce_summary,
 )
+from lightnav.memory.local_graph_config import LOCAL_GRAPH_PROTOCOL_VERSION, LocalGraphConfig
 from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.v3_config import RGM_V3_PROTOCOL_VERSION, RGMV3Config
 from lightnav.memory.v4_config import RGM_V4_PROTOCOL_VERSION, RGMV4Config
@@ -79,6 +83,7 @@ class MemoryConfig:
     rgm: RGMConfig = field(default_factory=RGMConfig)
     rgm_v3: RGMV3Config = field(default_factory=RGMV3Config)
     rgm_v4: RGMV4Config = field(default_factory=RGMV4Config)
+    local_graph: LocalGraphConfig = field(default_factory=LocalGraphConfig)
 
     def __post_init__(self) -> None:
         if self.top_k < 1 or self.max_context_chars < 1:
@@ -119,14 +124,19 @@ class MemoryConfig:
             raise ValueError("RGM V3 requires memory_enabled")
         if self.rgm_v4.enabled and not self.enabled:
             raise ValueError("RGM V4 requires memory_enabled")
-        if sum((self.rgm.enabled, self.rgm_v3.enabled, self.rgm_v4.enabled)) > 1:
-            raise ValueError("legacy RGM, RGM V3 and RGM V4 cannot run together")
-        if (self.rgm_v3.enabled or self.rgm_v4.enabled) and self.strategy != "hierarchical":
-            raise ValueError("RGM V3/V4 requires hierarchical memory")
-        if (self.rgm_v3.enabled or self.rgm_v4.enabled) and set(self.layers) != {
+        if self.local_graph.enabled and not self.enabled:
+            raise ValueError("local graph requires memory_enabled")
+        if sum((self.rgm.enabled, self.rgm_v3.enabled, self.rgm_v4.enabled,
+                self.local_graph.enabled)) > 1:
+            raise ValueError("legacy RGM, RGM V3, RGM V4 and local graph cannot run together")
+        if (self.rgm_v3.enabled or self.rgm_v4.enabled or self.local_graph.enabled
+                ) and self.strategy != "hierarchical":
+            raise ValueError("RGM V3/V4/local graph requires hierarchical memory")
+        if (self.rgm_v3.enabled or self.rgm_v4.enabled or self.local_graph.enabled
+                ) and set(self.layers) != {
             "short", "mid", "long",
         }:
-            raise ValueError("RGM V3/V4 requires short, mid and long memory layers")
+            raise ValueError("RGM V3/V4/local graph requires short, mid and long memory layers")
 
 
 @dataclass
@@ -168,6 +178,7 @@ class HabitatEvalConfig:
     cam_height: float = 0.88  # metres above the floor, as in the yamls
     waypoint_dt_s: float = 0.1  # seconds per waypoint row assumed by the HUD readout only
     record_dir: str = ""
+    trace_steps: bool = False  # single-episode RGB and exact model-input text audit
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     seed: int | None = None
     strict_full_eval: bool = False
@@ -188,6 +199,14 @@ class HabitatEvalConfig:
             raise ValueError("RGM V3 requires an explicit independent output_dir")
         if self.memory.rgm_v4.enabled and self.output_dir == "output/habitat_eval":
             raise ValueError("RGM V4 requires an explicit independent output_dir")
+        if self.memory.local_graph.enabled and self.output_dir == "output/habitat_eval":
+            raise ValueError("local graph requires an explicit independent output_dir")
+        if self.trace_steps and self.episodes != 1:
+            raise ValueError("trace_steps requires episodes=1")
+        if self.trace_steps and self.output_dir == "output/habitat_eval":
+            raise ValueError("trace_steps requires an explicit independent output_dir")
+        if self.trace_steps and self.resume:
+            raise ValueError("trace_steps cannot resume an existing output")
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +435,7 @@ def build_velocity_policy(
             rgm_config=cfg.memory.rgm,
             v3_config=cfg.memory.rgm_v3,
             v4_config=cfg.memory.rgm_v4,
+            local_graph_config=cfg.memory.local_graph,
         )
     return TrajVocabVLNCEPolicy(
         engine,
@@ -707,6 +727,66 @@ def _format_action(action: Any) -> str:
     return str(action)
 
 
+_POINTING_TOKEN_RE = re.compile(
+    r"<(?:apos_\d+|opos_\d+|tpos_\d+|apos|opos|pos_\d+|rotl|rotr|stop|novis)>"
+)
+_RVQ_TOKEN_RE = re.compile(r"<act_l\d+_\d+>")
+
+
+def _trace_pose(info: dict[str, Any]) -> dict[str, Any] | None:
+    """Preserve only pose fields the server actually supplied, without estimating pose."""
+    pose = {
+        key: make_json_safe(info[key])
+        for key in ("agent_pose", "pose", "agent_position", "position", "agent_rotation",
+                    "rotation", "heading")
+        if key in info
+    }
+    return pose or None
+
+
+def _trace_distance(info: dict[str, Any]) -> float | None:
+    distance = _safe_scalar(info.get("distance_to_goal"), default=float("nan"))
+    return distance if math.isfinite(distance) else None
+
+
+def _trace_prompt(policy: Any, *, forced_stop: bool) -> tuple[str | None, str]:
+    if forced_stop:
+        return None, "forced_stop_no_inference"
+    prompt = getattr(policy, "last_prompt_text", None)
+    if isinstance(prompt, str):
+        return prompt, "policy_sample"
+    if getattr(policy, "memory_enabled", False):
+        return None, "unavailable_memory_sample"
+    agent = getattr(policy, "agent", None)
+    engine = getattr(policy, "engine", None)
+    if agent is None or engine is None or not hasattr(engine, "bundle"):
+        return None, "unavailable"
+    from lightnav.inference.samples import build_vln_traj_sample
+
+    sample = build_vln_traj_sample(
+        agent._get_video_tensor(), agent.instruction,
+        list(agent._history_frame_ids), engine.bundle,
+    )
+    prompt = next(
+        (turn.get("value") for turn in sample["conversations"] if turn.get("from") == "human"),
+        None,
+    )
+    return prompt, "reconstructed_baseline_sample" if isinstance(prompt, str) else "unavailable"
+
+
+def _trace_actual_injection(diagnostic: Any, *, memory_enabled: bool) -> bool | None:
+    if not memory_enabled:
+        return False
+    if not isinstance(diagnostic, dict):
+        return None
+    for detail in (
+        diagnostic, diagnostic.get("v4_diagnostic"), diagnostic.get("v3_diagnostic"),
+    ):
+        if isinstance(detail, dict) and isinstance(detail.get("actual_injection"), bool):
+            return detail["actual_injection"]
+    return None
+
+
 def _prepare_v3_output_dir(output_dir: str, config: RGMV3Config, *, resume: bool) -> None:
     """Keep V3 results and scope metadata separate from immutable Pilot outputs."""
     path = Path(output_dir)
@@ -770,13 +850,34 @@ def _prepare_v4_output_dir(output_dir: str, config: RGMV4Config, *, resume: bool
         stream.write("\n")
 
 
+def _prepare_local_graph_output_dir(output_dir: str, config: LocalGraphConfig) -> None:
+    """Reserve an empty result directory for the independent local graph scheme."""
+    path = Path(output_dir)
+    if {"rgm_pilot_88_v1", "rgm_pilot_88_v2", "rgm_v3_pilot_88",
+            "rgm_v4_pilot_88"} & set(path.parts):
+        raise ValueError("local graph requires an independent output directory")
+    if path.exists() and any(path.iterdir()):
+        raise FileExistsError("local graph requires a new empty output directory")
+    path.mkdir(parents=True, exist_ok=True)
+    marker = path / "local_graph_protocol.json"
+    with marker.open("x", encoding="utf-8") as stream:
+        json.dump({
+            "protocol_version": LOCAL_GRAPH_PROTOCOL_VERSION,
+            "scope": config.scope,
+            "prompt_max_chars": config.prompt_max_chars,
+            "max_landmarks": config.max_landmarks,
+            "reactivation_steps": config.reactivation_steps,
+        }, stream, indent=2)
+        stream.write("\n")
+
+
 def _guard_non_v3_v4_output_dir(output_dir: str) -> None:
     """Prevent Baseline/Legacy runs from reusing reserved V3/V4 results."""
     path = Path(output_dir)
     if {"rgm_v3_pilot_88", "rgm_v4_pilot_88"} & set(path.parts):
         raise ValueError("V3/V4 Pilot results require their matching memory backend")
     if any((path / name).is_file() for name in (
-        "rgm_v3_protocol.json", "rgm_v4_protocol.json",
+        "rgm_v3_protocol.json", "rgm_v4_protocol.json", "local_graph_protocol.json",
     )):
         raise ValueError("V3/V4 result directory cannot be reused by another backend")
 
@@ -819,15 +920,28 @@ def run_habitat_eval(
             torch.manual_seed(cfg.seed)
 
     output_dir = cfg.output_dir or "output/habitat_eval"
+    if cfg.trace_steps and Path(output_dir).exists() and any(Path(output_dir).iterdir()):
+        raise FileExistsError("step trace requires a new empty output directory")
     if cfg.memory.rgm_v3.enabled:
         _prepare_v3_output_dir(output_dir, cfg.memory.rgm_v3, resume=cfg.resume)
     elif cfg.memory.rgm_v4.enabled:
         _prepare_v4_output_dir(output_dir, cfg.memory.rgm_v4, resume=cfg.resume)
+    elif cfg.memory.local_graph.enabled:
+        _prepare_local_graph_output_dir(output_dir, cfg.memory.local_graph)
     else:
         _guard_non_v3_v4_output_dir(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     results_jsonl = os.path.join(output_dir, "results.jsonl")
     diagnostics_jsonl = os.path.join(output_dir, "memory_diagnostics.jsonl")
+    trace_jsonl = Path(output_dir) / "step_trace.jsonl"
+    trace_rgb_dir = Path(output_dir) / "rgb"
+    if cfg.trace_steps:
+        existing = [path for path in (trace_jsonl, trace_rgb_dir, Path(results_jsonl))
+                    if path.exists()]
+        if existing:
+            raise FileExistsError(f"step trace requires fresh output paths: {existing}")
+        trace_rgb_dir.mkdir()
+        trace_jsonl.touch(exist_ok=False)
     if cfg.strict_full_eval and not cfg.resume and os.path.exists(results_jsonl):
         raise FileExistsError(
             f"formal output already contains results: {results_jsonl}; use --resume"
@@ -914,6 +1028,8 @@ def run_habitat_eval(
     print(f"  Backend:  {cfg.backend}")
     print(f"  Episodes: {cfg.episodes if cfg.episodes > 0 else 'full split'}")
     print(f"  Output:   {output_dir}")
+    if cfg.trace_steps:
+        print(f"  Step trace: {trace_jsonl} (+ {trace_rgb_dir})")
     lang_filter = set(cfg.languages) if cfg.languages else None
     if lang_filter:
         print(f"  Language filter: {sorted(lang_filter)}")
@@ -988,14 +1104,15 @@ def run_habitat_eval(
             if policy is None:
                 policy = policy_factory(cfg, engine, bundle, info)
             if (cfg.memory.rgm.enabled or cfg.memory.rgm_v3.enabled
-                    or cfg.memory.rgm_v4.enabled) and isinstance(
+                    or cfg.memory.rgm_v4.enabled or cfg.memory.local_graph.enabled) and isinstance(
                 policy, TrajVocabVLNCEPolicy,
             ):
                 # V3 evidence keys already contain the Scene. Avoid nesting it
                 # again in episode_id, which wastes the fixed prompt budget.
                 memory_episode_id = (
                     str(habitat_ep_id) if (
-                        cfg.memory.rgm_v3.enabled or cfg.memory.rgm_v4.enabled
+                    cfg.memory.rgm_v3.enabled or cfg.memory.rgm_v4.enabled
+                    or cfg.memory.local_graph.enabled
                     )
                     else json.dumps([habitat_scene_id, habitat_ep_id], separators=(",", ":"))
                 )
@@ -1035,8 +1152,82 @@ def run_habitat_eval(
                         action = policy.act(obs, info)
                     act_ms = (time.monotonic() - t_act) * 1000.0
                     policy_info: dict[str, Any] = {}
-                    if cfg.verbose or viz is not None:
+                    if cfg.verbose or viz is not None or cfg.trace_steps:
                         policy_info = policy.get_info() if hasattr(policy, "get_info") else {}
+                    trace_row: dict[str, Any] | None = None
+                    if cfg.trace_steps:
+                        # Trace records are evaluator-side only. None of these fields
+                        # are forwarded to policy.act or to the memory manager.
+                        rgb_rel = f"rgb/step_{step:04d}.png"
+                        rgb = np.asarray(obs["rgb"], dtype=np.uint8)
+                        with (Path(output_dir) / rgb_rel).open("xb") as image_file:
+                            Image.fromarray(rgb).save(image_file, format="PNG")
+                        prompt, prompt_source = _trace_prompt(policy, forced_stop=forced_stop)
+                        visible_info = {} if forced_stop else policy_info
+                        raw_text = str(visible_info.get("raw_text", ""))
+                        memory_diagnostic = (
+                            None if forced_stop else getattr(policy, "last_memory_diagnostic", None)
+                        )
+                        memory_text = (
+                            "" if forced_stop else getattr(policy, "last_memory_text", "")
+                        )
+                        actual_injection = _trace_actual_injection(
+                            memory_diagnostic, memory_enabled=cfg.memory.enabled,
+                        )
+                        agent = getattr(policy, "agent", None)
+                        pre_distance = _trace_distance(info)
+                        trace_row = {
+                            "episode_id": episode_id,
+                            "habitat_episode_id": habitat_ep_id,
+                            "scene_id": habitat_scene_id,
+                            "model_path": cfg.model_path,
+                            "action_tokenizer_bundle": cfg.action_tokenizer_bundle,
+                            "decoder_method": getattr(policy, "method", None),
+                            "action_horizon": getattr(policy, "H", None),
+                            "backend": cfg.backend,
+                            "max_new_tokens": cfg.max_new_tokens,
+                            "num_history_frames": getattr(policy, "num_history_frames", None),
+                            "aspect_mode": cfg.aspect_mode,
+                            "max_steps": cfg.max_steps,
+                            "seed": cfg.seed,
+                            "step": step,
+                            "instruction": instruction,
+                            "rgb": rgb_rel,
+                            "rgb_raw_sha256": sha256(rgb.tobytes()).hexdigest(),
+                            "rgb_shape": list(rgb.shape),
+                            "pose_pre": _trace_pose(info),
+                            "distance_to_goal_pre": pre_distance,
+                            "prompt": prompt,
+                            "prompt_source": prompt_source,
+                            "memory_text_in_prompt": memory_text,
+                            "injected_memory_text": (
+                                memory_text if actual_injection is True else
+                                "" if actual_injection is False else None
+                            ),
+                            "actual_memory_injection": actual_injection,
+                            "history_frame_ids": (
+                                list(agent._history_frame_ids) if agent is not None
+                                and hasattr(agent, "_history_frame_ids") else None
+                            ),
+                            "pointing_tokens": _POINTING_TOKEN_RE.findall(raw_text),
+                            "pointing": pointing_payload(
+                                raw_text, width=int(rgb.shape[1]), height=int(rgb.shape[0]),
+                            ),
+                            "rvq_action_tokens": _RVQ_TOKEN_RE.findall(raw_text),
+                            "rvq_codes": visible_info.get("rvq_codes"),
+                            "cluster_id": visible_info.get("cluster_id"),
+                            "raw_output": raw_text,
+                            "decoded_waypoints": visible_info.get("predicted_traj"),
+                            "action_waypoint_index": visible_info.get("action_waypoint_index"),
+                            "action_waypoint": visible_info.get("action_waypoint"),
+                            "decoded_action": action,
+                            "forced_stop": forced_stop,
+                            "act_latency_ms": act_ms,
+                            "memory_diagnostic": memory_diagnostic,
+                            "model_input_diagnostic": (
+                                None if forced_stop else getattr(engine, "last_input_diagnostic", None)
+                            ),
+                        }
                     if cfg.verbose:
                         print(
                             f"    Step {step}: {_format_action(action)}"
@@ -1059,6 +1250,30 @@ def run_habitat_eval(
                             scene_id=str(habitat_scene_id),
                         )
                     obs, _reward, terminated, truncated, info = env.step(action)
+
+                    if trace_row is not None:
+                        post_distance = _trace_distance(info)
+                        pre_distance = trace_row["distance_to_goal_pre"]
+                        trace_row.update({
+                            "pose_post": _trace_pose(info),
+                            "distance_to_goal_post": post_distance,
+                            "distance_delta_m": (
+                                post_distance - pre_distance
+                                if pre_distance is not None and post_distance is not None else None
+                            ),
+                            "distance_increased": (
+                                post_distance > pre_distance + 1e-4
+                                if pre_distance is not None and post_distance is not None else None
+                            ),
+                            # A correct route needs a paired-run or path comparison.
+                            "action_divergence_vs_baseline": None,
+                            "invalid_exploration": None,
+                            "wrong_turn": None,
+                            "terminated": bool(terminated),
+                            "truncated": bool(truncated),
+                        })
+                        with trace_jsonl.open("a", encoding="utf-8") as trace_file:
+                            trace_file.write(json.dumps(make_json_safe(trace_row), ensure_ascii=False) + "\n")
 
                     model_ms = getattr(policy, "last_model_inference_ms", None)
                     if model_ms is not None:

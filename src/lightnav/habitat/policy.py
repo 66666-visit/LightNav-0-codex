@@ -153,6 +153,8 @@ class TrajVocabVLNCEPolicy:
         self.last_memory_diagnostic: dict[str, Any] | None = None
         self.last_model_inference_ms: float | None = None
         self.last_prompt_chars: int | None = None
+        self.last_prompt_text: str | None = None
+        self.last_memory_text: str = ""
 
         self._last_cluster_id: int | None = None
         self._last_rvq_codes: list[int] | None = None
@@ -197,6 +199,8 @@ class TrajVocabVLNCEPolicy:
         self.last_memory_diagnostic = None
         self.last_model_inference_ms = None
         self.last_prompt_chars = None
+        self.last_prompt_text = None
+        self.last_memory_text = ""
         if self._memory_episode_open:
             if outcome is None:
                 self.memory_manager.close_episode()
@@ -215,6 +219,8 @@ class TrajVocabVLNCEPolicy:
         self.last_memory_diagnostic = None
         self.last_model_inference_ms = None
         self.last_prompt_chars = None
+        self.last_prompt_text = None
+        self.last_memory_text = ""
         action = first_waypoint_to_velocity_cmd(
             np.zeros(3, dtype=np.float32), self.dt, self.lin_vel_range, self.ang_vel_range
         )
@@ -414,11 +420,166 @@ class TrajVocabVLNCEPolicy:
         }
         return text, sample, diagnostic
 
+    def _generate_with_local_graph_memory(
+        self, obs: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        """Translate current and one-hop graph evidence into a compact VLN context."""
+        from lightnav.memory.memory_context_builder import (
+            audit_prompt_injection,
+            build_context_text,
+            inject_memory_context,
+        )
+        from lightnav.memory.schemas import MemoryContext, ObservationPacket
+
+        manager = self.memory_manager
+        step = self._memory_step
+        events = manager.observe(ObservationPacket(
+            step_id=step, rgb=obs["rgb"], instruction=self.instruction,
+            last_action=self._last_executed_action, prediction=self._last_prediction,
+        ))
+        self._memory_step += 1
+        base_sample = build_vln_traj_sample(
+            self.agent._get_video_tensor(), self.agent.instruction,
+            list(self.agent._history_frame_ids), self.engine.bundle,
+        )
+        budget = min(manager.local_graph_config.prompt_max_chars, manager.max_context_chars)
+        context = manager.get_local_graph_context(
+            step=step, rgb_width=int(obs["rgb"].shape[1]), events=events,
+        )
+        sample = base_sample
+        memory_text = ""
+        prompt_audit = None
+        fallback_reason = None
+        length_rejections = 0
+        started = perf_counter()
+        while True:
+            if context is not None:
+                try:
+                    augmented = inject_memory_context(base_sample, context, max_chars=budget)
+                    prompt_audit = audit_prompt_injection(
+                        base_sample, augmented, context, max_chars=budget,
+                    )
+                    memory_text = build_context_text(context, max_chars=budget)
+                    accepted = []
+                    for item in context.layer_items:
+                        line = item.metadata["serialized_text"]
+                        if not isinstance(line, str) or line not in memory_text:
+                            raise ValueError("local graph line was not injected whole")
+                        accepted.append({
+                            "evidence_ids": list(item.metadata["evidence_ids"]),
+                            "text": line,
+                        })
+                    if not accepted:
+                        raise ValueError("local graph context has no accepted evidence")
+                    sample = {
+                        **augmented,
+                        "_rgm_trace": {
+                            "episode_id": manager.working.state.episode_id,
+                            "scene_id": manager.v3_scene_id,
+                            "rollout_idx": manager.v3_rollout_idx,
+                            "memory_backend": "local_graph",
+                            "step_id": step,
+                            "original_instruction": self.instruction,
+                            "memory_text": memory_text,
+                            "accepted_records": accepted,
+                            "original_prompt_sha256": prompt_audit["base_sha256"],
+                            "injected_prompt_sha256": prompt_audit["augmented_sha256"],
+                            "injected_memory_chars": len(memory_text),
+                            "evidence_provenance": [
+                                source for item in context.layer_items
+                                for source in item.metadata["provenance"]
+                            ],
+                            "_base_sample": base_sample,
+                        },
+                    }
+                except (KeyError, ValueError) as exc:
+                    fallback_reason = f"prompt_contract: {exc}"
+                    manager.local_graph_fusion.discard_selection()
+                    context = None
+                    sample = base_sample
+                    memory_text = ""
+                    prompt_audit = None
+            try:
+                text, _ = self.engine.generate(sample)
+                break
+            except ValueError as exc:
+                if context is None or "processor input length" not in str(exc):
+                    raise
+                length_rejections += 1
+                remaining = list(context.layer_items)
+                remaining.remove(max(remaining, key=lambda item: len(item.description)))
+                if remaining:
+                    context = MemoryContext(
+                        text=context.text.splitlines()[0] + "\n" + "\n".join(
+                            item.description for item in remaining
+                        ),
+                        layer_items=remaining,
+                    )
+                else:
+                    context = None
+                    manager.local_graph_fusion.discard_selection()
+                    fallback_reason = "all local graph lines exceeded Processor token budget"
+                sample = base_sample
+                memory_text = ""
+                prompt_audit = None
+        self.last_model_inference_ms = (perf_counter() - started) * 1000.0
+        model_input = getattr(self.engine, "last_input_diagnostic", None)
+        checked = isinstance(model_input, dict)
+        block_visible = bool(
+            context is not None and checked
+            and model_input.get("memory_text_present_in_final_tokens") is True
+        )
+        if block_visible and getattr(self.engine, "backend", None) == "vllm_local":
+            block_visible = bool(
+                model_input.get("memory_text_present_in_vllm_prompt") is True
+                and model_input.get("vllm_prompt_matches_final_tokens") is True
+            )
+        visible_ids = list(model_input.get("model_visible_evidence_ids", [])) if block_visible else []
+        actual_injection = bool(context is not None and visible_ids and block_visible)
+        if actual_injection:
+            manager.local_graph_fusion.confirm_injected(visible_ids, step)
+        elif context is not None:
+            manager.local_graph_fusion.discard_selection()
+        historical_ids = [
+            key for key in visible_ids
+            if (record := manager.v3_store.get_evidence(key)) is not None
+            and ((record.episode_id, record.rollout_idx)
+                 != (manager.working.state.episode_id, manager.v3_rollout_idx)
+                 or record.step < step)
+        ]
+        diagnostic = {
+            "episode_id": manager.working.state.episode_id,
+            "memory_backend": "local_graph",
+            "local_graph_config": asdict(manager.local_graph_config),
+            "step": step,
+            "events_written": len(events),
+            "memory_text": memory_text,
+            "actual_injection": actual_injection if checked or context is None else None,
+            "actual_historical_injection": bool(historical_ids)
+            if checked or context is None else None,
+            "injected_evidence_ids": visible_ids,
+            "injected_historical_evidence_ids": historical_ids,
+            "processor_length_rejections": length_rejections,
+            "prompt_fallback_reason": fallback_reason,
+            "prompt_hash_before": (
+                prompt_audit["base_sha256"] if prompt_audit else
+                sha256(base_sample["conversations"][0]["value"].encode()).hexdigest()
+            ),
+            "prompt_hash_after": (
+                prompt_audit["augmented_sha256"] if prompt_audit else
+                sha256(base_sample["conversations"][0]["value"].encode()).hexdigest()
+            ),
+            "model_input_diagnostic": dict(model_input) if checked else None,
+        }
+        return text, sample, diagnostic
+
     def act(self, obs: dict[str, Any], info: dict[str, Any] | None = None) -> dict:
         """Run one inference step and return a Habitat ``velocity_control`` action dict."""
         self.last_memory_diagnostic = None
         self.last_model_inference_ms = None
         self.last_prompt_chars = None
+        self.last_prompt_text = None
+        self.last_memory_text = ""
         diagnostic: dict[str, Any] | None = None
         self.agent.observe(obs["rgb"])
         v4_enabled = bool(
@@ -429,6 +590,9 @@ class TrajVocabVLNCEPolicy:
         if v4_enabled:
             text, sample, diagnostic = self._generate_with_v4_memory(obs)
             rgm_enabled = False  # V4 diagnostics are finalized in the helper.
+        elif self._memory_episode_open and self.memory_manager.local_graph_config.enabled:
+            text, sample, diagnostic = self._generate_with_local_graph_memory(obs)
+            rgm_enabled = False
         elif self._memory_episode_open:
             from lightnav.memory.memory_context_builder import (
                 audit_prompt_injection,
@@ -719,6 +883,14 @@ class TrajVocabVLNCEPolicy:
                 )
             finally:
                 self.last_model_inference_ms = (perf_counter() - started) * 1000.0
+        if self._memory_episode_open:
+            self.last_prompt_text = next(
+                turn["value"] for turn in sample["conversations"]
+                if turn.get("from") == "human"
+            )
+            trace = sample.get("_rgm_trace")
+            if isinstance(trace, dict):
+                self.last_memory_text = str(trace.get("memory_text") or "")
         prompt_chars = getattr(self.engine, "last_prompt_chars", None)
         if isinstance(prompt_chars, int) and prompt_chars >= 0:
             self.last_prompt_chars = prompt_chars

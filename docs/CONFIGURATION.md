@@ -108,6 +108,22 @@ not verified rooms, physical object identities, or traversable connections.
 event, graph, retrieval, per-layer, and injected-prompt diagnostics. See
 [MEMORY_MVP.md](MEMORY_MVP.md) for evidence rules and a one-episode command.
 
+For a single-Episode audit, pass `--episodes 1 --trace_steps --output_dir <fresh-dir>`.
+This writes `<output_dir>/step_trace.jsonl` and the corresponding unmodified
+`<output_dir>/rgb/step_0000.png` frames. Each step records the policy's human
+prompt text (reconstructed with the same sample builder in baseline mode),
+memory text in that prompt, confirmed model-visible memory
+when the token audit can establish it, raw pointing and RVQ token strings,
+decoded waypoints and velocity action, raw RGB pixel checksum, plus evaluator-only pre/post distance
+and pose when the Habitat server supplies one. The bundled R2R server includes
+`agent_pose` (position and quaternion) when simulator state is available;
+otherwise the trace records `null`.
+`action_divergence_vs_baseline`, `invalid_exploration`, and `wrong_turn` remain `null` until matched
+traces are compared with each other and the reference route. The trace never
+feeds evaluator distance or pose into the policy. `--trace_steps` requires
+`--episodes 1`, an explicit output directory, and a fresh trace/results path;
+it cannot be combined with `--resume`.
+
 For formal R2R validation, use [MEMORY_ABLATION.md](MEMORY_ABLATION.md).
 `scripts/run_memory_ablation.sh` requires `MODEL_PATH`, `YOLO_MODEL_PATH`, and
 `DINO_MODEL_PATH` for the four-arm or topology A/B experiment. `--output-root DIR`
@@ -251,6 +267,28 @@ Evidence IDs and Episode/Step provenance, dropped candidates, exact token
 delta, and whether memory actually entered model input. See
 [RGM_V4.md](RGM_V4.md) for the implementation and source mapping.
 
+### Local graph navigation context (independent experiment)
+
+`--local_graph_enabled` selects the frozen-policy, current-view/local-DINO-graph
+memory path described in [MEMORY_DESIGN.md](research/MEMORY_DESIGN.md). It requires
+`--memory_enabled --memory_strategy hierarchical --memory_layers short,mid,long`
+and is mutually exclusive with `--rgm_enabled`, `--rgm_v3_enabled` and
+`--rgm_v4_enabled`. Supply the same YOLO/DINO model paths as the V4 comparison.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--local_graph_enabled` | off | Enable the independent local graph context |
+| `--local_graph_scope` | `episode_local` | Clear evidence each Episode, or retain it in the same Scene with `scene_persistent` |
+| `--local_graph_prompt_max_chars` | `320` | Entire navigation card character budget |
+| `--local_graph_max_landmarks` | `2` | Maximum current/local historical landmark lines |
+| `--local_graph_reactivation_steps` | `8` | Minimum interval before reusing an unchanged card |
+
+The runner requires a new, empty explicit output directory and writes
+`local_graph_protocol.json` (`local_graph_v1`). Current YOLO box position is a
+camera-sector observation; a DINO-linked earlier landmark is labelled as a
+possible revisit with unknown current direction and traversability. The module
+does not infer a route or change the action decoder.
+
 The underlying `scripts/eval_habitat.sh` also accepts `STRICT_FULL_EVAL=1`
 for the full-split gate, `RESUME=1` to skip existing completed Episodes,
 `EPISODE_MANIFEST_PATH` to create or compare a shared manifest, `SEED` for
@@ -261,6 +299,16 @@ truncate. Its matching client flags are `--strict_full_eval`, `--resume`,
 selection to the Habitat server as `--pilot-manifest`; the integrity gate
 checks exact selected IDs and writes `pilot_complete.json`. The ordinary
 defaults remain available for smoke tests.
+
+For one R2R Episode, the Habitat server accepts `--single-scene-id <path>` and
+`--single-episode-id <id>` together. They select exactly one loaded `val_unseen`
+Episode by canonical scene path and full ID before iteration, and reject pilot,
+strict full evaluation or sharding. The server also reports `agent_pose`
+(`position` and quaternion) in `info` when simulator state is available; this
+is evaluator-side trace data and is not passed into the memory packet. Resolve
+the two IDs from a manifest and the dataset with
+`scripts/resolve_single_episode.py`; see
+[EPISODE1_EXPERIMENT.md](research/EPISODE1_EXPERIMENT.md).
 
 `lightnav-eval-habitat` reports Episode progress from the server's loaded
 manifest. `--progress_shard_index` and `--progress_shard_count` label direct

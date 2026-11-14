@@ -10,6 +10,8 @@ from time import perf_counter
 from uuid import uuid4
 
 from lightnav.memory.episodic_memory import EpisodicMemory
+from lightnav.memory.local_graph_config import LocalGraphConfig
+from lightnav.memory.local_graph_fusion import LocalGraphFusion
 from lightnav.memory.memory_fusion import MemoryFusion
 from lightnav.memory.memory_prompt_gate import MemoryPromptGate
 from lightnav.memory.memory_retrieval_gate import MemoryRetrievalGate
@@ -69,6 +71,7 @@ class MemoryManager:
         rgm_config: RGMConfig | None = None,
         v3_config: RGMV3Config | None = None,
         v4_config: RGMV4Config | None = None,
+        local_graph_config: LocalGraphConfig | None = None,
     ) -> None:
         if top_k < 0:
             raise ValueError("top_k must be nonnegative")
@@ -98,14 +101,18 @@ class MemoryManager:
         self.rgm_config = rgm_config or RGMConfig()
         self.v3_config = v3_config or RGMV3Config()
         self.v4_config = v4_config or RGMV4Config()
-        if sum((self.rgm_config.enabled, self.v3_config.enabled, self.v4_config.enabled)) > 1:
-            raise ValueError("legacy RGM, RGM V3 and RGM V4 cannot run together")
+        self.local_graph_config = local_graph_config or LocalGraphConfig()
+        if sum((self.rgm_config.enabled, self.v3_config.enabled,
+                self.v4_config.enabled, self.local_graph_config.enabled)) > 1:
+            raise ValueError("legacy RGM, RGM V3, RGM V4 and local graph cannot run together")
         if self.rgm_config.enabled and strategy != "hierarchical":
             raise ValueError("RGM requires hierarchical memory")
-        if (self.v3_config.enabled or self.v4_config.enabled) and strategy != "hierarchical":
-            raise ValueError("RGM V3/V4 requires hierarchical memory")
-        if (self.v3_config.enabled or self.v4_config.enabled) and set(self.layers) != _LAYERS:
-            raise ValueError("RGM V3/V4 requires short, mid and long memory layers")
+        if (self.v3_config.enabled or self.v4_config.enabled
+                or self.local_graph_config.enabled) and strategy != "hierarchical":
+            raise ValueError("RGM V3/V4/local graph requires hierarchical memory")
+        if (self.v3_config.enabled or self.v4_config.enabled
+                or self.local_graph_config.enabled) and set(self.layers) != _LAYERS:
+            raise ValueError("RGM V3/V4/local graph requires short, mid and long memory layers")
         if self.rgm_config.enabled and self.rgm_config.place_two_stage_enabled and not place_enabled:
             raise ValueError("RGM two-stage place recognition requires place memory")
         self.topology_active = (
@@ -121,10 +128,12 @@ class MemoryManager:
         self.retriever = MemoryRetriever()
         self.fusion = MemoryFusion()
         self.v3_store = (
-            V3MemoryStore(scope=(self.v4_config.scope if self.v4_config.enabled
+            V3MemoryStore(scope=(self.local_graph_config.scope if self.local_graph_config.enabled
+                                 else self.v4_config.scope if self.v4_config.enabled
                                  else self.v3_config.scope),
                           place_similarity_threshold=place_similarity_threshold)
-            if self.v3_config.enabled or self.v4_config.enabled else None
+            if (self.v3_config.enabled or self.v4_config.enabled
+                or self.local_graph_config.enabled) else None
         )
         self.v3_retriever = V3Retriever(self.v3_store) if self.v3_store else None
         self.v3_formatter = (
@@ -143,6 +152,10 @@ class MemoryManager:
                               max_chars=min(self.v4_config.prompt_max_chars,
                                             self.max_context_chars))
             if self.v4_config.enabled else None
+        )
+        self.local_graph_fusion = (
+            LocalGraphFusion(self.local_graph_config)
+            if self.local_graph_config.enabled else None
         )
         self.v4_frame_ids_by_step: dict[FrameKey, int] = {}
         self.last_v4_context: NavigationMemoryContext | None = None
@@ -211,6 +224,10 @@ class MemoryManager:
             self._v4_visible_frame_ids = ()
             self._v4_dropped_candidates = []
             self.last_v4_diagnostic = {}
+        if self.local_graph_fusion is not None:
+            self.local_graph_fusion.reset_episode(
+                self.v3_scene_id, episode_id, rollout_idx,
+            )
         self.extractor.reset_episode(episode_id, instruction)
         if self.topology_active:
             assert self.place_extractor is not None
@@ -495,6 +512,20 @@ class MemoryManager:
                     visible_frame_ids: tuple[int, ...] = ()) -> MemoryContext | None:
         return self.retrieve(query, visible_frame_ids=visible_frame_ids)
 
+    def get_local_graph_context(self, *, step: int, rgb_width: int,
+                                events: list[MemoryEvent]) -> MemoryContext | None:
+        """Build a local navigation card from current RGB and scene evidence."""
+        if self.local_graph_fusion is None or self.v3_store is None:
+            raise RuntimeError("local graph memory is not active")
+        return self.local_graph_fusion.build(
+            self.v3_store, scene_id=self.v3_scene_id,
+            episode_id=self.working.state.episode_id,
+            rollout_idx=self.v3_rollout_idx, step=step,
+            instruction=self.working.state.instruction,
+            current_place_id=self.v3_place_id,
+            rgb_width=rgb_width, events=events,
+        )
+
     def reformat_v4_context(self, excluded_evidence_ids: frozenset[str]) -> MemoryContext | None:
         """Retry a V4 token overflow with a whole evidence item removed."""
         if self.v4_formatter is None or self.last_v4_context is None:
@@ -549,6 +580,8 @@ class MemoryManager:
                 self._v4_structured_context = None
                 self._v4_visible_frame_ids = ()
                 self._v4_dropped_candidates = []
+            if self.local_graph_fusion is not None:
+                self.local_graph_fusion.close_episode()
             self._writer = None
             self._pending_action = None
             self._pending_prediction = None

@@ -137,6 +137,8 @@ class VLNCEEnv(BaseHabitatEnv):
         seed: Optional[int] = None,
         strict_full_eval: bool = False,
         pilot_manifest_path: Optional[str] = None,
+        single_scene_id: Optional[str] = None,
+        single_episode_id: Optional[str] = None,
     ):
         """
         Args:
@@ -154,7 +156,20 @@ class VLNCEEnv(BaseHabitatEnv):
             early_stop_rotation: Force STOP once ``distance_to_goal`` has been unchanged for
                 more than this many consecutive steps. 0 disables.
             early_stop_steps: Force STOP once more than this many steps were taken. 0 disables.
+            single_scene_id / single_episode_id: Select exactly one loaded val_unseen Episode
+                by canonical scene-file identity and its Habitat episode ID.
         """
+        if (single_scene_id is None) != (single_episode_id is None):
+            raise ValueError("single_scene_id and single_episode_id must be provided together")
+        if single_scene_id is not None and (
+            not single_scene_id or not single_episode_id or strict_full_eval
+            or pilot_manifest_path or split_id is not None or split_num is not None
+            or split not in (None, "val_unseen")
+        ):
+            raise ValueError(
+                "single-Episode selection requires val_unseen without pilot, "
+                "strict full evaluation, or sharding"
+            )
         self.data_path = data_path
         self.scenes_dir = scenes_dir
         self.split = split
@@ -162,6 +177,8 @@ class VLNCEEnv(BaseHabitatEnv):
         self.seed = seed
         self.strict_full_eval = strict_full_eval
         self.pilot_manifest_path = pilot_manifest_path
+        self.single_scene_id = single_scene_id
+        self.single_episode_id = single_episode_id
         self.habitat_time_step: Optional[float] = None
         self.lin_vel_range: Optional[Tuple[float, float]] = None
         self.ang_vel_range: Optional[Tuple[float, float]] = None
@@ -320,6 +337,27 @@ class VLNCEEnv(BaseHabitatEnv):
         env.episodes = selected
         logger.info("Pilot selected %d/%d loaded episodes before sharding", len(selected), len(available))
 
+    def _apply_single_episode_selection(self, env: Any) -> None:
+        """Rebuild the Habitat iterator with exactly the requested loaded Episode."""
+        if self.single_scene_id is None:
+            return
+        if self.split != "val_unseen":
+            raise ValueError("single-Episode selection requires the val_unseen dataset split")
+        wanted = (_normalize_pilot_scene_id(self.single_scene_id), self.single_episode_id)
+        available = list(env.episodes)
+        selected = [
+            ep for ep in available
+            if (_normalize_pilot_scene_id(str(ep.scene_id)), str(ep.episode_id)) == wanted
+        ]
+        if len(selected) != 1:
+            raise ValueError(
+                f"Single Episode must match exactly one loaded val_unseen Episode: "
+                f"scene_id={self.single_scene_id!r}, episode_id={self.single_episode_id!r}, "
+                f"matches={len(selected)}"
+            )
+        env.episodes = selected
+        logger.info("Single Episode selected 1/%d loaded episodes: %s", len(available), wanted)
+
     def _create_habitat_env(self) -> Any:
         try:
             import habitat
@@ -406,6 +444,7 @@ class VLNCEEnv(BaseHabitatEnv):
             logger.warning(f"Could not summarize dataset size: {e}")
 
         self._apply_pilot_selection(env)
+        self._apply_single_episode_selection(env)
         self._apply_episode_split(env)
         return env
 

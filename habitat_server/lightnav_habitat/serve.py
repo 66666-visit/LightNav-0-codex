@@ -14,7 +14,6 @@ import os
 from typing import Any, Dict, Optional
 
 from .objectnav import ObjectNavEnv
-from .remote_server import RemoteEnvServer
 from .vlnce import VLNCEEnv
 
 _ENV_CLASSES = {
@@ -86,6 +85,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fixed evaluator-only Episode selection; filter before GPU sharding",
     )
     parser.add_argument(
+        "--single-scene-id", default=None,
+        help="Exact scene file identity for a single val_unseen Episode",
+    )
+    parser.add_argument(
+        "--single-episode-id", default=None,
+        help="Episode ID within --single-scene-id; requires both single-Episode flags",
+    )
+    parser.add_argument(
         "--success-distance",
         type=float,
         default=None,
@@ -125,6 +132,17 @@ def main(argv: Optional[list] = None) -> None:
         parser.error("formal R2R evaluation requires vlnce val_unseen, 500 steps, no early stop")
     if args.pilot_manifest and (args.task != "vlnce" or not args.strict_full_eval):
         parser.error("--pilot-manifest requires strict VLN-CE evaluation")
+    if (args.single_scene_id is None) != (args.single_episode_id is None):
+        parser.error("--single-scene-id and --single-episode-id must be provided together")
+    if args.single_scene_id is not None and (
+        not args.single_scene_id or not args.single_episode_id
+        or args.task != "vlnce" or args.strict_full_eval or args.pilot_manifest
+        or args.split_id is not None or args.split not in (None, "val_unseen")
+    ):
+        parser.error(
+            "single-Episode selection requires vlnce val_unseen without pilot, "
+            "strict-full-eval, or sharding"
+        )
 
     logging.basicConfig(
         level=logging.INFO,
@@ -165,6 +183,8 @@ def main(argv: Optional[list] = None) -> None:
         kwargs["seed"] = args.seed
         kwargs["strict_full_eval"] = args.strict_full_eval
         kwargs["pilot_manifest_path"] = args.pilot_manifest
+        kwargs["single_scene_id"] = args.single_scene_id
+        kwargs["single_episode_id"] = args.single_episode_id
 
     logger.info("Starting Habitat server")
     logger.info("task=%s config=%s port=%d gpu=%d", args.task, args.config, args.port, gpu_id)
@@ -178,6 +198,7 @@ def main(argv: Optional[list] = None) -> None:
     # Register the dataset loaders and measures with habitat's registry before the
     # environment (and therefore habitat.Env) is built.
     from . import objectnav_extensions, vlnce_extensions  # noqa: F401
+    from .remote_server import RemoteEnvServer
 
     env_cls = _ENV_CLASSES[args.task]
     env = env_cls(config_path=args.config, **kwargs)

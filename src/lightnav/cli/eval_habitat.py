@@ -15,6 +15,7 @@ import os
 import sys
 
 from lightnav.habitat.runner import HabitatEvalConfig, MemoryConfig, run_habitat_eval
+from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.v3_config import RGMV3Config
 from lightnav.memory.v4_config import RGMV4Config
@@ -60,6 +61,12 @@ def build_parser() -> argparse.ArgumentParser:
         "env truncate instead (default: force STOP at --max_steps).",
     )
     p.add_argument("--output_dir", default=_DEFAULTS.output_dir)
+    p.add_argument(
+        "--trace_steps", action="store_true",
+        help="For --episodes 1, save each RGB frame and an evaluator-side step_trace.jsonl "
+        "with the human prompt text, injected memory, model tokens and decoded action; "
+        "requires a fresh explicit output directory.",
+    )
     p.add_argument(
         "--seed", type=int, default=_DEFAULTS.seed,
         help="Set the client inference random seed; server seed is set separately.",
@@ -221,6 +228,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Maximum characters in the V4 memory block.")
     p.add_argument("--rgm_v4_revisit_enabled", action=argparse.BooleanOptionalAction,
                    default=True, help="Audit DINO visual revisit candidates in V4.")
+    p.add_argument("--local_graph_enabled", action="store_true",
+                   help="Enable independent local graph navigation context.")
+    p.add_argument("--local_graph_scope", choices=("episode_local", "scene_persistent"),
+                   default="episode_local", help="Local graph online memory scope.")
+    p.add_argument("--local_graph_prompt_max_chars", type=int, default=320,
+                   help="Maximum characters in a local graph navigation card.")
+    p.add_argument("--local_graph_max_landmarks", type=int, default=2,
+                   help="Maximum instruction-related landmarks in one local card.")
+    p.add_argument("--local_graph_reactivation_steps", type=int, default=8,
+                   help="Earliest step interval for reactivating an unchanged local card.")
     for name, default in (
         ("step0_conditional", True), ("write_gate_enabled", True),
         ("retrieval_gate_enabled", True), ("prompt_gate_enabled", True),
@@ -309,6 +326,7 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
         max_steps=args.max_steps,
         force_stop_at_max_steps=not args.no_force_stop,
         output_dir=args.output_dir,
+        trace_steps=args.trace_steps,
         languages=args.languages,
         traj_vocab_path=args.traj_vocab_path,
         K=args.K,
@@ -377,6 +395,12 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                 prompt_max_chars=args.rgm_v4_prompt_max_chars,
                 revisit_enabled=args.rgm_v4_revisit_enabled,
             ),
+            local_graph=LocalGraphConfig(
+                enabled=args.local_graph_enabled, scope=args.local_graph_scope,
+                prompt_max_chars=args.local_graph_prompt_max_chars,
+                max_landmarks=args.local_graph_max_landmarks,
+                reactivation_steps=args.local_graph_reactivation_steps,
+            ),
         ),
         save_video=args.save_video,
         video_fps=args.video_fps,
@@ -397,11 +421,11 @@ def main(argv: list[str] | None = None) -> int:
     raw_args = sys.argv[1:] if argv is None else argv
     parser = build_parser()
     args = parser.parse_args(raw_args)
-    if (args.rgm_v3_enabled or args.rgm_v4_enabled) and not any(
+    if (args.rgm_v3_enabled or args.rgm_v4_enabled or args.local_graph_enabled) and not any(
         token == "--output_dir" or token.startswith("--output_dir=")
         for token in raw_args
     ):
-        parser.error("RGM V3/V4 requires an explicit --output_dir for a new result directory")
+        parser.error("RGM V3/V4/local graph requires an explicit --output_dir")
     run_habitat_eval(config_from_args(args))
     return 0
 

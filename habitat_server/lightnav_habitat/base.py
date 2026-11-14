@@ -130,6 +130,21 @@ class BaseHabitatEnv(ABC):
             if raw_episode_id is not None:
                 info["raw_episode_id"] = raw_episode_id
 
+        try:
+            state = self._habitat_env.sim.get_agent_state()
+            position = state.position
+            rotation = state.rotation
+            info["agent_pose"] = {
+                "position": [float(value) for value in position],
+                "rotation": [
+                    float(rotation.w), float(rotation.x),
+                    float(rotation.y), float(rotation.z),
+                ],
+            }
+        except (AttributeError, TypeError, ValueError):
+            # Metadata only: custom test environments may not expose a simulator state.
+            pass
+
         if hasattr(self._habitat_env, "get_metrics"):
             info.update(self._habitat_env.get_metrics())
 

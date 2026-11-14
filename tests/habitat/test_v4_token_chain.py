@@ -16,6 +16,7 @@ from lightnav.habitat.policy import TrajVocabVLNCEPolicy
 from lightnav.inference.engine import VLNInferenceEngine
 from lightnav.inference.policies import NavigationPolicy
 from lightnav.inference.token_diagnostics import token_ids_sha256
+from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.manager import MemoryManager
 from lightnav.memory.memory_writer import MockSceneExtractor
 from lightnav.memory.schemas import SceneExtraction
@@ -369,6 +370,84 @@ def test_processor_overflow_retries_whole_items_and_keeps_baseline(monkeypatch):
     assert policy.last_memory_diagnostic["v4_diagnostic"]["actual_injection"] is False
     assert any("budget" in item["reason"] or "token" in item["reason"]
                for item in policy.last_memory_diagnostic["v4_diagnostic"]["dropped_candidates"])
+    assert engine.bundle.data_processor.last_process_diagnostic["truncated"] is False
+    baseline.close_episode()
+    policy.close_episode()
+
+
+def test_local_graph_card_reaches_vllm_with_original_video_and_action_decoder(monkeypatch):
+    baseline_engine, baseline_processor, baseline_vllm = _engine(monkeypatch)
+    baseline, _ = _policy(baseline_engine, memory_enabled=False)
+    _reset(baseline)
+    _run_steps(baseline, 1)
+
+    engine, processor, vllm = _engine(monkeypatch)
+    manager = MemoryManager(
+        extractor=MockSceneExtractor({
+            0: SceneExtraction(objects=["archway"], confidence=0.88),
+        }),
+        strategy="hierarchical",
+        local_graph_config=LocalGraphConfig(enabled=True),
+    )
+    centroids = np.zeros((2, 10, 3), dtype=np.float32)
+    centroids[1, :, 0] = 0.25
+    policy = TrajVocabVLNCEPolicy(
+        engine, centroids, dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        num_history_frames=2, memory_enabled=True, memory_manager=manager,
+    )
+    _reset(policy)
+    _run_steps(policy, 1)
+
+    diagnostic = policy.last_memory_diagnostic
+    model_input = engine.last_input_diagnostic
+    assert diagnostic["memory_backend"] == "local_graph"
+    assert diagnostic["actual_injection"] is True
+    assert model_input["memory_text_present_in_final_tokens"] is True
+    assert model_input["memory_text_present_in_vllm_prompt"] is True
+    assert model_input["vllm_prompt_matches_final_tokens"] is True
+    assert model_input["injected_memory_tokens"] > 0
+    assert "Current RGB: instruction landmark archway" in processor.tokenizer.decode(_ids(vllm))
+    assert "<navigation_task>Find the archway</navigation_task>" in policy.last_prompt_text
+    assert torch.equal(processor.calls[-1]["videos"][0], baseline_processor.calls[-1]["videos"][0])
+    assert policy.get_info()["raw_text"] == baseline.get_info()["raw_text"]
+    assert _ids(vllm) != _ids(baseline_vllm)
+    baseline.close_episode()
+    policy.close_episode()
+
+
+def test_local_graph_processor_overflow_falls_back_to_exact_baseline_tokens(monkeypatch):
+    baseline_engine, _, baseline_vllm = _engine(monkeypatch)
+    baseline, _ = _policy(baseline_engine, memory_enabled=False)
+    _reset(baseline)
+    _run_steps(baseline, 1)
+    baseline_ids = list(_ids(baseline_vllm))
+    baseline_full_len = baseline_engine.bundle.data_processor.last_process_diagnostic[
+        "tokens_before_truncation"
+    ]
+
+    engine, _, vllm = _engine(monkeypatch, max_seq_len=baseline_full_len + 8)
+    manager = MemoryManager(
+        extractor=MockSceneExtractor({
+            0: SceneExtraction(objects=["archway"], confidence=0.88),
+        }),
+        strategy="hierarchical",
+        local_graph_config=LocalGraphConfig(enabled=True),
+    )
+    centroids = np.zeros((2, 10, 3), dtype=np.float32)
+    centroids[1, :, 0] = 0.25
+    policy = TrajVocabVLNCEPolicy(
+        engine, centroids, dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        num_history_frames=2, memory_enabled=True, memory_manager=manager,
+    )
+    _reset(policy)
+    _run_steps(policy, 1)
+
+    assert _ids(vllm) == baseline_ids
+    assert policy.last_memory_diagnostic["processor_length_rejections"] == 1
+    assert policy.last_memory_diagnostic["actual_injection"] is False
+    assert policy.last_memory_diagnostic["memory_text"] == ""
     assert engine.bundle.data_processor.last_process_diagnostic["truncated"] is False
     baseline.close_episode()
     policy.close_episode()

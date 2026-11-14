@@ -1241,3 +1241,67 @@ def test_force_stop_does_not_fire_when_the_policy_stops_earlier(tmp_path):
         engine_factory=lambda c: (object(), SimpleNamespace(action_method="flat", num_history_frames=4)),
     )
     assert len(env.actions) == 2 and results[0]["forced_stop"] is False
+
+
+def test_single_episode_trace_records_model_input_and_evaluator_state(tmp_path):
+    class PoseEnv(FakeEnv):
+        def _base_info(self):
+            info = super()._base_info()
+            info["agent_pose"] = {
+                "position": [float(self._step), 0.0, 0.0],
+                "rotation": [1.0, 0.0, 0.0, 0.0],
+            }
+            return info
+
+    class TracedPolicy(FakePolicy):
+        last_prompt_text = "full prompt with original instruction and local context"
+        last_memory_text = "local context"
+        last_memory_diagnostic = {"actual_injection": True}
+
+        def get_info(self):
+            return {
+                "raw_text": "<apos_5><opos_0><act_l0_3><act_l1_2>",
+                "rvq_codes": [3, 2],
+                "cluster_id": 3,
+                "predicted_traj": np.array([[0.2, 0.0, 0.1]], dtype=np.float32),
+                "action_waypoint_index": 0,
+                "action_waypoint": np.array([0.2, 0.0, 0.1], dtype=np.float32),
+            }
+
+    cfg = _cfg(tmp_path, episodes=1, trace_steps=True, memory=MemoryConfig(enabled=True))
+    env = PoseEnv(steps_to_terminate=2)
+    policy = TracedPolicy()
+    run_habitat_eval(
+        cfg,
+        env_factory=lambda c: env,
+        policy_factory=lambda c, e, b, i: policy,
+        engine_factory=lambda c: (object(), SimpleNamespace(action_method="rvq")),
+    )
+
+    output = Path(cfg.output_dir)
+    rows = _read_jsonl(output / "step_trace.jsonl")
+    assert len(rows) == 2
+    assert (output / rows[0]["rgb"]).is_file()
+    assert rows[0]["prompt"] == policy.last_prompt_text
+    assert rows[0]["injected_memory_text"] == policy.last_memory_text
+    assert rows[0]["actual_memory_injection"] is True
+    assert rows[0]["pointing_tokens"] == ["<apos_5>", "<opos_0>"]
+    assert rows[0]["rvq_action_tokens"] == ["<act_l0_3>", "<act_l1_2>"]
+    assert rows[0]["rvq_codes"] == [3, 2]
+    assert rows[0]["pose_pre"]["agent_pose"]["position"] == [0.0, 0.0, 0.0]
+    assert rows[0]["pose_post"]["agent_pose"]["position"] == [1.0, 0.0, 0.0]
+    assert rows[0]["distance_to_goal_pre"] == 5.0
+    assert rows[0]["distance_to_goal_post"] == 4.0
+    assert rows[0]["memory_diagnostic"] == {"actual_injection": True}
+    assert rows[0]["action_divergence_vs_baseline"] is None
+    before = (output / "step_trace.jsonl").read_bytes()
+    with pytest.raises(FileExistsError, match="step trace requires fresh"):
+        run_habitat_eval(cfg)
+    assert (output / "step_trace.jsonl").read_bytes() == before
+
+
+def test_step_trace_requires_one_episode_and_fresh_output(tmp_path):
+    with pytest.raises(ValueError, match="episodes=1"):
+        _cfg(tmp_path, episodes=2, trace_steps=True)
+    with pytest.raises(ValueError, match="cannot resume"):
+        _cfg(tmp_path, episodes=1, trace_steps=True, resume=True)
