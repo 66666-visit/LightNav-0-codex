@@ -226,6 +226,9 @@ def test_persistent_local_history_keeps_episode_provenance() -> None:
     {"scope": "global"}, {"prompt_max_chars": 0},
     {"max_landmarks": True}, {"reactivation_steps": -1},
     {"protocol_version": "rgm_v4_v1"},
+    {"fusion_mode": "unknown"},
+    {"fusion_mode": "spatial", "protocol_version": "local_graph_v1"},
+    {"neighbor_radius_m": 0}, {"neighbor_radius_m": float("nan")},
 ])
 def test_invalid_config_is_rejected(kwargs: dict) -> None:
     with pytest.raises(ValueError):

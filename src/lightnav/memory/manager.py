@@ -12,6 +12,7 @@ from uuid import uuid4
 from lightnav.memory.episodic_memory import EpisodicMemory
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.local_graph_fusion import LocalGraphFusion
+from lightnav.memory.local_graph_spatial import SpatialLocalGraphFusion
 from lightnav.memory.memory_fusion import MemoryFusion
 from lightnav.memory.memory_prompt_gate import MemoryPromptGate
 from lightnav.memory.memory_retrieval_gate import MemoryRetrievalGate
@@ -32,6 +33,7 @@ from lightnav.memory.schemas import (
     PlaceDecision,
 )
 from lightnav.memory.semantic_index import SemanticIndex
+from lightnav.memory.spatial_geometry import HABITAT_WORLD_FRAME, AgentPose
 from lightnav.memory.topological_memory import PlaceObservationResult, TopologicalMemory
 from lightnav.memory.v3_config import RGMV3Config
 from lightnav.memory.v3_formatter import V3PromptFormatter
@@ -154,9 +156,12 @@ class MemoryManager:
             if self.v4_config.enabled else None
         )
         self.local_graph_fusion = (
-            LocalGraphFusion(self.local_graph_config)
+            (SpatialLocalGraphFusion(self.local_graph_config)
+             if self.local_graph_config.fusion_mode == "spatial"
+             else LocalGraphFusion(self.local_graph_config))
             if self.local_graph_config.enabled else None
         )
+        self._current_agent_pose: AgentPose | None = None
         self.v4_frame_ids_by_step: dict[FrameKey, int] = {}
         self.last_v4_context: NavigationMemoryContext | None = None
         self._v4_structured_context: NavigationMemoryContext | None = None
@@ -200,6 +205,7 @@ class MemoryManager:
                       *, scene_id: str | None = None, rollout_idx: int = 0) -> None:
         """Begin an Episode; V3 retains prior Scene history only when configured."""
         self.close_episode()
+        self._current_agent_pose = None
         episode_id = episode_id or uuid4().hex
         if self.v3_store is not None:
             # Callers without a scene identity must remain isolated by Episode.
@@ -251,7 +257,8 @@ class MemoryManager:
             extraction_observer=self.write_gate.record_extraction if self.write_gate else None,
         )
 
-    def observe(self, packet: ObservationPacket) -> list[MemoryEvent]:
+    def observe(self, packet: ObservationPacket, *,
+                agent_pose: AgentPose | None = None) -> list[MemoryEvent]:
         """Consume one real RGB observation and the action that preceded it.
 
         ``record_action`` records a command chosen by the policy. It is only
@@ -259,6 +266,13 @@ class MemoryManager:
         This keeps commands from a failed ``env.step`` out of episodic memory.
         """
         writer = self._require_writer()
+        if agent_pose is not None:
+            if (not self.local_graph_config.enabled
+                    or self.local_graph_config.fusion_mode != "spatial"):
+                raise ValueError("agent_pose is only accepted by spatial local graph memory")
+            if (agent_pose.scene_id != self.v3_scene_id
+                    or agent_pose.frame_id != HABITAT_WORLD_FRAME):
+                raise ValueError("agent_pose differs from active Habitat Scene/frame")
         action = packet.last_action if packet.last_action is not None else self._pending_action
         prediction = packet.prediction if packet.prediction is not None else self._pending_prediction
         safe_packet = ObservationPacket(
@@ -300,7 +314,9 @@ class MemoryManager:
                     if self.rgm_config.enabled else events,
                 )
         if self.v3_store is not None:
-            self._persist_v3_events(events)
+            self._persist_v3_events(events, agent_pose=agent_pose,
+                                    observation_step=packet.step_id)
+        self._current_agent_pose = agent_pose
         if self.v4_state_updater is not None:
             self.v4_state_updater.update(packet.step_id)
         self._pending_action = None
@@ -517,13 +533,15 @@ class MemoryManager:
         """Build a local navigation card from current RGB and scene evidence."""
         if self.local_graph_fusion is None or self.v3_store is None:
             raise RuntimeError("local graph memory is not active")
+        kwargs = ({"current_pose": self._current_agent_pose}
+                  if self.local_graph_config.fusion_mode == "spatial" else {})
         return self.local_graph_fusion.build(
             self.v3_store, scene_id=self.v3_scene_id,
             episode_id=self.working.state.episode_id,
             rollout_idx=self.v3_rollout_idx, step=step,
             instruction=self.working.state.instruction,
             current_place_id=self.v3_place_id,
-            rgb_width=rgb_width, events=events,
+            rgb_width=rgb_width, events=events, **kwargs,
         )
 
     def reformat_v4_context(self, excluded_evidence_ids: frozenset[str]) -> MemoryContext | None:
@@ -582,6 +600,7 @@ class MemoryManager:
                 self._v4_dropped_candidates = []
             if self.local_graph_fusion is not None:
                 self.local_graph_fusion.close_episode()
+            self._current_agent_pose = None
             self._writer = None
             self._pending_action = None
             self._pending_prediction = None
@@ -641,7 +660,9 @@ class MemoryManager:
         finally:
             self.last_place_extraction_ms = (perf_counter() - started) * 1000.0
 
-    def _persist_v3_events(self, events: list[MemoryEvent]) -> None:
+    def _persist_v3_events(self, events: list[MemoryEvent], *,
+                           agent_pose: AgentPose | None = None,
+                           observation_step: int | None = None) -> None:
         """Write every valid observed event with a Scene/Episode-qualified key."""
         assert self.v3_store is not None and self.v3_scene_id is not None
         instruction = self.working.state.instruction
@@ -656,6 +677,13 @@ class MemoryManager:
             label = (event.description.removeprefix("Observed ").strip()
                      if is_detection else None)
             payload = {"description": event.description}
+            observed_from_pose = (
+                agent_pose is not None and event.step_id == observation_step
+                and (is_detection or event.kind == "place_observation")
+            )
+            if observed_from_pose:
+                payload["pose_frame"] = agent_pose.frame_id
+                payload["position_semantics"] = "agent_observation_viewpoint"
             if event.kind in {"action", "turn"}:
                 action = event.metadata.get("action")
                 if isinstance(action, dict):
@@ -678,6 +706,8 @@ class MemoryManager:
                     event.event_id, None,
                 ), detector_name=event.source if is_detection else None,
                 raw_detector_confidence=event.confidence if is_detection else None,
+                position=agent_pose.position if observed_from_pose else None,
+                heading=agent_pose.heading if observed_from_pose else None,
                 instruction_terms=terms, source_evidence_ids=source_refs,
                 observation_status=("observed" if is_detection or event.kind in {
                     "place_observation", "visual_change", "place_visit",

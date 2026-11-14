@@ -19,6 +19,7 @@ from lightnav.inference.token_diagnostics import token_ids_sha256
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.manager import MemoryManager
 from lightnav.memory.memory_writer import MockSceneExtractor
+from lightnav.memory.place_recognition import MockPlaceDescriptorExtractor
 from lightnav.memory.schemas import SceneExtraction
 from lightnav.memory.v4_config import RGMV4Config
 from lightnav.memory.v4_navigation_state import COMPLETION_UNKNOWN
@@ -412,6 +413,53 @@ def test_local_graph_card_reaches_vllm_with_original_video_and_action_decoder(mo
     assert torch.equal(processor.calls[-1]["videos"][0], baseline_processor.calls[-1]["videos"][0])
     assert policy.get_info()["raw_text"] == baseline.get_info()["raw_text"]
     assert _ids(vllm) != _ids(baseline_vllm)
+    baseline.close_episode()
+    policy.close_episode()
+
+
+def test_spatial_local_graph_fields_reach_final_vllm_tokens(monkeypatch):
+    baseline_engine, baseline_processor, _ = _engine(monkeypatch)
+    baseline, _ = _policy(baseline_engine, memory_enabled=False)
+    _reset(baseline)
+    _run_steps(baseline, 2)
+
+    engine, processor, vllm = _engine(monkeypatch)
+    manager = MemoryManager(
+        extractor=MockSceneExtractor({
+            0: SceneExtraction(objects=["archway"], confidence=0.88),
+        }),
+        strategy="hierarchical", place_enabled=True,
+        place_extractor=MockPlaceDescriptorExtractor({0: (1, 0), 1: (1, 0)}),
+        place_every_n_steps=1,
+        local_graph_config=LocalGraphConfig(enabled=True, fusion_mode="spatial"),
+    )
+    centroids = np.zeros((2, 10, 3), dtype=np.float32)
+    centroids[1, :, 0] = 0.25
+    policy = TrajVocabVLNCEPolicy(
+        engine, centroids, dt=1.0,
+        lin_vel_range=(0.0, 0.3), ang_vel_range=(-30.0, 30.0),
+        num_history_frames=2, memory_enabled=True, memory_manager=manager,
+    )
+    _reset(policy)
+    for step, z in enumerate((-1.0, 0.0)):
+        policy.act({"rgb": np.full((8, 8, 3), step, dtype=np.uint8)}, {
+            "scene_id": "scene_a", "distance_to_goal": 0.0,
+            "agent_pose": {"position": [0.0, 0.0, z], "rotation": [1, 0, 0, 0]},
+        })
+
+    diagnostic = policy.last_memory_diagnostic
+    decoded = processor.tokenizer.decode(_ids(vllm))
+    assert diagnostic["actual_injection"] is True
+    assert diagnostic["spatial_fields_in_final_tokens"] is True
+    assert engine.last_input_diagnostic["memory_text_present_in_final_tokens"] is True
+    assert engine.last_input_diagnostic["memory_text_present_in_vllm_prompt"] is True
+    assert "History: archway" in decoded
+    assert "observed viewpoint place_" in decoded
+    assert "relative viewpoint 1.0m front" in decoded
+    assert "graph same_visual_place; passage unknown" in decoded
+    assert "<navigation_task>Find the archway</navigation_task>" in decoded
+    assert torch.equal(processor.calls[-1]["videos"][0], baseline_processor.calls[-1]["videos"][0])
+    assert policy.get_info()["raw_text"] == baseline.get_info()["raw_text"]
     baseline.close_episode()
     policy.close_episode()
 

@@ -116,6 +116,16 @@ class LocalGraphEvalLauncherTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("independent output directory", result.stderr)
 
+    def test_spatial_mode_rejects_legacy_88_result_path_before_launch(self) -> None:
+        output = self.root / "local_graph_fusion_88_run2"
+        for mode_arg in ("--local_graph_fusion_mode spatial",
+                         "--local_graph_fusion_mode=spatial"):
+            with self.subTest(mode_arg=mode_arg):
+                result = self.launch(_LOCAL_ARGS + " " + mode_arg, output)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("cannot use the legacy 88-Episode result path", result.stderr)
+                self.assertFalse(output.exists())
+
     @unittest.skipUnless(_HAS_RUNTIME, "LightNav runtime dependencies unavailable")
     def test_snapshot_records_actual_local_graph_cli_settings(self) -> None:
         output = self.root / "snapshot"
@@ -130,6 +140,8 @@ class LocalGraphEvalLauncherTest(unittest.TestCase):
         expected = {
             "enabled": True, "scope": "scene_persistent", "prompt_max_chars": 280,
             "max_landmarks": 3, "reactivation_steps": 12,
+            "neighbor_radius_m": 3.0,
+            "fusion_mode": "legacy",
             "protocol_version": "local_graph_v1",
         }
         self.assertEqual(snapshot["local_graph_effective"], expected)

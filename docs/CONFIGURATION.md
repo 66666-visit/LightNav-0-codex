@@ -282,12 +282,19 @@ and is mutually exclusive with `--rgm_enabled`, `--rgm_v3_enabled` and
 | `--local_graph_prompt_max_chars` | `320` | Entire navigation card character budget |
 | `--local_graph_max_landmarks` | `2` | Maximum current/local historical landmark lines |
 | `--local_graph_reactivation_steps` | `8` | Minimum interval before reusing an unchanged card |
+| `--local_graph_neighbor_radius_m` | `3.0` | Spatial mode's measured horizontal search radius, matching the public `val_unseen` mapper3 configuration |
+| `--local_graph_fusion_mode` | `legacy` | `legacy` reproduces the 88 Episode baseline card; `spatial` adds measured viewpoint geometry and graph relation status |
 
 The runner requires a new, empty explicit output directory and writes
-`local_graph_protocol.json` (`local_graph_v1`). Current YOLO box position is a
-camera-sector observation; a DINO-linked earlier landmark is labelled as a
-possible revisit with unknown current direction and traversability. The module
-does not infer a route or change the action decoder.
+`local_graph_protocol.json` (`local_graph_v1` for legacy,
+`local_graph_spatial_v1` for spatial). The spatial mode accepts only the current
+Scene's measured Habitat Agent pose, stores the **observation viewpoint** with
+YOLO and DINO evidence, and reports horizontal distance and relative bearing
+to that viewpoint when both positions share a frame. It does not infer an
+object's 3D location or a route from a straight-line bearing. Inferred graph
+edges retain unknown traversability. Both modes preserve the original RGB,
+instruction, pointing/action token interfaces and final-token audit. See
+[OVER_NAV_SPATIAL_FUSION.md](research/OVER_NAV_SPATIAL_FUSION.md).
 
 The underlying `scripts/eval_habitat.sh` also accepts `STRICT_FULL_EVAL=1`
 for the full-split gate, `RESUME=1` to skip existing completed Episodes,
@@ -304,8 +311,9 @@ For one R2R Episode, the Habitat server accepts `--single-scene-id <path>` and
 `--single-episode-id <id>` together. They select exactly one loaded `val_unseen`
 Episode by canonical scene path and full ID before iteration, and reject pilot,
 strict full evaluation or sharding. The server also reports `agent_pose`
-(`position` and quaternion) in `info` when simulator state is available; this
-is evaluator-side trace data and is not passed into the memory packet. Resolve
+(`position` and `w,x,y,z` quaternion) in `info` when simulator state is available;
+only spatial Local Graph mode passes that measured pose to the memory manager.
+Evaluator fields such as `distance_to_goal` stay outside memory. Resolve
 the two IDs from a manifest and the dataset with
 `scripts/resolve_single_episode.py`; see
 [EPISODE1_EXPERIMENT.md](research/EPISODE1_EXPERIMENT.md).

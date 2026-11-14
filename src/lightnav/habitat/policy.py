@@ -421,7 +421,7 @@ class TrajVocabVLNCEPolicy:
         return text, sample, diagnostic
 
     def _generate_with_local_graph_memory(
-        self, obs: dict[str, Any],
+        self, obs: dict[str, Any], info: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any], dict[str, Any]]:
         """Translate current and one-hop graph evidence into a compact VLN context."""
         from lightnav.memory.memory_context_builder import (
@@ -433,10 +433,17 @@ class TrajVocabVLNCEPolicy:
 
         manager = self.memory_manager
         step = self._memory_step
-        events = manager.observe(ObservationPacket(
+        packet = ObservationPacket(
             step_id=step, rgb=obs["rgb"], instruction=self.instruction,
             last_action=self._last_executed_action, prediction=self._last_prediction,
-        ))
+        )
+        if manager.local_graph_config.fusion_mode == "spatial":
+            from lightnav.memory.spatial_geometry import AgentPose
+
+            pose = AgentPose.from_habitat_info(info, expected_scene_id=manager.v3_scene_id)
+            events = manager.observe(packet, agent_pose=pose)
+        else:
+            events = manager.observe(packet)
         self._memory_step += 1
         base_sample = build_vln_traj_sample(
             self.agent._get_video_tensor(), self.agent.instruction,
@@ -536,6 +543,14 @@ class TrajVocabVLNCEPolicy:
             )
         visible_ids = list(model_input.get("model_visible_evidence_ids", [])) if block_visible else []
         actual_injection = bool(context is not None and visible_ids and block_visible)
+        spatial_ids = [
+            set(item.metadata["evidence_ids"])
+            for item in context.layer_items
+            if item.metadata.get("spatial_fields") is not None
+        ] if context is not None else []
+        spatial_fields_visible = bool(
+            block_visible and any(ids <= set(visible_ids) for ids in spatial_ids)
+        )
         if actual_injection:
             manager.local_graph_fusion.confirm_injected(visible_ids, step)
         elif context is not None:
@@ -556,6 +571,8 @@ class TrajVocabVLNCEPolicy:
             "memory_text": memory_text,
             "actual_injection": actual_injection if checked or context is None else None,
             "actual_historical_injection": bool(historical_ids)
+            if checked or context is None else None,
+            "spatial_fields_in_final_tokens": spatial_fields_visible
             if checked or context is None else None,
             "injected_evidence_ids": visible_ids,
             "injected_historical_evidence_ids": historical_ids,
@@ -591,7 +608,7 @@ class TrajVocabVLNCEPolicy:
             text, sample, diagnostic = self._generate_with_v4_memory(obs)
             rgm_enabled = False  # V4 diagnostics are finalized in the helper.
         elif self._memory_episode_open and self.memory_manager.local_graph_config.enabled:
-            text, sample, diagnostic = self._generate_with_local_graph_memory(obs)
+            text, sample, diagnostic = self._generate_with_local_graph_memory(obs, info)
             rgm_enabled = False
         elif self._memory_episode_open:
             from lightnav.memory.memory_context_builder import (

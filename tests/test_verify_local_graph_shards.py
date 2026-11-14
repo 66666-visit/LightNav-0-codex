@@ -18,6 +18,8 @@ class VerifyLocalGraphShardsTest(unittest.TestCase):
         self.effective = {
             "enabled": True, "scope": "episode_local", "prompt_max_chars": 320,
             "max_landmarks": 2, "reactivation_steps": 8,
+            "neighbor_radius_m": 3.0,
+            "fusion_mode": "legacy",
             "protocol_version": "local_graph_v1",
         }
         snapshot = {
@@ -55,6 +57,26 @@ class VerifyLocalGraphShardsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "differs from root snapshot"):
             verify_local_graph_shards(self.root, ["2", "0"])
         self.assertEqual(marker_path.read_text(), original)
+
+    def test_spatial_mode_requires_matching_protocol_on_every_shard(self) -> None:
+        snapshot_path = self.root / "config_snapshot.yaml"
+        snapshot = json.loads(snapshot_path.read_text())
+        spatial = {
+            **self.effective, "fusion_mode": "spatial",
+            "protocol_version": "local_graph_spatial_v1",
+        }
+        snapshot["protocol_version"] = spatial["protocol_version"]
+        snapshot["local_graph_effective"] = spatial
+        snapshot["memory_effective"]["local_graph_effective"] = spatial
+        snapshot_path.write_text(json.dumps(snapshot))
+        with self.assertRaisesRegex(ValueError, "differs from root snapshot"):
+            verify_local_graph_shards(self.root, ["2", "0"])
+        marker = {key: value for key, value in spatial.items() if key != "enabled"}
+        for index in range(2):
+            (self.root / f"shard_{index}" / "local_graph_protocol.json").write_text(
+                json.dumps(marker)
+            )
+        verify_local_graph_shards(self.root, ["2", "0"])
 
 
 if __name__ == "__main__":

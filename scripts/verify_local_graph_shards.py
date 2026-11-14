@@ -9,7 +9,7 @@ from pathlib import Path
 
 _MARKER_FIELDS = (
     "protocol_version", "scope", "prompt_max_chars", "max_landmarks",
-    "reactivation_steps",
+    "reactivation_steps", "neighbor_radius_m", "fusion_mode",
 )
 
 

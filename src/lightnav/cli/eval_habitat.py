@@ -238,6 +238,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Maximum instruction-related landmarks in one local card.")
     p.add_argument("--local_graph_reactivation_steps", type=int, default=8,
                    help="Earliest step interval for reactivating an unchanged local card.")
+    p.add_argument("--local_graph_neighbor_radius_m", type=float, default=3.0,
+                   help="Spatial mode: measured horizontal viewpoint search radius in meters.")
+    p.add_argument("--local_graph_fusion_mode", choices=("legacy", "spatial"),
+                   default="legacy", help="Legacy text card or pose-grounded spatial fusion.")
     for name, default in (
         ("step0_conditional", True), ("write_gate_enabled", True),
         ("retrieval_gate_enabled", True), ("prompt_gate_enabled", True),
@@ -400,6 +404,8 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                 prompt_max_chars=args.local_graph_prompt_max_chars,
                 max_landmarks=args.local_graph_max_landmarks,
                 reactivation_steps=args.local_graph_reactivation_steps,
+                neighbor_radius_m=args.local_graph_neighbor_radius_m,
+                fusion_mode=args.local_graph_fusion_mode,
             ),
         ),
         save_video=args.save_video,

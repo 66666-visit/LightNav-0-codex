@@ -49,5 +49,5 @@ V4 和新开关互斥。C 在新空目录写 `local_graph_protocol.json`；A/B/C
 ## 证据与局限
 
 - `distance_to_goal`、成功标志和服务端 `agent_pose` 只进 evaluator 的 `step_trace.jsonl`，不进入 `ObservationPacket` 或记忆检索；位姿只用于离线分析。
-- 本代码没有深度投影、实例级 YOLO 跟踪、实际里程计或拓扑边方向；历史地标的方位/距离必须写成未知。DINO 相似是地点假设，不能称为已验证的重访。
+- 上述 Legacy Local Graph 没有深度投影、实例级 YOLO 跟踪、实际里程计或拓扑边方向；历史地标的方位/距离写成未知。新增可切换的空间模式仅用 Habitat 实测 Agent Pose 算到历史**观测视点**的直线距离/相对方位，仍不能把 DINO 相似地点称为已验证重访，也不能把该方位当成可执行路径。见 [OVER_NAV_SPATIAL_FUSION.md](OVER_NAV_SPATIAL_FUSION.md)。
 - 当前方案能验证“记忆是否进入模型输入”和“是否改变动作”；能否改善 Episode 1、SR、SPL 需要真实 AutoDL 评测。Episode 1 的首次错误转向需结合参考路线、位姿和 RGB 手工确认，不能从同一步的动作分歧直接命名为错误。
