@@ -209,10 +209,62 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/output/habitat_${TASK}_${TS}}
 client_extra_args=($CLIENT_ARGS)
 v3_client_enabled=0
 v4_client_enabled=0
+local_graph_client_enabled=0
+rgm_client_enabled=0
+memory_client_enabled=0
 for token in "${client_extra_args[@]}"; do
+    [ "$token" = --memory_enabled ] && memory_client_enabled=1
+    [ "$token" = --rgm_enabled ] && rgm_client_enabled=1
     [ "$token" = --rgm_v3_enabled ] && v3_client_enabled=1
     [ "$token" = --rgm_v4_enabled ] && v4_client_enabled=1
+    [ "$token" = --local_graph_enabled ] && local_graph_client_enabled=1
 done
+if [ "$local_graph_client_enabled" -eq 1 ]; then
+    while [[ "$OUTPUT_ROOT" == */ && "$OUTPUT_ROOT" != / ]]; do
+        OUTPUT_ROOT="${OUTPUT_ROOT%/}"
+    done
+    if [ "$memory_client_enabled" -ne 1 ]; then
+        echo "$TAG ERROR: Local Graph requires --memory_enabled" >&2
+        exit 1
+    fi
+    if [ "$rgm_client_enabled" -eq 1 ] || [ "$v3_client_enabled" -eq 1 ] \
+        || [ "$v4_client_enabled" -eq 1 ]; then
+        echo "$TAG ERROR: Local Graph cannot share a run with RGM, V3, or V4" >&2
+        exit 1
+    fi
+    if [ "$RESUME" = 1 ]; then
+        echo "$TAG ERROR: Local Graph requires a fresh output and cannot resume" >&2
+        exit 1
+    fi
+    case "$OUTPUT_ROOT" in
+        */rgm_pilot_88_v1|*/rgm_pilot_88_v1/*|*/rgm_pilot_88_v2|*/rgm_pilot_88_v2/*|*/rgm_v3_pilot_88|*/rgm_v3_pilot_88/*|*/rgm_v4_pilot_88|*/rgm_v4_pilot_88/*)
+            echo "$TAG ERROR: Local Graph requires an independent output directory" >&2
+            exit 1
+            ;;
+    esac
+    ancestor_dir="$(dirname "$OUTPUT_ROOT")"
+    while [ "$ancestor_dir" != . ] && [ "$ancestor_dir" != / ]; do
+        if [ -f "$ancestor_dir/config_snapshot.yaml" ] \
+            || [ -f "$ancestor_dir/summary.json" ] \
+            || [ -f "$ancestor_dir/pilot_complete.json" ] \
+            || [ -f "$ancestor_dir/results.jsonl" ] \
+            || [ -f "$ancestor_dir/rgm_v3_protocol.json" ] \
+            || [ -f "$ancestor_dir/rgm_v4_protocol.json" ] \
+            || [ -f "$ancestor_dir/local_graph_protocol.json" ]; then
+            echo "$TAG ERROR: Local Graph output cannot be nested inside existing results" >&2
+            exit 1
+        fi
+        ancestor_dir="$(dirname "$ancestor_dir")"
+    done
+    if [ -L "$OUTPUT_ROOT" ] || { [ -e "$OUTPUT_ROOT" ] && [ ! -d "$OUTPUT_ROOT" ]; }; then
+        echo "$TAG ERROR: Local Graph output root must be a new directory" >&2
+        exit 1
+    fi
+    if [ -d "$OUTPUT_ROOT" ] && [ -n "$(find "$OUTPUT_ROOT" -mindepth 1 -print -quit)" ]; then
+        echo "$TAG ERROR: Local Graph output root must be empty; existing results are preserved" >&2
+        exit 1
+    fi
+fi
 if [ "$v3_client_enabled" -eq 1 ] && [ "$v4_client_enabled" -eq 1 ]; then
     echo "$TAG ERROR: RGM V3 and V4 cannot share one run" >&2
     exit 1
@@ -275,21 +327,25 @@ SNAPSHOT_BACKEND="$BACKEND" SNAPSHOT_TASK="$TASK" SNAPSHOT_SPLIT="$SPLIT" \
 SNAPSHOT_HABITAT_CONFIG="$HABITAT_CONFIG" SNAPSHOT_SEED="$SEED" \
 SNAPSHOT_EPISODES="$EPISODES" SNAPSHOT_MAX_STEPS="$MAX_STEPS" \
 SNAPSHOT_NO_FORCE_STOP="$NO_FORCE_STOP" SNAPSHOT_GPU_IDS="${GPUS[*]}" \
+SNAPSHOT_STRICT_FULL_EVAL="$STRICT_FULL_EVAL" \
 SNAPSHOT_ACTION_BUNDLE="$ACTION_TOKENIZER_BUNDLE" \
-SNAPSHOT_GPU_MEM_UTIL="$GPU_MEM_UTIL" SNAPSHOT_CLIENT_ARGS="$CLIENT_ARGS" \
+SNAPSHOT_GPU_MEM_UTIL="$GPU_MEM_UTIL" \
 SNAPSHOT_SERVER_ARGS="$SERVER_ARGS" SNAPSHOT_EXPECTED_EPISODES="$EXPECTED_EPISODES" \
 SNAPSHOT_DATA_PATH="$DATA_PATH" SNAPSHOT_SCENES_DIR="$SCENES_DIR" \
 SNAPSHOT_PILOT_MANIFEST="$PILOT_MANIFEST_PATH" \
 SNAPSHOT_REPO_ROOT="$REPO_ROOT" \
 PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
-"$CLIENT_PYTHON" - <<'PY'
+"$CLIENT_PYTHON" - "${client_extra_args[@]}" <<'PY'
 import hashlib
 import json
 import os
 import shlex
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
+from lightnav.cli.eval_habitat import build_parser, config_from_args
+from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.v3_config import RGMV3Config
 from lightnav.memory.v4_config import RGMV4Config
@@ -297,12 +353,14 @@ from lightnav.memory.v4_config import RGMV4Config
 env = os.environ
 habitat_config = Path(env["SNAPSHOT_HABITAT_CONFIG"]).resolve()
 model_path = Path(env["SNAPSHOT_MODEL_PATH"]).resolve()
-tokens = shlex.split(env["SNAPSHOT_CLIENT_ARGS"])
+tokens = sys.argv[1:]
 common_tokens, memory_tokens = [], []
 index = 0
 while index < len(tokens):
     token = tokens[index]
-    group = memory_tokens if token.startswith(("--memory_", "--rgm_", "--no-rgm_")) else common_tokens
+    group = memory_tokens if token.startswith((
+        "--memory_", "--rgm_", "--no-rgm_", "--local_graph_",
+    )) else common_tokens
     group.append(token)
     if token.startswith("--") and index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
         index += 1
@@ -385,6 +443,41 @@ for index, token in enumerate(tokens):
 v4_effective = asdict(RGMV4Config(**v4_values))
 if sum((rgm_effective["enabled"], v3_effective["enabled"], v4_effective["enabled"])) > 1:
     raise SystemExit("legacy RGM, RGM V3 and RGM V4 cannot share one run")
+local_graph_effective = None
+if "--local_graph_enabled" in tokens:
+    client_argv = [
+        "--model_path", env["SNAPSHOT_MODEL_PATH"],
+        "--backend", env["SNAPSHOT_BACKEND"],
+        "--episodes", env["SNAPSHOT_EPISODES"],
+        "--max_steps", env["SNAPSHOT_MAX_STEPS"],
+        "--gpu_memory_utilization", env["SNAPSHOT_GPU_MEM_UTIL"],
+    ]
+    if env["SNAPSHOT_SEED"]:
+        client_argv.extend(("--seed", env["SNAPSHOT_SEED"]))
+    if env["SNAPSHOT_NO_FORCE_STOP"] == "1":
+        client_argv.append("--no_force_stop")
+    if env["SNAPSHOT_ACTION_BUNDLE"]:
+        client_argv.extend(("--action_tokenizer_bundle", env["SNAPSHOT_ACTION_BUNDLE"]))
+    if env["SNAPSHOT_STRICT_FULL_EVAL"] == "1":
+        client_argv.append("--strict_full_eval")
+    client_argv.extend(tokens)
+    client_argv.extend(("--output_dir", str(Path(env["SNAPSHOT_OUTPUT_ROOT"]) / "shard_0")))
+    try:
+        parsed = build_parser().parse_args(client_argv)
+        effective = config_from_args(parsed)
+    except ValueError as exc:
+        raise SystemExit(f"invalid Local Graph client configuration: {exc}") from exc
+    local_config = effective.memory.local_graph
+    if not isinstance(local_config, LocalGraphConfig) or not local_config.enabled:
+        raise SystemExit("Local Graph flag did not select LocalGraphConfig")
+    if not effective.memory.enabled:
+        raise SystemExit("Local Graph requires memory_enabled")
+    if (effective.memory.strategy != "hierarchical"
+            or set(effective.memory.layers) != {"short", "mid", "long"}):
+        raise SystemExit("Local Graph requires hierarchical short,mid,long memory")
+    if any((rgm_effective["enabled"], v3_effective["enabled"], v4_effective["enabled"])):
+        raise SystemExit("Local Graph cannot share a run with RGM, V3, or V4")
+    local_graph_effective = asdict(local_config)
 
 snapshot = {
     "common": {
@@ -431,6 +524,10 @@ if v3_effective["enabled"]:
 if v4_effective["enabled"]:
     snapshot["protocol_version"] = v4_effective["protocol_version"]
     snapshot["memory_effective"]["rgm_v4"] = v4_effective
+if local_graph_effective is not None:
+    snapshot["protocol_version"] = local_graph_effective["protocol_version"]
+    snapshot["local_graph_effective"] = local_graph_effective
+    snapshot["memory_effective"]["local_graph_effective"] = local_graph_effective
 if env["SNAPSHOT_PILOT_MANIFEST"]:
     pilot_path = Path(env["SNAPSHOT_PILOT_MANIFEST"])
     snapshot["pilot_manifest_path"] = str(pilot_path)
@@ -579,6 +676,14 @@ for ((i = 0; i < N; i++)); do
 done
 
 # ── 4. merge ─────────────────────────────────────────────────────────────────
+if [ "$local_graph_client_enabled" -eq 1 ]; then
+    if [ "$FAILED" -ne 0 ]; then
+        echo "$TAG ERROR: Local Graph shard failed; refusing to merge partial results" >&2
+        exit 1
+    fi
+    "$CLIENT_PYTHON" "$REPO_ROOT/scripts/verify_local_graph_shards.py" \
+        "$OUTPUT_ROOT" "${GPUS[@]}"
+fi
 PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
     "$CLIENT_PYTHON" -m lightnav.cli.eval_merge "$OUTPUT_ROOT"/shard_* --output "$OUTPUT_ROOT" \
     | tee "$OUTPUT_ROOT/merge.log"

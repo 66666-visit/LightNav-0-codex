@@ -1,102 +1,85 @@
-# Episode 1：单 Episode 对照协议与当前结果
+# Local Graph Fusion：88 Episode 单组正式评测
 
-## 当前实测状态（2026-11-14）
+本文件沿用历史文件名；**当前目标是固定的 R2R `val_unseen` 88 Episode Pilot，只运行 Local Graph Fusion 一组**。此前 Episode 1 的 A/B/C 单条对照协议不适用于本轮，也不运行 `--episodes 1`、`--trace_steps` 或 `scripts/compare_episode1_traces.py`。评测启动器为 [eval_habitat.sh](../../scripts/eval_habitat.sh)，Local Graph 的算法与参数见 [MEMORY_DESIGN.md](MEMORY_DESIGN.md)。
 
-本地检查未找到 R2R `val_unseen.json.gz`、既有 `episode_manifest.json`、LightNav checkpoint 或 FIX3 的逐步结果；用户确认这些资产在 AutoDL。当前环境的 `nvidia-smi` 也无法访问 GPU。因此**本轮没有运行真实 Episode 1**，不能填入其准确 `episode_id`、`scene_id`、指令、起点、SR、SPL、动作分歧或首次偏离正确路线的 Step。旧文档的 88 Episode 汇总不是 Episode 1 的逐步证据，也不替代本实验。
+## 当前状态
 
-| 核对项 | 本地结果 |
+截至 2026-11-14，本工作区没有 AutoDL 上的 R2R 数据、88 条 Pilot manifest、LightNav 权重或 GPU。本次只修复启动器并准备命令，**没有启动评测**。本轮 Local Graph 的 88 条覆盖、SR、SPL、注入率与分片合并结果均待 AutoDL 实测，不能从旧 FIX3 结果推断。
+
+## 固定输入与输出
+
+| 项目 | 本轮设置 |
 | --- | --- |
-| Episode 1 的准确身份、指令、起点 | 待在 AutoDL 用 manifest + 数据集核对；不把 JSON `episode_id=1` 当作 Episode 1 |
-| A `baseline_off` | 无可证实的完全匹配单 Episode 结果 |
-| B `rgm_v4_fix3` | 无可证实的完全匹配单 Episode 逐步结果 |
-| C `local_graph` | 尚未真实运行 |
-| 首次动作分歧、无效探索、错误转向、路线偏离 | 均未确定 |
+| Episode 集合 | 复用已有 `rgm_pilot_88_v1` 的 88 条 `pilot_manifest.json` 和共享 `episode_manifest.json`，核对精确 ID |
+| 数据与环境 | R2R `val_unseen`、原 Habitat YAML/场景、每条最多 500 步、强制 STOP 关闭、随机种子 42 |
+| 模型与动作 | 同一个冻结 LightNav checkpoint、原 Pointing/RVQ 接口与动作解码参数；不训练、不改权重 |
+| 记忆组 | 仅 `--local_graph_enabled`，配同一 YOLO/DINO 资产；`hierarchical` 和 `short,mid,long` |
+| 输出 | 全新、独立的 `OUTPUT_ROOT`，不位于 FIX3 或旧 Pilot 目录内；不复用或删除旧结果 |
 
-## 1. 先核对身份
+88 条 Pilot 的身份由现有 manifest 的 Scene/Episode **完整 pair** 决定，不用 JSON 的 `episode_id=1` 猜测“Episode 1”。本轮是单组正式评测，因此无需启动 baseline 或 FIX3 评测；以后若做横向比较，应先核对权重、Pilot manifest、环境与动作解码完全一致。
 
-在装有本分支代码和 R2R 资产的 AutoDL 环境，设置实际路径；`SCENES_DIR` 必须和 Habitat server 使用的一致：
+## AutoDL 运行命令（本轮不执行）
+
+先把本次启动器修复及当前 Local Graph 代码同步到 AutoDL，使用原推理环境与独立 Habitat Python 3.9 环境。把示例路径替换为真实路径；`CLIENT_ARGS` 的模型路径不能含空格。Pilot manifest 放在新输出目录**之外**。
 
 ```bash
-export R2R_ROOT=/path/to/R2R_VLNCE_v1-3_preprocessed
-export SCENES_DIR=/path/to/scene_datasets
-export MANIFEST=/path/to/existing/episode_manifest.json
 export MODEL_PATH=/path/to/LightNav-0
+export ACTION_TOKENIZER_BUNDLE=/path/to/LightNav-0/action_tokenizer
+export HABITAT_CONFIG=habitat_server/configs/vlnce_r2r.yaml
+export DATA_PATH=/path/to/R2R_VLNCE_v1-3_preprocessed
+export SCENES_DIR=/path/to/scene_datasets
 export YOLO_MODEL_PATH=/path/to/yolo11n.pt
 export DINO_MODEL_PATH=/path/to/dinov2-small
-export RVQ_BUNDLE=/path/to/LightNav-0/action_tokenizer
-export RUN_ROOT=output/episode1_local_graph_20261114_run1
-mkdir -p "$RUN_ROOT"
-python scripts/resolve_single_episode.py \
-  --manifest "$MANIFEST" \
-  --dataset "$R2R_ROOT/val_unseen/val_unseen.json.gz" \
-  --scenes-dir "$SCENES_DIR" --episode-number 1 \
-  > "$RUN_ROOT/identity.json"
-cat "$RUN_ROOT/identity.json"
+export PILOT_MANIFEST_PATH=/path/to/rgm_pilot_88_v1/pilot_manifest.json
+export EPISODE_MANIFEST_PATH=/path/to/rgm_pilot_88_v1/episode_manifest.json
+export OUTPUT_ROOT=/path/to/output/local_graph_fusion_88_run1
+export GPU_IDS="0 1"
+export GPU_MEM_UTIL=0.65
+
+export TASK=vlnce SPLIT=val_unseen BACKEND=vllm_local
+export STRICT_FULL_EVAL=1 EXPECTED_EPISODES=88 EPISODES=-1
+export MAX_STEPS=500 NO_FORCE_STOP=1 SEED=42 RESUME=0
+export SERVER_ARGS="" LANGUAGES=""
+unset VLN_EVAL_TEMPERATURE VLN_EVAL_TOP_P VLN_EVAL_TOP_K VLN_EVAL_TRAJ_TOP1
+export CLIENT_ARGS="--memory_enabled --memory_strategy hierarchical --memory_layers short,mid,long --memory_extractor yolo11 --memory_extractor_model_path $YOLO_MODEL_PATH --memory_extractor_device cpu --memory_extractor_confidence 0.25 --memory_extract_every_n_steps 5 --memory_place_enabled --memory_place_model_path $DINO_MODEL_PATH --memory_place_device cpu --memory_place_extract_every_n_steps 5 --memory_place_similarity_threshold 0.85 --local_graph_enabled --local_graph_scope episode_local --local_graph_prompt_max_chars 320 --local_graph_max_landmarks 2 --local_graph_reactivation_steps 8"
+
+if [ -e "$OUTPUT_ROOT" ]; then
+  echo "Choose a new, empty OUTPUT_ROOT" >&2
+else
+  bash scripts/eval_habitat.sh
+fi
 ```
 
-`--episode-number 1` 指 **manifest 第一行**，不是数据集 JSON 的 `episode_id=1`。若过去的“Episode 1”实际上是结果标签 `episode_001`，它对应的可能是 manifest 第二行；应先用旧结果的 `scene_id + habitat_episode_id` 查清，再改为 `--episode-number 2` 等正确序号。脚本会要求数据集恰好有一条匹配，并输出原指令、`start_position`、`start_rotation`、`trajectory_id`、可用的 `reference_path` / `goal_position` 和给服务端的完整筛选参数。参考路线与目标只写入离线身份文件，不送给策略。没有这些真实输出前，本文件不代填身份。
+`GPU_IDS` 按 AutoDL 实际 GPU 调整；脚本每 GPU 起一个 Habitat server 和一个评测 client，以不重叠的 shard 处理同一 88 条集合。`PILOT_MANIFEST_PATH` 固定集合，`EPISODE_MANIFEST_PATH` 与旧运行的共享清单核对；运行前确认两份 manifest 都存在，不能用旧 `results.jsonl` 代替。`--trace_steps` 只支持单 Episode，因此此正式运行使用每步 `memory_diagnostics.jsonl` 与各 shard 的结果文件。Local Graph 输出目录要求全新；中断后保留已有结果，另开新目录重跑，不对已有目录设 `RESUME=1`。
 
-## 2. 只启动该 Episode 的 Habitat 服务
+## 运行后核查
 
-服务端仍使用原 R2R YAML、场景、500 步限制和种子；新 `--single-scene-id` / `--single-episode-id` 在 Habitat 加载后、迭代前精确筛选一个 Episode。服务端在独立的 Habitat Python 3.9 环境运行。
+启动器应先写根目录 `config_snapshot.yaml`，其中 `memory_args` 包含 `--local_graph_*`，根级 `local_graph_effective`（同时镜像到 `memory_effective.local_graph_effective`）记录 `enabled`、`scope`、`prompt_max_chars`、`max_landmarks`、`reactivation_steps`、`protocol_version`。检查其模型权重、动作 bundle、Habitat YAML、代码与 Pilot manifest 校验信息，然后检查每个 `shard_i/local_graph_protocol.json` 和 `shard_i/episode_manifest.json`。各 shard 的 Episode pair 必须不重叠，合并后的 `results.jsonl` 必须恰有 88 条。
+
+启动器负责合并 `shard_*/results.jsonl` 到根目录，并写 `summary.json`、`merge.log`、合并的 `memory_diagnostics.jsonl`；正式模式再调用 `experiment_integrity verify` 校验覆盖并生成 `pilot_complete.json`。**完成判据是 `pilot_complete.json` 存在、`summary.num_episodes == 88`，且 88 个 Scene/Episode pair 唯一并与 Pilot manifest 一致**；`summary.json` 单独存在可能只是部分结果，不能据此报告正式 SR/SPL。可以在 AutoDL 对产物做一次只读复核：
 
 ```bash
-SCENE_ID="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["single_scene_id"])' "$RUN_ROOT/identity.json")"
-EP_ID="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["single_episode_id"])' "$RUN_ROOT/identity.json")"
-python -m lightnav_habitat.serve \
-  --task vlnce --config habitat_server/configs/vlnce_r2r.yaml \
-  --data-path "$R2R_ROOT" --scenes-dir "$SCENES_DIR" \
-  --single-scene-id "$SCENE_ID" --single-episode-id "$EP_ID" \
-  --max-steps 500 --seed 42 --port 5555 \
-  --ready-file "$RUN_ROOT/server_A.ready"
+python -m lightnav.habitat.experiment_integrity verify "$OUTPUT_ROOT" \
+  --shared "$EPISODE_MANIFEST_PATH" \
+  --pilot-selection "$PILOT_MANIFEST_PATH"
+python - "$OUTPUT_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+snapshot = json.loads((root / "config_snapshot.yaml").read_text())
+local = snapshot["local_graph_effective"]
+assert local["enabled"] is True and local["protocol_version"] == "local_graph_v1"
+assert local == snapshot["memory_effective"]["local_graph_effective"]
+rows = [json.loads(line) for line in (root / "results.jsonl").read_text().splitlines() if line]
+keys = {(row["scene_id"], row["habitat_episode_id"]) for row in rows}
+assert len(rows) == len(keys) == 88
+summary = json.loads((root / "summary.json").read_text())
+assert summary["num_episodes"] == 88
+assert (root / "pilot_complete.json").is_file()
+print("88 unique Episodes; SR/SPL:", summary["metrics"]["SR_success_rate_pct"], summary["metrics"]["SPL_pct"])
+PY
 ```
 
-在单独终端启动服务，用端口或本组的 ready file 确认就绪。记录服务端 manifest 应为 `expected_count=1`，且 pair 与 `identity.json` 一致。此筛选不能与旧 88/220 Pilot、严格全量评测或分片开关合用。
-
-**每一组评测都要重启一次服务端**：评测客户端结束时发送 `close`，服务端随即退出。运行 A 前使用 `server_A.ready`；运行 B/C 前分别用完全相同的服务命令重启，只把 ready file 换成 `server_B.ready` / `server_C.ready`。确认三次使用相同配置、同一 Scene/Episode、同一种子，并核对 Step 0 的 RGB 像素校验和与位姿。不要把已经退出的服务当作可再次 reset 的实例。
-
-## 3. 三组使用同一冻结模型和动作解码器
-
-在 inference Python 3.11 环境执行。三个输出目录必须事先不存在或为空；`--trace_steps` 会拒绝覆盖已有 RGB/逐步结果。若旧 A/B 结果具有**完全相同**的 Episode pair、权重/源码/环境配置、指令、RVQ 解码、种子和逐步 Prompt/RGB/Token/动作记录，可只复用它们并运行 C；否则仅补跑 A/B 的这一个 Episode。每组结束后让同一单 Episode 服务端 reset；确认 Step 0 RGB/位姿一致。
-
-```bash
-common=(--model_path "$MODEL_PATH" --backend vllm_local \
-  --server tcp://127.0.0.1:5555 --episodes 1 --max_steps 500 \
-  --no_force_stop --seed 42 --trace_steps \
-  --action_tokenizer_bundle "$RVQ_BUNDLE" --horizon 10)
-memory=(--memory_enabled --memory_strategy hierarchical \
-  --memory_layers short,mid,long \
-  --memory_extractor yolo11 --memory_extractor_model_path "$YOLO_MODEL_PATH" \
-  --memory_extractor_device cpu --memory_extract_every_n_steps 5 \
-  --memory_place_enabled --memory_place_model_path "$DINO_MODEL_PATH" \
-  --memory_place_device cpu --memory_place_extract_every_n_steps 5)
-
-lightnav-eval-habitat "${common[@]}" \
-  --output_dir "$RUN_ROOT/A_baseline_off"
-# A 完成后按第 2 节重启单 Episode 服务端，ready file 改为 server_B.ready
-lightnav-eval-habitat "${common[@]}" "${memory[@]}" \
-  --rgm_v4_enabled --rgm_v4_scope episode_local \
-  --output_dir "$RUN_ROOT/B_rgm_v4_fix3"
-# B 完成后按第 2 节重启单 Episode 服务端，ready file 改为 server_C.ready
-lightnav-eval-habitat "${common[@]}" "${memory[@]}" \
-  --local_graph_enabled --local_graph_scope episode_local \
-  --output_dir "$RUN_ROOT/C_local_graph"
-```
-
-先核对 AutoDL 的 FIX3 实际参数；若其 YOLO/DINO 周期、阈值、RVQ bundle、`max_new_tokens`、图像大小或 V4 scope 不同，应在 B/C 中显式保持其共同参数，不把不同协议叫作 FIX3 对照。不能为迁就环境改用别的 checkpoint、修改权重、训练 LightNav 或改变 RVQ/Pointing 接口。只运行 `--episodes 1`，不要启动 88 条脚本。
-
-## 4. 逐步记录与判读
-
-每组输出 `episode_manifest.json`、`results.jsonl`、`memory_diagnostics.jsonl`、`step_trace.jsonl`、`rgb/step_NNNN.png`。逐步 trace 包含实际 Prompt、Prompt 内记忆、经最终 Token 审计确认的记忆、历史帧 ID、原始 RGB 像素校验和、Pointing Token/像素、RVQ 原始 Token/码、完整 waypoint、实际速度动作、动作前后位姿及目标距离。位姿和目标距离只用于离线评价，**不送入在线记忆或模型**。若某字段不可用，写 `null`，不得补造。
-
-```bash
-python scripts/compare_episode1_traces.py \
-  --baseline "$RUN_ROOT/A_baseline_off" \
-  --fix3 "$RUN_ROOT/B_rgm_v4_fix3" \
-  --local-graph "$RUN_ROOT/C_local_graph" \
-  --output "$RUN_ROOT/paired_comparison.json"
-```
-
-比较器要求三组身份、指令、初始 RGB、初始位姿以及记录到的模型路径、解码器方法/时域、推理上限和历史帧配置相同；报告每步 `action_divergence_vs_baseline`（实际发给 Habitat 的速度命令）、`rvq_token_divergence_vs_baseline`、`pointing_token_divergence_vs_baseline`、`same_rgb`，以及第一处**同 RGB 的动作分歧**和第一处 RGB 分叉。不同 RVQ Token 若解码成相同命令，只记 Token 分歧。分叉后的不同动作受不同观测影响，不能作为相同输入下的模型因果对照。`invalid_exploration`、`wrong_turn` 与 `first_correct_route_deviation_step` 保持未判定：审阅者须把数据集 `reference_path`、每步位姿、RGB、目标距离与指令子句一起检查，标出最早离开正确路线的 Step 和证据；一次目标距离增大或一次动作不同并不足以定性为错误转向。
-
-最终填写三组各自的成功、SPL、最终/最小目标距离、步数、实际注入步数及第一次路线偏离；若 C 失败，也需定位是无证据、证据未进 Token、提示误导还是模型忽略提示。随后可在相同配置下从同场景挑 3–5 条不同长度 Episode 做小规模、预先固定 ID 的配对验证，再决定是否扩大评测。
+若某 shard 失败或合并结果缺失，保留其日志和目录，不把部分汇总写成正式 88 条结果。后续可按每步诊断统计模型输入中的实际记忆注入，并与已有 FIX3 汇总做同协议比较；这不需要重跑 FIX3。
