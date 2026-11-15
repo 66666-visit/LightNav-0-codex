@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Tuple
 
@@ -13,6 +14,40 @@ logger = logging.getLogger(__name__)
 # Shape used for the zero image returned when the simulator exposes no RGB/depth
 # sensor and no explicit image_size was requested (never hit with the shipped configs).
 _FALLBACK_IMAGE_HW = (270, 480)
+
+
+def _config_value(config: Any, key: str, default: Any = None) -> Any:
+    """Read a Hydra config or a small test double without importing Habitat."""
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _quaternion_wxyz(rotation: Any) -> np.ndarray:
+    values = np.asarray(
+        [rotation.w, rotation.x, rotation.y, rotation.z], dtype=np.float64,
+    )
+    norm = float(np.linalg.norm(values))
+    if not np.isfinite(values).all() or not 0.99 <= norm <= 1.01:
+        raise ValueError("invalid sensor or agent quaternion")
+    return values / norm
+
+
+def _quaternion_product(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    w1, x1, y1, z1 = left
+    w2, x2, y2, z2 = right
+    return np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ], dtype=np.float64)
+
+
+def _quaternion_rotate(rotation: np.ndarray, vector: np.ndarray) -> np.ndarray:
+    pure = np.array([0.0, *vector], dtype=np.float64)
+    inverse = rotation * np.array([1.0, -1.0, -1.0, -1.0])
+    return _quaternion_product(_quaternion_product(rotation, pure), inverse)[1:]
 
 
 class BaseHabitatEnv(ABC):
@@ -101,7 +136,9 @@ class BaseHabitatEnv(ABC):
         """Depth image as (H, W) float32."""
         for key in self.DEPTH_KEYS:
             if key in habitat_obs:
-                depth = np.asarray(habitat_obs[key]).squeeze()
+                depth = np.asarray(habitat_obs[key])
+                if depth.ndim == 3 and depth.shape[2] == 1:
+                    depth = depth[:, :, 0]
                 return depth.astype(np.float32)
 
         return np.zeros(self._fallback_hw(), dtype=np.float32)
@@ -118,6 +155,111 @@ class BaseHabitatEnv(ABC):
         obs.update(self._extract_task_obs(habitat_obs))
         return obs
 
+    def _spatial_rgbd_info(self, habitat_obs: Dict, state: Any) -> Dict[str, Any]:
+        """Describe an aligned RGB-D sample using the *current* simulator sensor poses.
+
+        The RGB and depth arrays remain unchanged on the wire. In particular,
+        Habitat-Lab normally normalizes depth after clipping it to its configured
+        range; the client must decode that value before backprojection.
+        """
+        unavailable: Dict[str, Any] = {"status": "unavailable"}
+        try:
+            rgb_key = next(key for key in self.RGB_KEYS if key in habitat_obs)
+            depth_key = next(key for key in self.DEPTH_KEYS if key in habitat_obs)
+            rgb = np.asarray(habitat_obs[rgb_key])
+            depth = np.asarray(habitat_obs[depth_key])
+            if depth.ndim == 3 and depth.shape[2] == 1:
+                depth = depth[:, :, 0]
+            if (rgb.ndim != 3 or rgb.shape[2] not in (3, 4)
+                    or depth.ndim != 2 or rgb.shape[:2] != depth.shape):
+                raise ValueError("RGB and depth image sizes differ")
+            height, width = depth.shape
+
+            sim = self._habitat_env.sim
+            simulator_config = getattr(sim, "habitat_config", None)
+            if simulator_config is None:
+                env_config = getattr(self._habitat_env, "_config", None)
+                simulator_config = _config_value(
+                    _config_value(env_config, "habitat"), "simulator",
+                )
+            agents = _config_value(simulator_config, "agents")
+            agent_config = _config_value(agents, "main_agent")
+            sensors = _config_value(agent_config, "sim_sensors")
+            rgb_config = _config_value(sensors, "rgb_sensor")
+            depth_config = _config_value(sensors, "depth_sensor")
+            if rgb_config is None or depth_config is None:
+                raise ValueError("RGB/depth simulator sensor config is unavailable")
+            for config in (rgb_config, depth_config):
+                if (int(_config_value(config, "height")) != height
+                        or int(_config_value(config, "width")) != width):
+                    raise ValueError("sensor config size differs from RGB-D sample")
+                if str(_config_value(config, "sensor_subtype", "PINHOLE")) != "PINHOLE":
+                    raise ValueError("only pinhole RGB-D sensors are supported")
+            rgb_hfov = float(_config_value(rgb_config, "hfov"))
+            depth_hfov = float(_config_value(depth_config, "hfov"))
+            if (not 0.0 < rgb_hfov < 180.0
+                    or not math.isclose(rgb_hfov, depth_hfov, abs_tol=1e-5)):
+                raise ValueError("RGB/depth horizontal FOV is invalid or differs")
+            depth_min = float(_config_value(depth_config, "min_depth"))
+            depth_max = float(_config_value(depth_config, "max_depth"))
+            if (not math.isfinite(depth_min) or not math.isfinite(depth_max)
+                    or depth_min < 0.0 or depth_max <= depth_min):
+                raise ValueError("depth range is invalid")
+            normalized = _config_value(depth_config, "normalize_depth")
+            if not isinstance(normalized, bool):
+                raise ValueError("depth normalization setting is unavailable")
+
+            sensor_states = state.sensor_states
+            rgb_state = _config_value(sensor_states, rgb_key)
+            depth_state = _config_value(sensor_states, depth_key)
+            if rgb_state is None or depth_state is None:
+                raise ValueError("current RGB/depth sensor poses are unavailable")
+            agent_position = np.asarray(state.position, dtype=np.float64)
+            rgb_position = np.asarray(rgb_state.position, dtype=np.float64)
+            depth_position = np.asarray(depth_state.position, dtype=np.float64)
+            if (agent_position.shape != (3,) or rgb_position.shape != (3,)
+                    or depth_position.shape != (3,) or not np.isfinite(agent_position).all()
+                    or not np.isfinite(rgb_position).all()
+                    or not np.isfinite(depth_position).all()):
+                raise ValueError("invalid agent or sensor position")
+            agent_rotation = _quaternion_wxyz(state.rotation)
+            rgb_rotation = _quaternion_wxyz(rgb_state.rotation)
+            depth_rotation = _quaternion_wxyz(depth_state.rotation)
+            if (np.linalg.norm(rgb_position - depth_position) > 1e-4
+                    or abs(float(np.dot(rgb_rotation, depth_rotation))) < 1.0 - 1e-8):
+                raise ValueError("RGB/depth sensor poses are not aligned")
+
+            agent_inverse = agent_rotation * np.array([1.0, -1.0, -1.0, -1.0])
+            camera_position = _quaternion_rotate(agent_inverse, rgb_position - agent_position)
+            camera_rotation = _quaternion_product(agent_inverse, rgb_rotation)
+            camera_rotation /= np.linalg.norm(camera_rotation)
+            focal = (width / 2.0) / math.tan(math.radians(rgb_hfov) / 2.0)
+            return {
+                "status": "ok",
+                "image_size_hw": [height, width],
+                "K": [[focal, 0.0, width / 2.0],
+                      [0.0, focal, height / 2.0],
+                      [0.0, 0.0, 1.0]],
+                "agent_pose": {
+                    "position": agent_position.tolist(),
+                    "rotation": agent_rotation.tolist(),
+                },
+                "camera_extrinsics": {
+                    "position": camera_position.tolist(),
+                    "rotation": camera_rotation.tolist(),
+                },
+                "depth_encoding": "normalized_0_1" if normalized else "meters",
+                "min_depth_m": depth_min,
+                "max_depth_m": depth_max,
+                "camera_frame": "habitat_right_up_back",
+                "aligned": True,
+            }
+        except Exception as exc:  # noqa: BLE001
+            # A geometry consumer must reject this sample, never infer a camera
+            # pose from the agent position or from a hard-coded sensor height.
+            unavailable["reason"] = str(exc) or "required RGB-D metadata is unavailable"
+            return unavailable
+
     def _compute_info(self, habitat_obs: Dict) -> Dict[str, Any]:
         """steps, episode_id, scene_id (+ raw_episode_id when a loader renumbered) and metrics."""
         info: Dict[str, Any] = {"steps": self._step_count}
@@ -130,6 +272,7 @@ class BaseHabitatEnv(ABC):
             if raw_episode_id is not None:
                 info["raw_episode_id"] = raw_episode_id
 
+        state = None
         try:
             state = self._habitat_env.sim.get_agent_state()
             position = state.position
@@ -144,6 +287,8 @@ class BaseHabitatEnv(ABC):
         except (AttributeError, TypeError, ValueError):
             # Metadata only: custom test environments may not expose a simulator state.
             pass
+
+        info["spatial_rgbd"] = self._spatial_rgbd_info(habitat_obs, state)
 
         if hasattr(self._habitat_env, "get_metrics"):
             info.update(self._habitat_env.get_metrics())
@@ -201,6 +346,9 @@ class BaseHabitatEnv(ABC):
         habitat_obs = self._habitat_env.step(habitat_action)
         obs = self._build_observation(habitat_obs)
         info = self._compute_info(habitat_obs)
+        # Only the environment's real step creates this record. A reset or a
+        # similarity between two poses is not evidence of a traversed edge.
+        info["spatial_transition_record"] = True
         reward = self._compute_reward(obs, info)
         terminated = self._check_terminated(obs, info, action)
         truncated = self._step_count >= self.max_steps

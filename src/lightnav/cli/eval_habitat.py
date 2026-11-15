@@ -15,8 +15,10 @@ import os
 import sys
 
 from lightnav.habitat.runner import HabitatEvalConfig, MemoryConfig, run_habitat_eval
+from lightnav.memory.conceptgraphs_lite import GeometryConfig
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.rgm_config import RGMConfig
+from lightnav.memory.spatial_l3_config import SpatialL3Config
 from lightnav.memory.v3_config import RGMV3Config
 from lightnav.memory.v4_config import RGMV4Config
 
@@ -238,6 +240,32 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Maximum instruction-related landmarks in one local card.")
     p.add_argument("--local_graph_reactivation_steps", type=int, default=8,
                    help="Earliest step interval for reactivating an unchanged local card.")
+    p.add_argument("--spatial_l3_mode", choices=("off", "shadow", "inject"), default="off",
+                   help="ConceptGraphs-Lite: off, shadow diagnostics, or verified Prompt injection.")
+    p.add_argument("--spatial_l3_seg_model_path", default="",
+                   help="Local yolo11n-seg.pt path, independent of the L1 detector.")
+    p.add_argument("--spatial_l3_seg_device", default="cpu")
+    p.add_argument("--spatial_l3_seg_confidence", type=float, default=0.25)
+    p.add_argument("--spatial_l3_seg_every_n_steps", type=int, default=5)
+    p.add_argument("--spatial_l3_evidence_min_iou", type=float, default=0.5,
+                   help="Minimum instance-box IoU to link L3 geometry to L1 Evidence.")
+    p.add_argument("--spatial_l3_evidence_ambiguity_margin", type=float, default=0.1,
+                   help="Minimum best-versus-second L1 Evidence IoU margin.")
+    p.add_argument("--spatial_l3_min_injection_confidence", type=float, default=0.5,
+                   help="Minimum independent segmentation confidence for Prompt injection.")
+    geometry_defaults = GeometryConfig()
+    for name in (
+        "min_depth_m", "max_depth_m", "voxel_size_m", "max_center_distance_m",
+        "min_overlap_ratio", "min_bbox_iou", "ambiguity_margin_ratio",
+        "min_travel_distance_m",
+    ):
+        p.add_argument(
+            f"--spatial_l3_{name}", type=float, default=getattr(geometry_defaults, name),
+        )
+    for name in ("min_points", "max_points_per_instance", "max_points_per_object"):
+        p.add_argument(
+            f"--spatial_l3_{name}", type=int, default=getattr(geometry_defaults, name),
+        )
     for name, default in (
         ("step0_conditional", True), ("write_gate_enabled", True),
         ("retrieval_gate_enabled", True), ("prompt_gate_enabled", True),
@@ -400,6 +428,25 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                 prompt_max_chars=args.local_graph_prompt_max_chars,
                 max_landmarks=args.local_graph_max_landmarks,
                 reactivation_steps=args.local_graph_reactivation_steps,
+            ),
+            spatial_l3=SpatialL3Config(
+                mode=args.spatial_l3_mode,
+                seg_model_path=args.spatial_l3_seg_model_path,
+                seg_device=args.spatial_l3_seg_device,
+                seg_confidence=args.spatial_l3_seg_confidence,
+                seg_every_n_steps=args.spatial_l3_seg_every_n_steps,
+                evidence_min_iou=args.spatial_l3_evidence_min_iou,
+                evidence_ambiguity_margin=args.spatial_l3_evidence_ambiguity_margin,
+                min_injection_confidence=args.spatial_l3_min_injection_confidence,
+                geometry=GeometryConfig(**{
+                    name: getattr(args, f"spatial_l3_{name}") for name in (
+                        "min_depth_m", "max_depth_m", "min_points",
+                        "max_points_per_instance", "max_points_per_object",
+                        "voxel_size_m", "max_center_distance_m",
+                        "min_overlap_ratio", "min_bbox_iou",
+                        "ambiguity_margin_ratio", "min_travel_distance_m",
+                    )
+                }),
             ),
         ),
         save_video=args.save_video,

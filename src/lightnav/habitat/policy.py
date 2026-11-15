@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+import random
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
@@ -32,6 +34,31 @@ if TYPE_CHECKING:
     from lightnav.memory.manager import MemoryManager
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _preserve_global_rng():
+    """Keep a shadow extractor from changing baseline sampling state."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    try:
+        import torch
+    except ImportError:
+        torch = None
+    torch_state = torch.get_rng_state() if torch is not None else None
+    cuda_states = (
+        torch.cuda.get_rng_state_all()
+        if torch is not None and torch.cuda.is_available() else None
+    )
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        if torch is not None:
+            torch.set_rng_state(torch_state)
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all(cuda_states)
 
 
 def extract_instruction(obs: dict[str, Any] | None) -> str:
@@ -421,7 +448,7 @@ class TrajVocabVLNCEPolicy:
         return text, sample, diagnostic
 
     def _generate_with_local_graph_memory(
-        self, obs: dict[str, Any],
+        self, obs: dict[str, Any], info: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any], dict[str, Any]]:
         """Translate current and one-hop graph evidence into a compact VLN context."""
         from lightnav.memory.memory_context_builder import (
@@ -438,14 +465,41 @@ class TrajVocabVLNCEPolicy:
             last_action=self._last_executed_action, prediction=self._last_prediction,
         ))
         self._memory_step += 1
+        spatial_mode = manager.spatial_l3_config.mode
+        spatial_diagnostic = None
+        spatial_context = None
+        spatial_fallback_reason = None
+        if spatial_mode != "off":
+            with _preserve_global_rng() if spatial_mode == "shadow" else nullcontext():
+                try:
+                    spatial_diagnostic = manager.observe_spatial(obs, info, events, step=step)
+                    spatial_context = manager.get_spatial_context(step=step)
+                except Exception as exc:  # noqa: BLE001
+                    # Shadow must remain observational even if the L3 sidecar
+                    # fails unexpectedly. Injection falls back to Local Graph.
+                    spatial_fallback_reason = f"spatial_candidate: {exc}"
+                    spatial_diagnostic = {
+                        "mode": spatial_mode, "step": step,
+                        "rejection_reason": f"{type(exc).__name__}: {exc}",
+                    }
+            spatial_diagnostic["candidate_count"] = (
+                len(spatial_context.layer_items) if spatial_context is not None else 0
+            )
         base_sample = build_vln_traj_sample(
             self.agent._get_video_tensor(), self.agent.instruction,
             list(self.agent._history_frame_ids), self.engine.bundle,
         )
         budget = min(manager.local_graph_config.prompt_max_chars, manager.max_context_chars)
-        context = manager.get_local_graph_context(
-            step=step, rgb_width=int(obs["rgb"].shape[1]), events=events,
-        )
+        context_source = "local_graph"
+        if spatial_mode == "inject" and spatial_context is not None:
+            context = spatial_context
+            context_source = "spatial_l3"
+        else:
+            if spatial_mode == "inject" and spatial_fallback_reason is None:
+                spatial_fallback_reason = "no_trusted_spatial_candidate"
+            context = manager.get_local_graph_context(
+                step=step, rgb_width=int(obs["rgb"].shape[1]), events=events,
+            )
         sample = base_sample
         memory_text = ""
         prompt_audit = None
@@ -494,11 +548,19 @@ class TrajVocabVLNCEPolicy:
                     }
                 except (KeyError, ValueError) as exc:
                     fallback_reason = f"prompt_contract: {exc}"
-                    manager.local_graph_fusion.discard_selection()
+                    if context_source == "local_graph":
+                        manager.local_graph_fusion.discard_selection()
                     context = None
                     sample = base_sample
                     memory_text = ""
                     prompt_audit = None
+                    if context_source == "spatial_l3":
+                        spatial_fallback_reason = fallback_reason
+                        context = manager.get_local_graph_context(
+                            step=step, rgb_width=int(obs["rgb"].shape[1]), events=events,
+                        )
+                        context_source = "local_graph"
+                        continue
             try:
                 text, _ = self.engine.generate(sample)
                 break
@@ -517,8 +579,15 @@ class TrajVocabVLNCEPolicy:
                     )
                 else:
                     context = None
-                    manager.local_graph_fusion.discard_selection()
                     fallback_reason = "all local graph lines exceeded Processor token budget"
+                    if context_source == "spatial_l3":
+                        spatial_fallback_reason = fallback_reason
+                        context = manager.get_local_graph_context(
+                            step=step, rgb_width=int(obs["rgb"].shape[1]), events=events,
+                        )
+                        context_source = "local_graph"
+                    else:
+                        manager.local_graph_fusion.discard_selection()
                 sample = base_sample
                 memory_text = ""
                 prompt_audit = None
@@ -537,15 +606,24 @@ class TrajVocabVLNCEPolicy:
         visible_ids = list(model_input.get("model_visible_evidence_ids", [])) if block_visible else []
         actual_injection = bool(context is not None and visible_ids and block_visible)
         if actual_injection:
-            manager.local_graph_fusion.confirm_injected(visible_ids, step)
-        elif context is not None:
+            if context_source == "local_graph":
+                manager.local_graph_fusion.confirm_injected(visible_ids, step)
+        elif context is not None and context_source == "local_graph":
             manager.local_graph_fusion.discard_selection()
         historical_ids = [
             key for key in visible_ids
-            if (record := manager.v3_store.get_evidence(key)) is not None
-            and ((record.episode_id, record.rollout_idx)
-                 != (manager.working.state.episode_id, manager.v3_rollout_idx)
-                 or record.step < step)
+            if (
+                (record := manager.v3_store.get_evidence(key)) is not None
+                and ((record.episode_id, record.rollout_idx)
+                     != (manager.working.state.episode_id, manager.v3_rollout_idx)
+                     or record.step < step)
+            ) or (
+                manager.spatial_map is not None
+                and (spatial_record := manager.spatial_map.evidence.get(key)) is not None
+                and ((spatial_record.episode_id, spatial_record.rollout_idx)
+                     != (manager.working.state.episode_id, manager.v3_rollout_idx)
+                     or spatial_record.step_id < step)
+            )
         ]
         diagnostic = {
             "episode_id": manager.working.state.episode_id,
@@ -571,6 +649,13 @@ class TrajVocabVLNCEPolicy:
             ),
             "model_input_diagnostic": dict(model_input) if checked else None,
         }
+        if spatial_diagnostic is not None:
+            diagnostic["spatial_l3"] = {
+                **spatial_diagnostic,
+                "context_source": context_source,
+                "fallback_reason": spatial_fallback_reason,
+                "shadow_no_spatial_injection": spatial_mode == "shadow",
+            }
         return text, sample, diagnostic
 
     def act(self, obs: dict[str, Any], info: dict[str, Any] | None = None) -> dict:
@@ -590,8 +675,10 @@ class TrajVocabVLNCEPolicy:
         if v4_enabled:
             text, sample, diagnostic = self._generate_with_v4_memory(obs)
             rgm_enabled = False  # V4 diagnostics are finalized in the helper.
-        elif self._memory_episode_open and self.memory_manager.local_graph_config.enabled:
-            text, sample, diagnostic = self._generate_with_local_graph_memory(obs)
+        elif self._memory_episode_open and getattr(
+            getattr(self.memory_manager, "local_graph_config", None), "enabled", False,
+        ):
+            text, sample, diagnostic = self._generate_with_local_graph_memory(obs, info)
             rgm_enabled = False
         elif self._memory_episode_open:
             from lightnav.memory.memory_context_builder import (

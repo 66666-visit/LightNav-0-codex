@@ -119,8 +119,10 @@ and pose when the Habitat server supplies one. The bundled R2R server includes
 `agent_pose` (position and quaternion) when simulator state is available;
 otherwise the trace records `null`.
 `action_divergence_vs_baseline`, `invalid_exploration`, and `wrong_turn` remain `null` until matched
-traces are compared with each other and the reference route. The trace never
-feeds evaluator distance or pose into the policy. `--trace_steps` requires
+traces are compared with each other and the reference route. The legacy
+memory paths never feed evaluator distance or pose into the policy; the
+explicit ConceptGraphs-Lite L3 modes separately consume the server's
+`spatial_rgbd` pose and calibration, never evaluator goal distance. `--trace_steps` requires
 `--episodes 1`, an explicit output directory, and a fresh trace/results path;
 it cannot be combined with `--resume`.
 
@@ -183,9 +185,10 @@ The uncalibrated numeric flags and defaults are:
 | `prompt_max_records` / `prompt_max_chars` | 3 / 400 | Final injected memory budget |
 
 All RGM flags appear in `config_snapshot.yaml` under `memory_args`. Scores are
-engineering thresholds, not calibrated probabilities. No current server field
-supplies Pose, collision feedback or odometry; RGM never marks a traversal as
-physically verified.
+engineering thresholds, not calibrated probabilities. RGM V1 does not consume
+pose, collision feedback or odometry, so it never marks a traversal as
+physically verified. The new `spatial_rgbd` metadata is consumed only by the
+explicit ConceptGraphs-Lite L3 path described below.
 
 For the new A/C/D Pilot, use
 `bash scripts/run_memory_ablation.sh --rgm-88 --parent-manifest OLD/pilot_manifest.json`
@@ -289,6 +292,109 @@ camera-sector observation; a DINO-linked earlier landmark is labelled as a
 possible revisit with unknown current direction and traversability. The module
 does not infer a route or change the action decoder.
 
+### ConceptGraphs-Lite L3 (Habitat Local Graph extension)
+
+`--spatial_l3_mode {off,shadow,inject}` adds the independent three-dimensional
+object map described in [CONCEPTGRAPHS_LITE_L3.md](research/CONCEPTGRAPHS_LITE_L3.md).
+It requires `--memory_enabled --memory_strategy hierarchical --memory_layers
+short,mid,long --local_graph_enabled`. The default `off` preserves the existing
+Local Graph behavior. It runs only in the Habitat evaluation client when that
+client receives aligned RGB-D and calibration metadata from the Habitat server;
+the WebSocket inference server has no RGB-D map interface.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--spatial_l3_mode` | `off` | `shadow` builds/searches the graph for diagnostics without modifying the original model input; `inject` allows audited, trustworthy spatial candidates |
+| `--spatial_l3_seg_model_path FILE` | empty | Existing local `yolo11n-seg.pt`; required for `shadow` or `inject`; never downloaded or overwritten |
+| `--spatial_l3_seg_device` | `cpu` | Independent segmentation inference device |
+| `--spatial_l3_seg_confidence` | `0.25` | Raw YOLO segmentation score floor, not a calibrated probability |
+| `--spatial_l3_seg_every_n_steps` | `5` | L3 Mask extraction cadence (step 0, 5, 10, …), independent of L1 |
+| `--spatial_l3_evidence_min_iou` | `0.5` | Minimum same-class segmentation-box/L1-box IoU for an optional cross-reference |
+| `--spatial_l3_evidence_ambiguity_margin` | `0.1` | Reject an L1 cross-reference when the best and second-best IoU differ by less |
+| `--spatial_l3_min_injection_confidence` | `0.5` | Minimum raw L3 segmentation confidence for a historical object to enter Prompt |
+
+The original L1 `--memory_extractor yolo11 --memory_extractor_model_path
+/local/yolo11n.pt` still runs separately. The L3 model must produce a real
+instance Mask; no detection box is rasterized into one. Both weights are local,
+independently configured, and untouched by the runner. Each valid L3 Mask
+receives its own source-qualified, Scene/Episode/rollout/Step-specific Evidence
+record. A same-class, high-overlap L1 box may be kept as an **optional**
+cross-reference. A missing or ambiguous L1 match never changes the L3 Mask or
+blocks a geometrically valid object. The original L1 Evidence contract remains
+unchanged. Use separate local paths for the two model weights.
+
+Each `shadow` or `inject` run also writes `conceptgraphs_l3_protocol.json` with
+its mode and geometry settings beside the unchanged `local_graph_protocol.json`.
+The output directory must be fresh, so these settings cannot overwrite an
+earlier Local Graph result.
+
+Habitat may send Depth normalized after clipping to its configured sensor
+range. The server declares `depth_encoding`, sensor min/max, K, wxyz Agent
+Pose, and current Sensor Extrinsics under `info.spatial_rgbd` for the same
+observation. The client converts depth to metres and rejects censored range
+endpoints, invalid pixels, unaligned images, and missing/ambiguous metadata.
+Its L3 object map is Episode-local in V1.1 even when the old Local Graph
+scope is `scene_persistent`.
+
+All geometry flags have the prefix `--spatial_l3_` followed by the field below.
+They can be passed directly to `lightnav-eval-habitat`; distance fields use
+metres, while IoU and ratio fields are dimensionless and point limits are integers.
+
+| Suffix | Default | Meaning |
+| --- | ---: | --- |
+| `min_depth_m` / `max_depth_m` | `0.1` / `10.0` | Map filter; the Habitat server's actual sensor min/max range is applied first |
+| `min_points` | `8` | Minimum valid Mask depth pixels for geometry |
+| `max_points_per_instance` / `max_points_per_object` | `256` / `2048` | Bounded online point-cloud samples |
+| `voxel_size_m` | `0.03` | Voxel downsampling size and strict nearest-neighbor radius for `n_ratio` |
+| `max_center_distance_m` | `0.75` | Existing-object candidate search radius |
+| `min_overlap_ratio` | `0.35` | Minimum one-way `n_ratio`: fraction of new detection points within `voxel_size_m` of a historical object point |
+| `min_bbox_iou` | `0.01` | Minimum padded 3D axis-aligned box IoU pre-gate; not the match score |
+| `ambiguity_margin_ratio` | `0.12` | Minimum dimensionless best-vs-second `n_ratio` advantage; otherwise create a new node |
+| `min_travel_distance_m` | `0.01` | Minimum measured pose displacement for a recorded `traversed_to` edge |
+
+The earlier experimental flags `--spatial_l3_max_surface_distance_m` and
+`--spatial_l3_ambiguity_margin_m` have been removed. Use `voxel_size_m` for
+the `n_ratio` neighbor radius and `ambiguity_margin_ratio` for its score gap.
+
+The matching rule requires the same class, center distance within its maximum,
+padded 3D box IoU above its floor, and `n_ratio` above its floor. The original
+ConceptGraphs `overlap` mode defines `n_ratio` as the one-way fraction of new
+detection points whose nearest historical-object point is strictly closer than
+the voxel radius. L3 uses only this geometry score: it computes ambiguity
+against all historical candidates before greedy, one-to-one assignment within
+each frame. A losing contender creates a new object rather than falling back
+to its runner-up. The class, center, padded-box, ambiguity and one-to-one gates
+are this project's conservative Geometry-only adaptations. These thresholds
+are engineering starting points, not values measured on this project's R2R scenes.
+Adjust only against real RGB-D data and report the selected values with the
+result. A recorded environment step with valid pre/post pose is required for
+`traversed_to`; an issued velocity alone is insufficient.
+
+For a one-Episode AutoDL smoke run, after starting the Habitat server in its
+separate Python 3.9 environment and preparing both existing local weights:
+
+```bash
+lightnav-eval-habitat \
+    --model_path /path/to/LightNav-0 --server tcp://127.0.0.1:5555 \
+    --backend vllm_local --episodes 1 --trace_steps \
+    --output_dir output/conceptgraphs_l3_shadow_smoke \
+    --memory_enabled --memory_strategy hierarchical \
+    --memory_layers short,mid,long --local_graph_enabled \
+    --memory_extractor yolo11 \
+    --memory_extractor_model_path /path/to/yolo11n.pt \
+    --spatial_l3_mode shadow \
+    --spatial_l3_seg_model_path /path/to/yolo11n-seg.pt
+```
+
+Use a fresh output directory for each run. Change only `shadow` to `inject`
+and use a separate directory for the injection smoke run. In `shadow`, compare
+the actual final Prompt/Token ID hashes and decoded action to a matched
+baseline run on the same observation; the graph and candidates are diagnostic.
+In `inject`, only trusted candidates pass the existing Prompt gate, budget and
+Token audit. A missing geometric candidate falls back to the original Local
+Graph candidate path; an empty/failed final prompt falls back to the original
+LightNav sample.
+
 The underlying `scripts/eval_habitat.sh` also accepts `STRICT_FULL_EVAL=1`
 for the full-split gate, `RESUME=1` to skip existing completed Episodes,
 `EPISODE_MANIFEST_PATH` to create or compare a shared manifest, `SEED` for
@@ -305,7 +411,8 @@ For one R2R Episode, the Habitat server accepts `--single-scene-id <path>` and
 Episode by canonical scene path and full ID before iteration, and reject pilot,
 strict full evaluation or sharding. The server also reports `agent_pose`
 (`position` and quaternion) in `info` when simulator state is available; this
-is evaluator-side trace data and is not passed into the memory packet. Resolve
+is evaluator-side trace data for legacy modes. Explicit ConceptGraphs-Lite L3
+uses the separate same-step `spatial_rgbd` calibration and pose record. Resolve
 the two IDs from a manifest and the dataset with
 `scripts/resolve_single_episode.py`; see
 [EPISODE1_EXPERIMENT.md](research/EPISODE1_EXPERIMENT.md).

@@ -9,6 +9,7 @@ from dataclasses import asdict, replace
 from time import perf_counter
 from uuid import uuid4
 
+from lightnav.memory.conceptgraphs_lite import ObjectMap, RGBDFrame
 from lightnav.memory.episodic_memory import EpisodicMemory
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.local_graph_fusion import LocalGraphFusion
@@ -32,6 +33,8 @@ from lightnav.memory.schemas import (
     PlaceDecision,
 )
 from lightnav.memory.semantic_index import SemanticIndex
+from lightnav.memory.spatial_graph_adapter import SpatialGraphAdapter, make_spatial_evidence
+from lightnav.memory.spatial_l3_config import SpatialL3Config
 from lightnav.memory.topological_memory import PlaceObservationResult, TopologicalMemory
 from lightnav.memory.v3_config import RGMV3Config
 from lightnav.memory.v3_formatter import V3PromptFormatter
@@ -72,6 +75,8 @@ class MemoryManager:
         v3_config: RGMV3Config | None = None,
         v4_config: RGMV4Config | None = None,
         local_graph_config: LocalGraphConfig | None = None,
+        spatial_l3_config: SpatialL3Config | None = None,
+        spatial_extractor: object | None = None,
     ) -> None:
         if top_k < 0:
             raise ValueError("top_k must be nonnegative")
@@ -102,6 +107,21 @@ class MemoryManager:
         self.v3_config = v3_config or RGMV3Config()
         self.v4_config = v4_config or RGMV4Config()
         self.local_graph_config = local_graph_config or LocalGraphConfig()
+        self.spatial_l3_config = spatial_l3_config or SpatialL3Config()
+        if self.spatial_l3_config.mode != "off" and not self.local_graph_config.enabled:
+            raise ValueError("spatial L3 requires Local Graph to be enabled")
+        if self.spatial_l3_config.mode != "off" and spatial_extractor is None:
+            raise ValueError("spatial L3 requires an independent segmentation extractor")
+        self.spatial_extractor = spatial_extractor
+        self.spatial_map = (
+            ObjectMap(self.spatial_l3_config.geometry)
+            if self.spatial_l3_config.mode != "off" else None
+        )
+        self.spatial_adapter = (
+            SpatialGraphAdapter() if self.spatial_map is not None else None
+        )
+        self.last_spatial_frame: RGBDFrame | None = None
+        self.last_spatial_diagnostic: dict = {}
         if sum((self.rgm_config.enabled, self.v3_config.enabled,
                 self.v4_config.enabled, self.local_graph_config.enabled)) > 1:
             raise ValueError("legacy RGM, RGM V3, RGM V4 and local graph cannot run together")
@@ -228,6 +248,11 @@ class MemoryManager:
             self.local_graph_fusion.reset_episode(
                 self.v3_scene_id, episode_id, rollout_idx,
             )
+        if self.spatial_map is not None:
+            self.spatial_map.reset_episode(self.v3_scene_id, episode_id, rollout_idx)
+            self.last_spatial_frame = None
+            self.last_spatial_diagnostic = {}
+            self.spatial_extractor.reset_episode(episode_id, instruction)
         self.extractor.reset_episode(episode_id, instruction)
         if self.topology_active:
             assert self.place_extractor is not None
@@ -314,6 +339,90 @@ class MemoryManager:
             raise TypeError("action must be a dict")
         self._pending_action = deepcopy(action)
         self._pending_prediction = prediction
+
+    def observe_spatial(
+        self, obs: dict, info: dict | None, events: list[MemoryEvent], *, step: int,
+    ) -> dict:
+        """Build the independent 3D graph after L1 has persisted this step's Evidence."""
+        self._require_writer()
+        if self.spatial_map is None or self.spatial_extractor is None:
+            return {}
+        diagnostic = {
+            "mode": self.spatial_l3_config.mode, "step": step,
+            "frame_valid": False, "segmentation_count": 0,
+            "evidence_minted": 0, "evidence_linked": 0, "evidence_unmatched": 0,
+            "evidence_ambiguous": 0, "observed_objects": 0,
+            "object_nodes": len(self.spatial_map.objects),
+            "viewpoints": len(self.spatial_map.viewpoints),
+            "observed_from_edges": sum(
+                edge.relation_type == "observed_from" for edge in self.spatial_map.edges
+            ),
+            "traversed_to_edges": sum(
+                edge.relation_type == "traversed_to" for edge in self.spatial_map.edges
+            ),
+            "rejection_reason": None,
+        }
+        self.last_spatial_frame = None
+        try:
+            frame = RGBDFrame.from_habitat(obs, info)
+            diagnostic["frame_valid"] = True
+            self.last_spatial_frame = frame
+            instances = self.spatial_extractor.extract(frame.rgb, step)
+            diagnostic["segmentation_count"] = len(instances)
+            masks, counts = make_spatial_evidence(
+                instances, events, self.v3_store,
+                scene_id=self.v3_scene_id,
+                episode_id=self.working.state.episode_id,
+                rollout_idx=self.v3_rollout_idx,
+                step=step,
+                source=f"yolo11n-seg:{self.spatial_l3_config.seg_model_path.rsplit('/', 1)[-1]}",
+                min_iou=self.spatial_l3_config.evidence_min_iou,
+                ambiguity_margin=self.spatial_l3_config.evidence_ambiguity_margin,
+            )
+            diagnostic["evidence_minted"] = counts["minted"]
+            diagnostic["evidence_linked"] = counts["linked"]
+            diagnostic["evidence_unmatched"] = counts["unmatched"]
+            diagnostic["evidence_ambiguous"] = counts["ambiguous"]
+            observed = self.spatial_map.observe(
+                frame, masks, step_id=step,
+                transition_record=bool((info or {}).get("spatial_transition_record") is True),
+            )
+            diagnostic["observed_objects"] = len(observed)
+            diagnostic["object_nodes"] = len(self.spatial_map.objects)
+            diagnostic["viewpoints"] = len(self.spatial_map.viewpoints)
+            diagnostic["observed_from_edges"] = sum(
+                edge.relation_type == "observed_from" for edge in self.spatial_map.edges
+            )
+            diagnostic["traversed_to_edges"] = sum(
+                edge.relation_type == "traversed_to" for edge in self.spatial_map.edges
+            )
+        except Exception as exc:  # noqa: BLE001
+            # L3 is an optional sidecar. A segmentation or geometry failure must
+            # never prevent the frozen policy from using its original path.
+            diagnostic["rejection_reason"] = f"{type(exc).__name__}: {exc}"
+            self.last_spatial_frame = None
+            logger.warning("spatial L3 rejected step=%s: %s", step, exc)
+        self.last_spatial_diagnostic = diagnostic
+        return dict(diagnostic)
+
+    def get_spatial_context(self, *, step: int) -> MemoryContext | None:
+        """Adapt reliable historical 3D objects to the existing prompt contract."""
+        if self.spatial_map is None or self.spatial_adapter is None:
+            return None
+        if self.last_spatial_frame is None or self.v3_store is None:
+            return None
+        return self.spatial_adapter.build(
+            self.v3_store, self.spatial_map, self.last_spatial_frame,
+            scene_id=self.v3_scene_id, episode_id=self.working.state.episode_id,
+            rollout_idx=self.v3_rollout_idx, step=step,
+            instruction=self.working.state.instruction,
+            scope=self.local_graph_config.scope,
+            max_landmarks=self.local_graph_config.max_landmarks,
+            prompt_max_chars=min(
+                self.local_graph_config.prompt_max_chars, self.max_context_chars,
+            ),
+            min_confidence=self.spatial_l3_config.min_injection_confidence,
+        )
 
     def record_v4_frame_id(self, step: int, frame_id: int) -> None:
         """Bind one memory Step to the TrackingAgent frame actually observed."""
@@ -582,6 +691,14 @@ class MemoryManager:
                 self._v4_dropped_candidates = []
             if self.local_graph_fusion is not None:
                 self.local_graph_fusion.close_episode()
+            if self.spatial_map is not None:
+                self.spatial_extractor.close_episode()
+                self.spatial_map.objects.clear()
+                self.spatial_map.viewpoints.clear()
+                self.spatial_map.edges.clear()
+                self.spatial_map.evidence.clear()
+                self.last_spatial_frame = None
+                self.last_spatial_diagnostic = {}
             self._writer = None
             self._pending_action = None
             self._pending_prediction = None

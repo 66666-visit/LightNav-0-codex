@@ -21,7 +21,7 @@ import os
 import random
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable
@@ -48,6 +48,7 @@ from lightnav.habitat.results import (
 )
 from lightnav.memory.local_graph_config import LOCAL_GRAPH_PROTOCOL_VERSION, LocalGraphConfig
 from lightnav.memory.rgm_config import RGMConfig
+from lightnav.memory.spatial_l3_config import SpatialL3Config
 from lightnav.memory.v3_config import RGM_V3_PROTOCOL_VERSION, RGMV3Config
 from lightnav.memory.v4_config import RGM_V4_PROTOCOL_VERSION, RGMV4Config
 from lightnav.serving.protocol import pointing_payload
@@ -84,6 +85,7 @@ class MemoryConfig:
     rgm_v3: RGMV3Config = field(default_factory=RGMV3Config)
     rgm_v4: RGMV4Config = field(default_factory=RGMV4Config)
     local_graph: LocalGraphConfig = field(default_factory=LocalGraphConfig)
+    spatial_l3: SpatialL3Config = field(default_factory=SpatialL3Config)
 
     def __post_init__(self) -> None:
         if self.top_k < 1 or self.max_context_chars < 1:
@@ -126,6 +128,13 @@ class MemoryConfig:
             raise ValueError("RGM V4 requires memory_enabled")
         if self.local_graph.enabled and not self.enabled:
             raise ValueError("local graph requires memory_enabled")
+        if self.spatial_l3.mode != "off" and not self.local_graph.enabled:
+            raise ValueError("spatial L3 requires local graph enabled")
+        if self.spatial_l3.mode != "off" and self.extractor != "yolo11":
+            raise ValueError("spatial L3 requires the independent L1 yolo11 detector")
+        if (self.spatial_l3.mode != "off" and self.spatial_l3.seg_model_path
+                == self.extractor_model_path):
+            raise ValueError("spatial L3 and L1 must use independent model paths")
         if sum((self.rgm.enabled, self.rgm_v3.enabled, self.rgm_v4.enabled,
                 self.local_graph.enabled)) > 1:
             raise ValueError("legacy RGM, RGM V3, RGM V4 and local graph cannot run together")
@@ -403,6 +412,7 @@ def build_velocity_policy(
 
         extractor = None
         place_extractor = None
+        spatial_extractor = None
         if cfg.memory.extractor == "yolo11":
             from lightnav.memory.yolo_scene_extractor import YOLOSceneExtractor
 
@@ -411,6 +421,15 @@ def build_velocity_policy(
                 device=cfg.memory.extractor_device,
                 confidence=cfg.memory.extractor_confidence,
                 every_n_steps=cfg.memory.extract_every_n_steps,
+            )
+        if cfg.memory.spatial_l3.mode != "off":
+            from lightnav.memory.yolo_seg_extractor import YOLOSegExtractor
+
+            spatial_extractor = YOLOSegExtractor(
+                model_path=cfg.memory.spatial_l3.seg_model_path,
+                device=cfg.memory.spatial_l3.seg_device,
+                confidence=cfg.memory.spatial_l3.seg_confidence,
+                every_n_steps=cfg.memory.spatial_l3.seg_every_n_steps,
             )
         if (
             cfg.memory.place_enabled and cfg.memory.strategy == "hierarchical"
@@ -436,6 +455,8 @@ def build_velocity_policy(
             v3_config=cfg.memory.rgm_v3,
             v4_config=cfg.memory.rgm_v4,
             local_graph_config=cfg.memory.local_graph,
+            spatial_l3_config=cfg.memory.spatial_l3,
+            spatial_extractor=spatial_extractor,
         )
     return TrajVocabVLNCEPolicy(
         engine,
@@ -871,6 +892,19 @@ def _prepare_local_graph_output_dir(output_dir: str, config: LocalGraphConfig) -
         stream.write("\n")
 
 
+def _write_spatial_l3_protocol(output_dir: str, config: SpatialL3Config) -> None:
+    """Identify the spatial experiment without changing the Local Graph marker."""
+    if config.mode == "off":
+        return
+    marker = Path(output_dir) / "conceptgraphs_l3_protocol.json"
+    with marker.open("x", encoding="utf-8") as stream:
+        json.dump({
+            "protocol_version": "conceptgraphs_lite_l3_v1_1",
+            "spatial_l3": asdict(config),
+        }, stream, indent=2)
+        stream.write("\n")
+
+
 def _guard_non_v3_v4_output_dir(output_dir: str) -> None:
     """Prevent Baseline/Legacy runs from reusing reserved V3/V4 results."""
     path = Path(output_dir)
@@ -878,6 +912,7 @@ def _guard_non_v3_v4_output_dir(output_dir: str) -> None:
         raise ValueError("V3/V4 Pilot results require their matching memory backend")
     if any((path / name).is_file() for name in (
         "rgm_v3_protocol.json", "rgm_v4_protocol.json", "local_graph_protocol.json",
+        "conceptgraphs_l3_protocol.json",
     )):
         raise ValueError("V3/V4 result directory cannot be reused by another backend")
 
@@ -921,13 +956,14 @@ def run_habitat_eval(
 
     output_dir = cfg.output_dir or "output/habitat_eval"
     if cfg.trace_steps and Path(output_dir).exists() and any(Path(output_dir).iterdir()):
-        raise FileExistsError("step trace requires a new empty output directory")
+        raise FileExistsError("step trace requires fresh empty output directory")
     if cfg.memory.rgm_v3.enabled:
         _prepare_v3_output_dir(output_dir, cfg.memory.rgm_v3, resume=cfg.resume)
     elif cfg.memory.rgm_v4.enabled:
         _prepare_v4_output_dir(output_dir, cfg.memory.rgm_v4, resume=cfg.resume)
     elif cfg.memory.local_graph.enabled:
         _prepare_local_graph_output_dir(output_dir, cfg.memory.local_graph)
+        _write_spatial_l3_protocol(output_dir, cfg.memory.spatial_l3)
     else:
         _guard_non_v3_v4_output_dir(output_dir)
     os.makedirs(output_dir, exist_ok=True)
