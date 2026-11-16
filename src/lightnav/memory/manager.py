@@ -361,6 +361,11 @@ class MemoryManager:
             "mode": self.spatial_l3_config.mode, "step": step,
             "frame_valid": False, "segmentation_count": 0,
             "evidence_minted": 0, "evidence_linked": 0, "evidence_unmatched": 0,
+            "evidence_unmatched_no_same_class": 0,
+            "evidence_unmatched_invalid_l1_bbox": 0,
+            "evidence_unmatched_low_iou": 0,
+            "evidence_unmatched_low_mask_coverage": 0,
+            "evidence_unmatched_invalid_l1_evidence": 0,
             "evidence_ambiguous": 0, "observed_objects": 0,
             "object_nodes": len(self.spatial_map.objects),
             "viewpoints": len(self.spatial_map.viewpoints),
@@ -370,15 +375,18 @@ class MemoryManager:
             "traversed_to_edges": sum(
                 edge.relation_type == "traversed_to" for edge in self.spatial_map.edges
             ),
-            "rejection_reason": None,
+            "rejection_reason": None, "failure_stage": None,
         }
         self.last_spatial_frame = None
+        stage = "rgbd_frame"
         try:
             frame = RGBDFrame.from_habitat(obs, info)
             diagnostic["frame_valid"] = True
             self.last_spatial_frame = frame
+            stage = "segmentation"
             instances = self.spatial_extractor.extract(frame.rgb, step)
             diagnostic["segmentation_count"] = len(instances)
+            stage = "spatial_evidence"
             masks, counts = make_spatial_evidence(
                 instances, events, self.v3_store,
                 scene_id=self.v3_scene_id,
@@ -392,11 +400,19 @@ class MemoryManager:
             diagnostic["evidence_minted"] = counts["minted"]
             diagnostic["evidence_linked"] = counts["linked"]
             diagnostic["evidence_unmatched"] = counts["unmatched"]
+            for reason in (
+                "unmatched_no_same_class", "unmatched_invalid_l1_bbox",
+                "unmatched_low_iou", "unmatched_low_mask_coverage",
+                "unmatched_invalid_l1_evidence",
+            ):
+                diagnostic[f"evidence_{reason}"] = counts[reason]
             diagnostic["evidence_ambiguous"] = counts["ambiguous"]
+            stage = "object_map_observe"
             observed = self.spatial_map.observe(
                 frame, masks, step_id=step,
                 transition_record=bool((info or {}).get("spatial_transition_record") is True),
             )
+            stage = "diagnostic_summary"
             diagnostic["observed_objects"] = len(observed)
             diagnostic["object_nodes"] = len(self.spatial_map.objects)
             diagnostic["viewpoints"] = len(self.spatial_map.viewpoints)
@@ -410,6 +426,7 @@ class MemoryManager:
             # L3 is an optional sidecar. A segmentation or geometry failure must
             # never prevent the frozen policy from using its original path.
             diagnostic["rejection_reason"] = f"{type(exc).__name__}: {exc}"
+            diagnostic["failure_stage"] = stage
             self.last_spatial_frame = None
             logger.warning("spatial L3 rejected step=%s: %s", step, exc)
         self.last_spatial_diagnostic = diagnostic

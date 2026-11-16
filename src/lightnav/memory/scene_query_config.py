@@ -24,6 +24,8 @@ class SceneQueryConfig:
     model: str = ""
     timeout: float = 30.0
     max_rounds: int = 4
+    max_tool_calls: int = 12
+    thinking: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
@@ -36,6 +38,12 @@ class SceneQueryConfig:
             raise ValueError("MEMORY_QUERY_TIMEOUT must be finite and positive")
         if type(self.max_rounds) is not int or self.max_rounds < 1:
             raise ValueError("MEMORY_QUERY_MAX_ROUNDS must be a positive integer")
+        if type(self.max_tool_calls) is not int or self.max_tool_calls < 1:
+            raise ValueError("MEMORY_QUERY_MAX_TOOL_CALLS must be a positive integer")
+        if self.thinking is not None and (
+            not isinstance(self.thinking, str) or self.thinking not in {"enabled", "disabled"}
+        ):
+            raise ValueError("MEMORY_QUERY_THINKING must be enabled or disabled")
 
     @classmethod
     def from_env(cls, *, enabled: bool | None = None) -> SceneQueryConfig:
@@ -49,4 +57,6 @@ class SceneQueryConfig:
             model=os.getenv("MEMORY_QUERY_MODEL", ""),
             timeout=float(os.getenv("MEMORY_QUERY_TIMEOUT", "30")),
             max_rounds=int(os.getenv("MEMORY_QUERY_MAX_ROUNDS", "4")),
+            max_tool_calls=int(os.getenv("MEMORY_QUERY_MAX_TOOL_CALLS", "12")),
+            thinking=(os.getenv("MEMORY_QUERY_THINKING", "").strip().casefold() or None),
         )

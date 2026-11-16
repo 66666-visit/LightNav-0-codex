@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import deque
+from itertools import count
 from typing import Any
 
 import numpy as np
@@ -40,10 +41,14 @@ class _MockProvider:
         self.responses = deque(responses)
         self.calls: list[dict[str, Any]] = []
 
-    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+    def complete(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *,
+        tool_choice: str = "auto",
+    ) -> dict[str, Any]:
         self.calls.append({
             "messages": json.loads(json.dumps(messages)),
             "tool_names": [tool["function"]["name"] for tool in tools],
+            "tool_choice": tool_choice,
         })
         return self.responses.popleft()
 
@@ -107,9 +112,12 @@ def _map_objects(
             for node, instance in zip(nodes, instances)]
 
 
+_TOOL_CALL_IDS = count()
+
+
 def _tool(name: str, **arguments: Any) -> dict[str, Any]:
     return {
-        "id": f"call_{name}", "type": "function",
+        "id": f"call_{name}_{next(_TOOL_CALL_IDS)}", "type": "function",
         "function": {"name": name, "arguments": json.dumps(arguments)},
     }
 
@@ -132,9 +140,13 @@ def _final(
     })}
 
 
-def _controller(*responses: dict[str, Any]) -> tuple[SceneQueryController, _MockProvider]:
+def _controller(
+    *responses: dict[str, Any], max_rounds: int = 4, max_tool_calls: int = 12,
+) -> tuple[SceneQueryController, _MockProvider]:
     provider = _MockProvider(*responses)
-    return SceneQueryController(SceneQueryConfig(enabled=True, max_rounds=4), provider), provider
+    return SceneQueryController(SceneQueryConfig(
+        enabled=True, max_rounds=max_rounds, max_tool_calls=max_tool_calls,
+    ), provider), provider
 
 
 def test_l1_suffices_without_a_map_query_or_l2_input() -> None:
@@ -594,6 +606,403 @@ def test_changed_navigation_demand_selects_previously_unused_historical_object()
         item["kind"] == "l3_object" and item["id"] == sofa[0]
         for item in second_payload["recent_memory_selections"]
     )
+
+
+def test_multi_round_tool_feedback_preserves_reasoning_content_without_logging_it() -> None:
+    manager = _manager()
+    _observe_l1(manager, 0)
+    object_id, evidence_id = _map_objects(manager, ("sofa", 1, 4, None))[0]
+    _observe_l1(manager, 1)
+    private_first = "PRIVATE_REASONING_FIRST"
+    private_second = "PRIVATE_REASONING_SECOND"
+    first_tool = _tool("find_objects", class_name="sofa")
+    controller, provider = _controller(
+        {"content": None, "reasoning_content": private_first,
+         "tool_calls": [first_tool]},
+        {"content": json.dumps({"action": "THINK", "reason_code": "READ_EVIDENCE"}),
+         "reasoning_content": private_second},
+        _query(_tool("read_evidence", evidence_id=evidence_id)),
+        _final("USE_L3", objects=[object_id], evidence=[evidence_id]),
+    )
+
+    context, diagnostic = controller.run(
+        manager, instruction="turn after the sofa", step=1, agent_pose=None,
+    )
+
+    assert context is not None and diagnostic["decision"] == "USE_L3"
+    assert diagnostic["api_request_count"] == 4
+    assert diagnostic["api_round_request_counts"] == [1, 1, 1, 1]
+    assert len(diagnostic["request_latencies_ms"]) == 4
+    assert provider.calls[-1]["tool_choice"] == "none"  # Reserved Final round.
+    second_messages = provider.calls[1]["messages"]
+    assert all(
+        isinstance(message["content"], str) and message["content"] is not None
+        for request in provider.calls for message in request["messages"]
+        if message["role"] == "assistant"
+    )
+    assert second_messages[2]["content"] == ""
+    assert second_messages[2]["reasoning_content"] == private_first
+    assert second_messages[2]["tool_calls"] == [first_tool]
+    assert second_messages[2]["tool_calls"][0]["id"] == second_messages[3]["tool_call_id"]
+    assert json.loads(second_messages[3]["content"])["result"][0]["class_name"] == "sofa"
+    assert any(message.get("reasoning_content") == private_second
+               for message in provider.calls[2]["messages"])
+    assert sum(message["role"] == "tool" for message in provider.calls[-1]["messages"]) == 2
+    assert private_first not in json.dumps(diagnostic)
+    assert private_second not in json.dumps(diagnostic)
+
+
+def test_deepseek_thinking_http_tool_roundtrip_keeps_reasoning_and_verified_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager()
+    _observe_l1(manager, 0)
+    object_id, evidence_id = _map_objects(manager, ("sofa", 1, 4, None))[0]
+    _observe_l1(manager, 1)
+    monkeypatch.setenv("MEMORY_QUERY_API_KEY", "synthetic_secret_never_log")
+    first_tool = _tool("find_objects", class_name="sofa", history_eligible_only=True)
+    second_tool = _tool("read_evidence", evidence_id=evidence_id)
+    responses = deque([
+        {"role": "assistant", "content": None, "reasoning_content": "PRIVATE_ROUND_ONE",
+         "tool_calls": [first_tool]},
+        {"role": "assistant", "content": None, "reasoning_content": "PRIVATE_ROUND_TWO",
+         "tool_calls": [second_tool]},
+        {"role": "assistant", "content": _final(
+            "USE_L3", objects=[object_id], evidence=[evidence_id],
+        )["content"], "reasoning_content": "PRIVATE_ROUND_THREE"},
+    ])
+    requests: list[dict[str, Any]] = []
+
+    class Reply:
+        def __init__(self, message: dict[str, Any]) -> None:
+            self.message = message
+
+        def __enter__(self) -> Reply:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            pass
+
+        def read(self) -> bytes:
+            return json.dumps({"choices": [{"message": self.message}]}).encode()
+
+    def urlopen(request: Any, *, timeout: float) -> Reply:
+        requests.append(json.loads(request.data))
+        return Reply(responses.popleft())
+
+    monkeypatch.setattr(provider_module, "urlopen", urlopen)
+    controller = SceneQueryController(SceneQueryConfig(
+        enabled=True, base_url="https://api.deepseek.com", model="deepseek-v4-pro",
+        thinking="enabled", max_rounds=3,
+    ))
+    context, diagnostic = controller.run(
+        manager, instruction="turn after sofa", step=1, agent_pose=None,
+    )
+
+    assert context is not None and "Spatial history: sofa" in context.text
+    assert diagnostic["decision"] == "USE_L3"
+    assert diagnostic["api_request_count"] == 3
+    assert diagnostic["tool_call_counts"] == {"find_objects": 1, "read_evidence": 1}
+    assert all(request["thinking"] == {"type": "enabled"} for request in requests)
+    assert "tool_choice" not in requests[0] and "tool_choice" not in requests[1]
+    assert requests[2]["tool_choice"] == "none"
+    assert len(requests[2]["tools"]) == 4
+    assert all(
+        isinstance(message["content"], str) and message["content"] is not None
+        for request in requests for message in request["messages"]
+        if message["role"] == "assistant"
+    )
+    assert requests[1]["messages"][2]["content"] == ""
+    assert [message["tool_calls"] for message in requests[1]["messages"]
+            if message["role"] == "assistant" and message.get("tool_calls")] == [[first_tool]]
+    assert [message["tool_calls"] for message in requests[2]["messages"]
+            if message["role"] == "assistant" and message.get("tool_calls")] == [
+                [first_tool], [second_tool],
+            ]
+    assert any(message.get("reasoning_content") == "PRIVATE_ROUND_ONE"
+               for message in requests[1]["messages"])
+    assert any(message.get("reasoning_content") == "PRIVATE_ROUND_TWO"
+               for message in requests[2]["messages"])
+    for request in requests[1:]:
+        tool_calls = {
+            call["id"] for message in request["messages"]
+            if message["role"] == "assistant" for call in message.get("tool_calls", [])
+        }
+        assert all(
+            message["tool_call_id"] in tool_calls and "result" in json.loads(message["content"])
+            for message in request["messages"] if message["role"] == "tool"
+        )
+    assert sum(message["role"] == "tool" for message in requests[2]["messages"]) == 2
+    assert "PRIVATE_ROUND_ONE" not in json.dumps(diagnostic)
+    assert "synthetic_secret_never_log" not in json.dumps(diagnostic)
+
+
+def test_same_step_duplicate_query_uses_one_dispatch_and_returns_both_tool_results() -> None:
+    manager = _manager()
+    _observe_l1(manager, 0)
+    _map_objects(manager, ("sofa", 1, 4, None))
+    _observe_l1(manager, 1)
+    controller, provider = _controller(
+        _query(_tool("find_objects", class_name="sofa"),
+               _tool("find_objects", class_name="sofa")),
+        _final("NO_MEMORY"),
+    )
+
+    context, diagnostic = controller.run(
+        manager, instruction="find sofa", step=1, agent_pose=None,
+    )
+
+    assert context is None and diagnostic["decision"] == "NO_MEMORY"
+    assert diagnostic["tool_call_counts"] == {"find_objects": 2}
+    assert diagnostic["tool_calls_requested"] == 2
+    assert diagnostic["tool_calls_executed"] == 1
+    assert diagnostic["tool_calls_succeeded"] == 1
+    assert diagnostic["tool_calls_reused"] == 1
+    assert diagnostic["duplicate_tool_call_count"] == 1
+    assert [call["cache_hit"] for call in diagnostic["query_calls"]] == [False, True]
+    replies = [message for message in provider.calls[1]["messages"]
+               if message["role"] == "tool"]
+    assert len(replies) == 2 and replies[0]["tool_call_id"] != replies[1]["tool_call_id"]
+    assert json.loads(replies[0]["content"])["result"] == json.loads(
+        replies[1]["content"]
+    )["result"]
+    assert controller.episode_statistics()["l3_query_count"] == 2
+    assert controller.episode_statistics()["repeated_query_count"] == 1
+
+
+def test_cached_query_reused_for_unchanged_map_and_invalidated_after_graph_change() -> None:
+    manager = _manager()
+    _observe_l1(manager, 0)
+    _map_objects(manager, ("sofa", 1, 4, None))
+    _observe_l1(manager, 1)
+    controller, _ = _controller(
+        _query(_tool("find_objects", class_name="sofa", history_eligible_only=True)),
+        _final("NO_MEMORY"),
+        _query(_tool("find_objects", class_name="sofa", history_eligible_only=True)),
+        _final("NO_MEMORY"),
+        _query(_tool("find_objects", class_name="sofa", history_eligible_only=True)),
+        _final("NO_MEMORY"),
+    )
+    _, first = controller.run(manager, instruction="find sofa", step=1, agent_pose=None)
+    _observe_l1(manager, 2)  # No L3 map update; the query-visible graph is unchanged.
+    _, second = controller.run(manager, instruction="find sofa", step=2, agent_pose=None)
+    assert first["tool_calls_executed"] == 1
+    assert second["query_cache_invalidated"] is False
+    assert second["tool_calls_executed"] == 0
+    assert second["tool_calls_reused"] == 1
+
+    mask = np.zeros((8, 8), dtype=np.bool_)
+    mask[1:7, 5:8] = True
+    manager.spatial_map.observe(_frame(), [InstanceMask(
+        class_name="lamp", confidence=0.9, mask=mask,
+        evidence_id=canonical_evidence_key("scene", "episode", 0, "seg_new"),
+    )], step_id=3)
+    _observe_l1(manager, 3)
+    _observe_l1(manager, 4)
+    _, third = controller.run(manager, instruction="find sofa", step=4, agent_pose=None)
+    assert third["query_cache_invalidated"] is True
+    assert third["tool_calls_executed"] == 1
+    assert third["tool_calls_reused"] == 0
+    stats = controller.episode_statistics()
+    assert stats["tool_calls_requested"] == 3
+    assert stats["tool_calls_executed"] == 2
+    assert stats["tool_calls_succeeded"] == 2
+    assert stats["tool_calls_reused"] == 1
+    assert stats["tool_calls_rejected_budget"] == 0
+
+
+def test_tool_call_budget_abstains_and_is_not_an_api_failure() -> None:
+    manager = _manager()
+    _observe_l1(manager, 0)
+    _map_objects(manager, ("sofa", 1, 4, None))
+    _observe_l1(manager, 1)
+    controller, provider = _controller(
+        _query(_tool("find_objects", class_name="sofa"),
+               _tool("find_objects", class_name="sofa")),
+        {"content": json.dumps({"action": "THINK", "reason_code": "STILL_QUERYING"})},
+        {"content": json.dumps({"action": "THINK", "reason_code": "STILL_QUERYING"})},
+        max_rounds=3, max_tool_calls=1,
+    )
+
+    context, diagnostic = controller.run(
+        manager, instruction="find sofa", step=1, agent_pose=None,
+    )
+
+    assert context is None and diagnostic["decision"] == "NO_MEMORY"
+    assert diagnostic["failure_category"] == "MAX_TOOL_CALLS"
+    assert diagnostic["tool_call_budget_exhausted"] is True
+    assert diagnostic["tool_calls_requested"] == 2
+    assert diagnostic["tool_calls_executed"] == 1
+    assert diagnostic["tool_calls_succeeded"] == 1
+    assert diagnostic["tool_calls_rejected_budget"] == 1
+    assert diagnostic["api_request_count"] == 3
+    assert provider.calls[1]["tool_choice"] == provider.calls[2]["tool_choice"] == "none"
+    stats = controller.episode_statistics()
+    assert stats["max_tool_calls_count"] == 1
+    assert stats["api_failure_count"] == 0
+    assert stats["tool_calls_requested"] == 2
+    assert stats["tool_calls_executed"] == 1
+    assert stats["tool_calls_succeeded"] == 1
+    assert stats["tool_calls_reused"] == 0
+    assert stats["tool_calls_rejected_budget"] == 1
+
+
+def test_tool_diagnostics_separate_requests_dispatch_success_cache_and_budget() -> None:
+    manager = _manager()
+    _observe_l1(manager, 0)
+    _map_objects(manager, ("sofa", 1, 4, None))
+    _observe_l1(manager, 1)
+    controller, _ = _controller(
+        _query(
+            _tool("find_objects", class_name="sofa"),
+            _tool("find_objects", class_name="sofa"),
+            _tool("read_node"),  # Reaches the local dispatcher and fails validation.
+            _tool("read_evidence", evidence_id="over_budget"),
+        ),
+        _final("NO_MEMORY"),
+        max_rounds=3, max_tool_calls=3,
+    )
+
+    context, diagnostic = controller.run(
+        manager, instruction="find sofa", step=1, agent_pose=None,
+    )
+
+    assert context is None and diagnostic["failure_category"] is None
+    assert diagnostic["tool_call_counts"] == {
+        "find_objects": 2, "read_node": 1, "read_evidence": 1,
+    }
+    expected = {
+        "tool_calls_requested": 4,
+        "tool_calls_executed": 2,
+        "tool_calls_succeeded": 1,
+        "tool_calls_reused": 1,
+        "tool_calls_rejected_budget": 1,
+    }
+    for key, value in expected.items():
+        assert diagnostic[key] == value
+        assert controller.episode_statistics()[key] == value
+    assert controller.episode_statistics()["tool_read_evidence_call_count"] == 1
+
+
+def test_tool_call_budget_can_finalize_already_verified_history() -> None:
+    manager = _manager()
+    _observe_l1(manager, 0)
+    object_id, evidence_id = _map_objects(manager, ("sofa", 1, 4, None))[0]
+    _observe_l1(manager, 1)
+    controller, provider = _controller(
+        _query(_tool("find_objects", class_name="sofa", history_eligible_only=True),
+               _tool("read_evidence", evidence_id=evidence_id)),
+        _final("USE_L3", objects=[object_id], evidence=[evidence_id]),
+        max_rounds=3, max_tool_calls=2,
+    )
+    context, diagnostic = controller.run(
+        manager, instruction="turn after sofa", step=1, agent_pose=None,
+    )
+    assert context is not None and diagnostic["decision"] == "USE_L3"
+    assert diagnostic["tool_call_budget_exhausted"] is True
+    assert diagnostic["tool_calls_rejected_budget"] == 0
+    assert diagnostic["failure_category"] is None
+    assert provider.calls[-1]["tool_choice"] == "none"
+
+
+def test_final_round_rejects_new_tool_call_and_records_round_budget() -> None:
+    manager = _manager()
+    _observe_l1(manager, 0)
+    _map_objects(manager, ("sofa", 1, 4, None))
+    _observe_l1(manager, 1)
+    controller, provider = _controller(
+        _query(_tool("find_objects", class_name="sofa")),
+        _query(_tool("find_objects", class_name="sofa")),
+        max_rounds=2,
+    )
+    context, diagnostic = controller.run(
+        manager, instruction="find sofa", step=1, agent_pose=None,
+    )
+    assert context is None and diagnostic["failure_category"] == "MAX_TOOL_ROUNDS"
+    assert diagnostic["decision"] == "NO_MEMORY"
+    assert diagnostic["tool_calls_requested"] == 2
+    assert diagnostic["tool_calls_executed"] == 1
+    assert diagnostic["tool_calls_succeeded"] == 1
+    assert diagnostic["tool_calls_rejected_budget"] == 1
+    assert provider.calls[-1]["tool_choice"] == "none"
+    assert controller.episode_statistics()["max_tool_rounds_count"] == 1
+    assert controller.episode_statistics()["api_failure_count"] == 0
+
+
+def test_api_never_returns_final_has_separate_failure_count() -> None:
+    manager = _manager()
+    _observe_l1(manager, 0)
+    controller, provider = _controller(
+        {"content": json.dumps({"action": "THINK", "reason_code": "WAIT"})},
+        {"content": json.dumps({"action": "THINK", "reason_code": "WAIT"})},
+        max_rounds=2,
+    )
+    context, diagnostic = controller.run(
+        manager, instruction="find sofa", step=0, agent_pose=None,
+    )
+    assert context is None and diagnostic["failure_category"] == "API_NO_FINAL"
+    assert diagnostic["query_calls"] == []
+    assert all(not call["tool_names"] for call in provider.calls)
+    assert controller.episode_statistics()["api_no_final_count"] == 1
+    assert controller.episode_statistics()["api_failure_count"] == 0
+
+
+def test_reasoning_only_turn_can_finish_without_tools_and_invalid_json_is_no_final() -> None:
+    manager = _manager()
+    _observe_l1(manager, 0)
+    controller, provider = _controller(
+        {"content": None, "reasoning_content": "PRIVATE_THINKING"},
+        _final("NO_MEMORY"),
+        max_rounds=2,
+    )
+    context, diagnostic = controller.run(
+        manager, instruction="find sofa", step=0, agent_pose=None,
+    )
+    assert context is None and diagnostic["decision"] == "NO_MEMORY"
+    assert diagnostic["failure_category"] is None
+    assert provider.calls[1]["messages"][2]["reasoning_content"] == "PRIVATE_THINKING"
+    assert "PRIVATE_THINKING" not in json.dumps(diagnostic)
+
+    bad_controller, _ = _controller({"content": "invalid JSON"})
+    bad_context, bad_diagnostic = bad_controller.run(
+        manager, instruction="find sofa", step=0, agent_pose=None,
+    )
+    assert bad_context is None
+    assert bad_diagnostic["failure_category"] == "API_NO_FINAL"
+    assert bad_controller.episode_statistics()["api_no_final_count"] == 1
+    assert bad_controller.episode_statistics()["api_failure_count"] == 0
+
+
+def test_weak_fused_object_is_classified_separately_from_api_failure() -> None:
+    manager = _manager()
+    _observe_l1(manager, 0)
+    sofa, _lamp = _map_objects(
+        manager, ("sofa", 1, 4, None), ("lamp", 5, 8, None),
+    )
+    weak_mask = np.zeros((8, 8), dtype=np.bool_)
+    weak_mask[1:7, 1:4] = True
+    manager.spatial_map.observe(_frame(), [InstanceMask(
+        class_name="sofa", confidence=0.3, mask=weak_mask,
+        evidence_id=canonical_evidence_key("scene", "episode", 0, "seg_weak"),
+    )], step_id=1)
+    assert len(manager.spatial_map.objects[sofa[0]].evidence_ids) == 2
+    _observe_l1(manager, 1)
+    _observe_l1(manager, 2)
+    controller, _ = _controller(
+        _query(_tool("find_objects", class_name="sofa"),
+               _tool("read_evidence", evidence_id=sofa[1])),
+        _final("USE_L3", objects=[sofa[0]], evidence=[sofa[1]]),
+    )
+    context, diagnostic = controller.run(
+        manager, instruction="turn after sofa", step=2, agent_pose=None,
+    )
+    assert context is None and diagnostic["api_decision"] == "USE_L3"
+    assert diagnostic["decision"] == "NO_MEMORY"
+    assert diagnostic["failure_category"] == "GRAPH_FUSION_FAILED"
+    assert "confidence=0.3" in diagnostic["fallback_reason"]
+    assert diagnostic["l3_evidence_valid_count"] == 1  # Strong lamp remains queryable.
+    assert controller.episode_statistics()["graph_fusion_failure_count"] == 1
+    assert controller.episode_statistics()["api_failure_count"] == 0
 
 
 @pytest.mark.parametrize("failure", ["timeout", "invalid_json"])

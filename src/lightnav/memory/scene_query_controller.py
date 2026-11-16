@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from collections import Counter
+from copy import deepcopy
 from html import escape
+from time import perf_counter
 from typing import Any
 
 from lightnav.memory.local_graph_fusion import _plain_label
@@ -18,21 +22,97 @@ from lightnav.memory.v3_schemas import canonical_evidence_key
 _HEADER = "[Navigation Memory]"
 _DECISIONS = frozenset({"NO_MEMORY", "USE_L1", "USE_L3", "USE_BOTH"})
 _SYSTEM = """You select existing navigation memory facts. You do not output a robot action.
-First consider whether current L1 observations suffice. Query the read-only L3 tools only
-when a map fact could add task-relevant information. A map object and an L1 detection with
-the same label are different identities unless a linked L1 Evidence ID proves association.
+Think before responding, then either call the read-only L3 tools or return Final.
+Do not spend a response on a standalone THINK unless essential. First consider whether
+L1 already suffices. Query only a named task-relevant landmark or object class; do not
+enumerate generic categories or repeat a query whose result is already in this conversation.
+Prefer find_objects with the exact class_name and history_eligible_only=true. Raw
+Evidence IDs are not necessarily injectable: use only historical_eligible_evidence_ids
+and historical_eligible_object_ids, and read each selected Evidence explicitly.
+If no eligible L3 fact is available, select L1 or NO_MEMORY. A map object and an L1
+detection with the same label are different identities unless a linked L1 Evidence ID
+proves association.
 Previous selections are context, never a cooldown: reuse a fact if still needed.
 native_visual_source_steps identifies RGB observation steps already sampled in the
 LightNav video input; add external memory from those steps only when it clarifies
 the current task. recent_memory_selections summarizes prior IDs and injections.
-You may answer {"action":"THINK","reason_code":"SHORT_CODE"} to continue, call tools,
-or finish with exactly this JSON object (no prose or invented facts):
+Finish with exactly this JSON object (no prose or invented facts):
 {"decision":"NO_MEMORY|USE_L1|USE_L3|USE_BOTH",
  "selected_l1_fact_ids":[],"selected_l3_object_ids":[],
  "selected_l3_evidence_ids":[],"reason_code":"SHORT_CODE"}.
-To select L3, first discover the object with find_objects/read_node and explicitly
-read each selected Evidence with read_evidence. Never select an ID absent from tool results.
+To select L3, first discover the object with find_objects/read_node. Never select an
+ID absent from tool results. Return Final promptly after sufficient results arrive.
 Use NO_MEMORY when no verified fact adds value. Only select facts; local code renders them."""
+
+
+class _NoFinalError(ValueError):
+    pass
+
+
+class _ToolRoundBudgetError(ValueError):
+    pass
+
+
+class _ToolCallBudgetError(ValueError):
+    pass
+
+
+class _EvidenceValidationError(ValueError):
+    pass
+
+
+class _GraphFusionError(ValueError):
+    pass
+
+
+def _safe_error(exc: Exception) -> str:
+    """Never copy an API credential from a provider exception into diagnostics."""
+    value = str(exc)
+    key = os.getenv("MEMORY_QUERY_API_KEY", "")
+    if key:
+        value = value.replace(key, "[REDACTED]")
+    return f"{type(exc).__name__}: {value[:400]}"
+
+
+def _assistant_message(message: dict[str, Any], *, tool_calls: list[dict] | None = None) -> dict[str, Any]:
+    """Preserve DeepSeek reasoning_content for the next tool-bearing API request."""
+    result: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}
+    if "reasoning_content" in message:
+        result["reasoning_content"] = message["reasoning_content"]
+    if tool_calls is not None:
+        result["tool_calls"] = tool_calls
+    return result
+
+
+def _graph_state_key(tools: SceneQueryTools) -> str:
+    """Hash only query-visible map state and the historical eligibility boundary."""
+    graph = tools.object_map
+    nodes = tuple(sorted((key, node.object_id, node.class_name, tuple(node.center_world),
+                          tuple(tuple(part) for part in node.bbox_3d),
+                          node.observation_count, node.geometry_status,
+                          tuple(node.evidence_ids)) for key, node in graph.objects.items()))
+    evidence = tuple(sorted((key, repr(record)) for key, record in graph.evidence.items()))
+    viewpoints = tuple(sorted((key, repr(node)) for key, node in graph.viewpoints.items()))
+    # get_edges_for_node returns graph.edges in insertion order.
+    edges = tuple(repr(edge) for edge in graph.edges)
+    historical = tuple(sorted(key for key, record in graph.evidence.items()
+                              if (record.episode_id, record.rollout_idx)
+                              != (tools.episode_id, tools.rollout_idx)
+                              or record.step_id < tools.step))
+    linked_records = []
+    if tools.store is not None:
+        for record in graph.evidence.values():
+            if record.linked_l1_evidence_id is None:
+                continue
+            linked = tools.store.get_evidence(record.linked_l1_evidence_id)
+            linked_records.append((record.linked_l1_evidence_id, None if linked is None else (
+                linked.scene_id, linked.episode_id, linked.rollout_idx, linked.step,
+                linked.event_type, linked.semantic_label, linked.observation_status,
+                linked.provenance_validity,
+            )))
+    snapshot = (graph._identity, nodes, evidence, viewpoints, edges, historical,
+                tuple(sorted(linked_records)), tools.scope, tools.min_confidence)
+    return hashlib.sha256(repr(snapshot).encode("utf-8")).hexdigest()
 
 
 def _unique_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -123,12 +203,23 @@ class SceneQueryController:
     def reset_episode(self) -> None:
         self._selection_history: list[dict[str, Any]] = []
         self._query_signatures: set[str] = set()
+        self._tool_result_cache: dict[str, Any] = {}
+        self._cached_graph_state_key: str | None = None
         self._injected_evidence: set[str] = set()
         self._stats: Counter[str] = Counter({
             name: 0 for name in (
                 "step_count", "l1_selection_count", "l3_query_count",
                 "l3_hit_count", "both_selection_count", "no_memory_count",
                 "api_failure_count", "invalid_id_rejection_count",
+                "api_no_final_count", "max_tool_rounds_count",
+                "max_tool_calls_count", "evidence_validation_failure_count",
+                "graph_fusion_failure_count", "api_request_count",
+                "api_request_latency_ms_total", "duplicate_tool_call_count",
+                "tool_calls_requested", "tool_calls_executed",
+                "tool_calls_succeeded", "tool_calls_reused",
+                "tool_calls_rejected_budget", "tool_unknown_call_count",
+                "tool_find_objects_call_count", "tool_read_node_call_count",
+                "tool_read_evidence_call_count", "tool_get_edges_for_node_call_count",
                 "repeated_query_count", "repeated_evidence_injection_count",
                 "repeated_fact_expression_count", "rendered_fact_count",
                 "actual_injection_step_count", "injected_evidence_count",
@@ -167,9 +258,33 @@ class SceneQueryController:
         })
         self._stats["step_count"] += 1
         self._count_decision(diagnostic["decision"], 1)
-        if diagnostic["fallback_reason"] is not None:
-            self._stats["api_failure_count"] += 1
+        category = diagnostic["failure_category"]
+        category_keys = {
+            "API_REQUEST_FAILED": "api_failure_count",
+            "API_NO_FINAL": "api_no_final_count",
+            "MAX_TOOL_ROUNDS": "max_tool_rounds_count",
+            "MAX_TOOL_CALLS": "max_tool_calls_count",
+            "EVIDENCE_VALIDATION_FAILED": "evidence_validation_failure_count",
+            "GRAPH_FUSION_FAILED": "graph_fusion_failure_count",
+        }
+        if category in category_keys:
+            self._stats[category_keys[category]] += 1
         self._stats["invalid_id_rejection_count"] += diagnostic["invalid_id_rejection_count"]
+        self._stats["api_request_count"] += diagnostic["api_request_count"]
+        self._stats["api_request_latency_ms_total"] += sum(diagnostic["request_latencies_ms"])
+        self._stats["l3_query_count"] += len(diagnostic["query_calls"])
+        self._stats["repeated_query_count"] += sum(
+            bool(call.get("repeated")) for call in diagnostic["query_calls"]
+        )
+        for key in ("duplicate_tool_call_count", "tool_calls_requested",
+                    "tool_calls_executed", "tool_calls_succeeded",
+                    "tool_calls_reused", "tool_calls_rejected_budget"):
+            self._stats[key] += diagnostic[key]
+        for name, count in diagnostic["tool_call_counts"].items():
+            key = f"tool_{name}_call_count" if name in {
+                "find_objects", "read_node", "read_evidence", "get_edges_for_node",
+            } else "tool_unknown_call_count"
+            self._stats[key] += count
 
     def _count_decision(self, decision: str, delta: int) -> None:
         if decision in {"USE_L1", "USE_BOTH"}:
@@ -269,11 +384,28 @@ class SceneQueryController:
             min_confidence=manager.spatial_l3_config.min_injection_confidence,
         )
         counts = tools.candidate_counts()
+        graph_state_key = _graph_state_key(tools)
+        cache_invalidated = (self._cached_graph_state_key is not None
+                             and self._cached_graph_state_key != graph_state_key)
+        if self._cached_graph_state_key != graph_state_key:
+            self._tool_result_cache.clear()
+            self._cached_graph_state_key = graph_state_key
+        l3_available = counts["l3_evidence_valid_count"] > 0
         diagnostic: dict[str, Any] = {
             "step": step, "memory_strategy": "scene_query",
             "l1_available_count": len(l1_facts), **counts,
             "query_rounds": 0, "api_rounds": 0, "query_calls": [],
             "query_returned_object_ids": [], "query_returned_evidence_ids": [],
+            "query_returned_eligible_object_ids": [],
+            "api_request_count": 0, "api_round_request_counts": [],
+            "request_latencies_ms": [], "tool_call_counts": {},
+            "duplicate_tool_call_count": 0, "tool_calls_requested": 0,
+            "tool_calls_executed": 0, "tool_calls_succeeded": 0,
+            "tool_calls_reused": 0, "tool_calls_rejected_budget": 0,
+            "tool_call_budget": self.config.max_tool_calls,
+            "query_cache_invalidated": cache_invalidated,
+            "query_graph_state_key": graph_state_key,
+            "l3_query_disabled_reason": None if l3_available else "NO_ELIGIBLE_HISTORY",
             "api_decision": None, "decision": "NO_MEMORY", "reason_code": None,
             "selected_l1_fact_ids": [], "selected_l3_object_ids": [],
             "selected_l3_evidence_ids": [], "deduplicated_fact_count": 0,
@@ -281,7 +413,7 @@ class SceneQueryController:
             "repeated_selection_count": 0, "native_visual_overlap_count": 0,
             "memory_context_item_count": 0, "memory_context_chars": 0,
             "memory_context_tokens": None, "invalid_id_rejection_count": 0,
-            "fallback_reason": None,
+            "fallback_reason": None, "failure_category": None,
         }
         pose = None if agent_pose is None else {
             "position": list(agent_pose.position),
@@ -292,91 +424,204 @@ class SceneQueryController:
             "current_agent_pose": pose, "l1_facts": l1_facts,
             "native_visual_source_steps": list(native_visual_source_steps),
             "recent_memory_selections": self._selection_summary(set(l1_by_id)),
-            "available_l3_query_tools": [item["function"]["name"] for item in OPENAI_TOOLS],
+            "available_l3_query_tools": (
+                [item["function"]["name"] for item in OPENAI_TOOLS] if l3_available else []
+            ),
         }
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": _SYSTEM},
+            {"role": "system", "content": (
+                _SYSTEM + f"\nExecution budget: at most {self.config.max_rounds} API responses "
+                f"and {self.config.max_tool_calls} tool call requests. "
+                "The last response must be Final; do not wait until it to query."
+            )},
             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ]
         returned_objects: set[str] = set()
+        eligible_objects: set[str] = set()
         discovered_objects: set[str] = set()
         returned_evidence: set[str] = set()
         final: dict[str, Any] | None = None
+        step_signatures: set[str] = set()
+        tool_calls_requested = 0
+        tool_budget_exhausted = False
+        final_prompt_sent = False
         try:
             for round_idx in range(self.config.max_rounds):
                 diagnostic["api_rounds"] = round_idx + 1
-                message = self.provider.complete(messages, OPENAI_TOOLS)
+                final_only = (not l3_available or tool_budget_exhausted
+                              or round_idx == self.config.max_rounds - 1)
+                if final_only and round_idx > 0 and not final_prompt_sent:
+                    messages.append({
+                        "role": "user",
+                        "content": "No more map tool calls are available. Return the structured Final "
+                                   "using only already returned and verified IDs, or NO_MEMORY.",
+                    })
+                    final_prompt_sent = True
+                started = perf_counter()
+                try:
+                    message = self.provider.complete(
+                        messages, OPENAI_TOOLS if l3_available else [],
+                        tool_choice="none" if final_only else "auto",
+                    )
+                finally:
+                    diagnostic["api_request_count"] += 1
+                    diagnostic["api_round_request_counts"].append(1)
+                    diagnostic["request_latencies_ms"].append(
+                        round((perf_counter() - started) * 1000.0, 3)
+                    )
                 if not isinstance(message, dict):
                     raise ValueError("API message must be an object")
                 tool_calls = message.get("tool_calls") or []
+                if not isinstance(tool_calls, list):
+                    raise ValueError("API tool_calls must be a list")
                 if tool_calls:
-                    if not isinstance(tool_calls, list):
-                        raise ValueError("API tool_calls must be a list")
+                    # Count API requests before checking the local round/call budgets.
+                    diagnostic["tool_calls_requested"] += len(tool_calls)
+                    counts_by_tool = diagnostic["tool_call_counts"]
+                    for requested_call in tool_calls:
+                        requested_function = (requested_call.get("function")
+                                              if isinstance(requested_call, dict) else None)
+                        requested_name = (requested_function.get("name")
+                                          if isinstance(requested_function, dict) else None)
+                        tool_name = (requested_name if isinstance(requested_name, str)
+                                     and requested_name else "unknown")
+                        counts_by_tool[tool_name] = counts_by_tool.get(tool_name, 0) + 1
+                    if final_only:
+                        if tool_budget_exhausted:
+                            diagnostic["tool_calls_rejected_budget"] += len(tool_calls)
+                            raise _ToolCallBudgetError("API requested tools after the tool-call budget")
+                        if l3_available:
+                            diagnostic["tool_calls_rejected_budget"] += len(tool_calls)
+                            raise _ToolRoundBudgetError("API requested tools on the final-only round")
+                        raise _NoFinalError("API requested L3 tools with no eligible history")
                     diagnostic["query_rounds"] += 1
-                    messages.append({
-                        "role": "assistant", "content": message.get("content"),
-                        "tool_calls": tool_calls,
-                    })
+                    messages.append(_assistant_message(message, tool_calls=tool_calls))
+                    seen_call_ids: set[str] = set()
                     for call in tool_calls:
                         if not isinstance(call, dict) or not isinstance(call.get("function"), dict):
                             raise ValueError("API tool call is invalid")
+                        call_id = call.get("id")
+                        if not isinstance(call_id, str) or not call_id or call_id in seen_call_ids:
+                            raise ValueError("API tool call ID is missing or duplicated")
+                        seen_call_ids.add(call_id)
                         function = call["function"]
                         name = function.get("name")
                         raw_args = function.get("arguments")
+                        tool_name = name if isinstance(name, str) and name else "unknown"
+                        tool_calls_requested += 1
+                        if tool_calls_requested > self.config.max_tool_calls:
+                            tool_budget_exhausted = True
+                            diagnostic["tool_calls_rejected_budget"] += 1
+                            diagnostic["query_calls"].append({
+                                "name": tool_name, "round": round_idx + 1,
+                                "error": "tool_call_budget_exhausted", "repeated": False,
+                            })
+                            content = {"error": "tool_call_budget_exhausted"}
+                            messages.append({
+                                "role": "tool", "tool_call_id": call_id,
+                                "content": json.dumps(content),
+                            })
+                            continue
                         try:
-                            arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                            signature = json.dumps([name, arguments], sort_keys=True)
+                            arguments = json.loads(
+                                raw_args, object_pairs_hook=_unique_json_pairs,
+                                parse_constant=_reject_json_constant,
+                            ) if isinstance(raw_args, str) else raw_args
+                            signature = json.dumps(
+                                [name, arguments], sort_keys=True, ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
                             repeated = signature in self._query_signatures
                             self._query_signatures.add(signature)
-                            self._stats["l3_query_count"] += 1
-                            self._stats["repeated_query_count"] += int(repeated)
-                            result = tools.call(name, raw_args)
+                            same_step_duplicate = signature in step_signatures
+                            step_signatures.add(signature)
+                            diagnostic["duplicate_tool_call_count"] += int(same_step_duplicate)
+                            cache_hit = signature in self._tool_result_cache
+                            if cache_hit:
+                                result = deepcopy(self._tool_result_cache[signature])
+                                diagnostic["tool_calls_reused"] += 1
+                            else:
+                                diagnostic["tool_calls_executed"] += 1
+                                result = tools.call(name, raw_args)
+                                diagnostic["tool_calls_succeeded"] += 1
+                                self._tool_result_cache[signature] = deepcopy(result)
                             object_ids = (
                                 [item["object_id"] for item in result] if name == "find_objects" else
                                 [result["object_id"]] if name == "read_node" else
                                 result.get("object_ids", []) if name == "read_evidence" else []
                             )
                             evidence_ids = [result["evidence_id"]] if name == "read_evidence" else []
+                            eligible_ids = (
+                                [item["object_id"] for item in result
+                                 if item.get("historical_eligible_evidence_ids")]
+                                if name == "find_objects" else
+                                [result["object_id"]]
+                                if name == "read_node" and result.get("historical_eligible_evidence_ids") else
+                                result.get("historical_eligible_object_ids", [])
+                                if name == "read_evidence" else []
+                            )
                             returned_objects.update(object_ids)
+                            eligible_objects.update(eligible_ids)
                             if name in {"find_objects", "read_node"}:
                                 discovered_objects.update(object_ids)
                             returned_evidence.update(evidence_ids)
                             diagnostic["query_calls"].append({
                                 "name": name, "arguments": arguments, "repeated": repeated,
+                                "same_step_duplicate": same_step_duplicate,
+                                "cache_hit": cache_hit, "round": round_idx + 1,
                                 "returned_object_ids": object_ids,
+                                "eligible_object_ids": eligible_ids,
                                 "returned_evidence_ids": evidence_ids,
                             })
-                            content = {"result": result}
+                            content = {"result": result, "cache_hit": cache_hit}
                         except (ValueError, TypeError, KeyError) as exc:
-                            error = f"{type(exc).__name__}: {exc}"
+                            error = _safe_error(exc)
                             if "object ID" in error or "Evidence ID" in error:
                                 diagnostic["invalid_id_rejection_count"] += 1
                             diagnostic["query_calls"].append({
-                                "name": name, "arguments": raw_args, "error": error,
+                                "name": tool_name, "round": round_idx + 1,
+                                "error": error, "repeated": False,
                             })
                             content = {"error": error}
                         messages.append({
-                            "role": "tool", "tool_call_id": call.get("id", ""),
+                            "role": "tool", "tool_call_id": call_id,
                             "content": json.dumps(content, ensure_ascii=False),
                         })
+                    if tool_calls_requested >= self.config.max_tool_calls:
+                        tool_budget_exhausted = True
                     continue
                 content = message.get("content")
+                if content is None or content == "":
+                    if (message.get("reasoning_content")
+                            and round_idx < self.config.max_rounds - 1):
+                        # DeepSeek can return a reasoning-only assistant turn.
+                        # Preserve it for the next tool-bearing request without logging it.
+                        messages.append(_assistant_message(message))
+                        continue
+                    raise _NoFinalError("API returned neither tool calls nor Final")
                 try:
                     parsed = json.loads(
                         content, object_pairs_hook=_unique_json_pairs,
                         parse_constant=_reject_json_constant,
                     ) if isinstance(content, str) else content
                 except (ValueError, TypeError) as exc:
-                    raise ValueError("API returned invalid JSON") from exc
+                    raise _NoFinalError("API returned invalid Final JSON") from exc
                 if isinstance(parsed, dict) and parsed.get("action") == "THINK":
                     if set(parsed) != {"action", "reason_code"}:
                         raise ValueError("Think has invalid fields")
-                    messages.append({"role": "assistant", "content": content})
+                    messages.append(_assistant_message(message))
                     continue
-                final = _final(parsed)
+                try:
+                    final = _final(parsed)
+                except ValueError as exc:
+                    raise _NoFinalError(str(exc)) from exc
                 break
             if final is None:
-                raise ValueError("API did not return Final within max rounds")
+                if tool_budget_exhausted:
+                    raise _ToolCallBudgetError("API did not return Final within tool-call budget")
+                if diagnostic["query_rounds"] >= max(1, self.config.max_rounds - 1):
+                    raise _ToolRoundBudgetError("API did not return Final within tool rounds")
+                raise _NoFinalError("API did not return Final within max rounds")
             diagnostic["api_decision"] = final["decision"]
             diagnostic["reason_code"] = final["reason_code"]
             selected_l1 = final["selected_l1_fact_ids"]
@@ -384,27 +629,35 @@ class SceneQueryController:
             selected_evidence = final["selected_l3_evidence_ids"]
             if any(key not in l1_by_id for key in selected_l1):
                 diagnostic["invalid_id_rejection_count"] += 1
-                raise ValueError("Final selected an invalid L1 fact ID")
+                raise _EvidenceValidationError("Final selected an invalid L1 fact ID")
             if any(key not in discovered_objects for key in selected_objects):
                 diagnostic["invalid_id_rejection_count"] += 1
-                raise ValueError("Final selected an undiscovered object ID")
+                raise _EvidenceValidationError("Final selected an undiscovered object ID")
             if any(key not in returned_evidence for key in selected_evidence):
                 diagnostic["invalid_id_rejection_count"] += 1
-                raise ValueError("Final selected an unqueried Evidence ID")
+                raise _EvidenceValidationError("Final selected an unqueried Evidence ID")
             verified: dict[str, list[str]] = {object_id: [] for object_id in selected_objects}
             for evidence_id in selected_evidence:
                 owners = [object_id for object_id in selected_objects
                           if evidence_id in manager.spatial_map.objects[object_id].evidence_ids]
                 if len(owners) != 1:
                     diagnostic["invalid_id_rejection_count"] += 1
-                    raise ValueError("Final Evidence ID has no unique selected object")
-                tools.validate_history(owners[0], evidence_id)
+                    raise _EvidenceValidationError("Final Evidence ID has no unique selected object")
+                try:
+                    tools.validate_history(owners[0], evidence_id)
+                except ValueError as exc:
+                    if str(exc).startswith("fused Object has missing or weak Evidence"):
+                        raise _GraphFusionError(str(exc)) from exc
+                    raise _EvidenceValidationError(str(exc)) from exc
                 verified[owners[0]].append(evidence_id)
             if any(not ids for ids in verified.values()):
-                raise ValueError("Final selected an object without verified Evidence")
-            context, kept_l1, kept_l3, dedup, conflicts = self._render(
-                manager, step, agent_pose, l1_by_id, selected_l1, verified,
-            )
+                raise _EvidenceValidationError("Final selected an object without verified Evidence")
+            try:
+                context, kept_l1, kept_l3, dedup, conflicts = self._render(
+                    manager, step, agent_pose, l1_by_id, selected_l1, verified,
+                )
+            except (KeyError, ValueError) as exc:
+                raise _GraphFusionError(str(exc)) from exc
             diagnostic["selected_l1_fact_ids"] = kept_l1
             diagnostic["selected_l3_object_ids"] = list(kept_l3)
             diagnostic["selected_l3_evidence_ids"] = [
@@ -436,10 +689,21 @@ class SceneQueryController:
             )
         except Exception as exc:  # noqa: BLE001
             # Fail closed: no old spatial-first or local-graph fallback is allowed.
-            diagnostic["fallback_reason"] = f"{type(exc).__name__}: {exc}"
+            diagnostic["fallback_reason"] = _safe_error(exc)
+            diagnostic["failure_category"] = (
+                "MAX_TOOL_CALLS" if isinstance(exc, _ToolCallBudgetError) else
+                "MAX_TOOL_ROUNDS" if isinstance(exc, _ToolRoundBudgetError) else
+                "API_NO_FINAL" if isinstance(exc, _NoFinalError) else
+                "EVIDENCE_VALIDATION_FAILED" if isinstance(exc, _EvidenceValidationError) else
+                "GRAPH_FUSION_FAILED" if isinstance(exc, _GraphFusionError) else
+                "API_REQUEST_FAILED"
+            )
+            diagnostic["reason_code"] = diagnostic["reason_code"] or diagnostic["failure_category"]
             context = None
         diagnostic["query_returned_object_ids"] = sorted(returned_objects)
+        diagnostic["query_returned_eligible_object_ids"] = sorted(eligible_objects)
         diagnostic["query_returned_evidence_ids"] = sorted(returned_evidence)
+        diagnostic["tool_call_budget_exhausted"] = tool_budget_exhausted
         diagnostic["api_queried_node_count"] = len(discovered_objects)
         diagnostic["final_selected_object_count"] = len(diagnostic["selected_l3_object_ids"])
         diagnostic["final_selected_evidence_count"] = len(diagnostic["selected_l3_evidence_ids"])

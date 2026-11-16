@@ -174,6 +174,21 @@ class TrajVocabVLNCEPolicy:
             self.memory_manager = None
         self._scene_query_controller = None
         self._scene_query_frame_ids_by_step: dict[int, int] = {}
+        self._scene_query_policy_stats = {
+            "spatial_evidence_minted_count": 0,
+            "spatial_evidence_linked_count": 0,
+            "spatial_evidence_unmatched_count": 0,
+            "spatial_evidence_unmatched_no_same_class_count": 0,
+            "spatial_evidence_unmatched_invalid_l1_bbox_count": 0,
+            "spatial_evidence_unmatched_low_iou_count": 0,
+            "spatial_evidence_unmatched_low_mask_coverage_count": 0,
+            "spatial_evidence_unmatched_invalid_l1_evidence_count": 0,
+            "spatial_evidence_ambiguous_count": 0,
+            "memory_context_attempt_count": 0,
+            "actual_injection_failure_count": 0,
+            "graph_fusion_build_failure_count": 0,
+            "graph_fusion_failure_overlap_count": 0,
+        }
         if self.memory_manager is not None and getattr(
             getattr(self.memory_manager, "scene_query_config", None), "enabled", False,
         ):
@@ -234,6 +249,9 @@ class TrajVocabVLNCEPolicy:
             if self._scene_query_controller is not None:
                 self._scene_query_controller.reset_episode()
                 self._scene_query_frame_ids_by_step = {}
+                self._scene_query_policy_stats = dict.fromkeys(
+                    self._scene_query_policy_stats, 0,
+                )
 
     def close_episode(self, *, outcome: str | None = None) -> None:
         """Release the explicit memory of the current episode, if enabled."""
@@ -256,7 +274,24 @@ class TrajVocabVLNCEPolicy:
         """Cumulative selection and actual-injection counts for the current Episode."""
         if self._scene_query_controller is None:
             return None
-        return self._scene_query_controller.episode_statistics()
+        stats = self._scene_query_controller.episode_statistics()
+        stats.update(self._scene_query_policy_stats)
+        stats["graph_fusion_failure_count"] = (
+            stats.get("graph_fusion_failure_count", 0)
+            + self._scene_query_policy_stats["graph_fusion_build_failure_count"]
+            - self._scene_query_policy_stats["graph_fusion_failure_overlap_count"]
+        )
+        minted = self._scene_query_policy_stats["spatial_evidence_minted_count"]
+        linked = self._scene_query_policy_stats["spatial_evidence_linked_count"]
+        attempts = self._scene_query_policy_stats["memory_context_attempt_count"]
+        steps = stats["step_count"]
+        actual = stats["actual_injection_step_count"]
+        stats["evidence_link_success_rate"] = linked / minted if minted else 0.0
+        stats["actual_injection_rate"] = actual / steps if steps else 0.0
+        stats["attempted_context_injection_success_rate"] = (
+            actual / attempts if attempts else 0.0
+        )
+        return stats
 
     def observe(self, obs: dict[str, Any], info: dict[str, Any] | None = None) -> None:
         """Push the RGB frame into the history buffer without running inference."""
@@ -493,6 +528,20 @@ class TrajVocabVLNCEPolicy:
         self._memory_step += 1
         with _preserve_global_rng():
             spatial_diagnostic = manager.observe_spatial(obs, info, events, step=step)
+        for source, target in (
+            ("evidence_minted", "spatial_evidence_minted_count"),
+            ("evidence_linked", "spatial_evidence_linked_count"),
+            ("evidence_unmatched", "spatial_evidence_unmatched_count"),
+            ("evidence_unmatched_no_same_class", "spatial_evidence_unmatched_no_same_class_count"),
+            ("evidence_unmatched_invalid_l1_bbox", "spatial_evidence_unmatched_invalid_l1_bbox_count"),
+            ("evidence_unmatched_low_iou", "spatial_evidence_unmatched_low_iou_count"),
+            ("evidence_unmatched_low_mask_coverage", "spatial_evidence_unmatched_low_mask_coverage_count"),
+            ("evidence_unmatched_invalid_l1_evidence", "spatial_evidence_unmatched_invalid_l1_evidence_count"),
+            ("evidence_ambiguous", "spatial_evidence_ambiguous_count"),
+        ):
+            count = spatial_diagnostic.get(source, 0)
+            if type(count) is int and count >= 0:
+                self._scene_query_policy_stats[target] += count
         self._scene_query_frame_ids_by_step[step] = int(self.agent._history_frame_ids[-1])
         base_sample = build_vln_traj_sample(
             self.agent._get_video_tensor(), self.agent.instruction,
@@ -513,6 +562,20 @@ class TrajVocabVLNCEPolicy:
                         if manager.last_spatial_frame is not None else None),
             native_visual_source_steps=native_visual_source_steps,
         )
+        graph_fusion_build_failure = (
+            spatial_diagnostic.get("failure_stage") == "object_map_observe"
+            and spatial_diagnostic.get("rejection_reason") is not None
+        )
+        diagnostic["graph_fusion_build_failure"] = graph_fusion_build_failure
+        if graph_fusion_build_failure:
+            self._scene_query_policy_stats["graph_fusion_build_failure_count"] += 1
+            if diagnostic.get("failure_category") == "GRAPH_FUSION_FAILED":
+                self._scene_query_policy_stats["graph_fusion_failure_overlap_count"] += 1
+            elif diagnostic.get("failure_category") is None:
+                diagnostic["failure_category"] = "GRAPH_FUSION_FAILED"
+        context_attempted = context is not None
+        if context_attempted:
+            self._scene_query_policy_stats["memory_context_attempt_count"] += 1
         diagnostic["episode_id"] = manager.working.state.episode_id
         diagnostic["events_written"] = len(events)
         diagnostic["spatial_l3"] = spatial_diagnostic
@@ -625,6 +688,21 @@ class TrajVocabVLNCEPolicy:
         } if context is not None else set()
         visible_ids = [key for key in visible_ids if key in selected_ids]
         actual_injection = bool(context is not None and block_visible and visible_ids)
+        injection_failure_reason = None
+        if context_attempted and not actual_injection:
+            if length_rejections and context is None:
+                injection_failure_reason = "processor_token_budget"
+            elif str(diagnostic.get("fallback_reason") or "").startswith("prompt_contract:"):
+                injection_failure_reason = "prompt_contract"
+            elif not checked:
+                injection_failure_reason = "token_audit_unavailable"
+            elif not block_visible:
+                injection_failure_reason = "memory_block_not_visible_in_final_tokens"
+            else:
+                injection_failure_reason = "evidence_ids_not_visible_in_final_tokens"
+            self._scene_query_policy_stats["actual_injection_failure_count"] += 1
+            if diagnostic.get("failure_category") is None:
+                diagnostic["failure_category"] = "ACTUAL_INJECTION_FAILED"
         historical_ids = [
             key for key in visible_ids
             if (record := manager.spatial_map.evidence.get(key)) is not None
@@ -692,6 +770,13 @@ class TrajVocabVLNCEPolicy:
                 model_input.get("final_token_count") if checked else None
             ),
             "actual_injection": actual_injection if checked or context is None else None,
+            "memory_context_attempted": context_attempted,
+            "injection_failure_reason": injection_failure_reason,
+            "evidence_link_success_rate": (
+                spatial_diagnostic.get("evidence_linked", 0)
+                / spatial_diagnostic["evidence_minted"]
+                if spatial_diagnostic.get("evidence_minted", 0) else 0.0
+            ),
             "actual_historical_injection": bool(historical_ids) if checked or context is None else None,
             "injected_evidence_ids": visible_ids,
             "injected_historical_evidence_ids": historical_ids,
@@ -719,7 +804,7 @@ class TrajVocabVLNCEPolicy:
             native_visual_overlap_item_count=native_overlap_item_count,
             final_decision=diagnostic["decision"],
         )
-        diagnostic["scene_query_episode_stats"] = controller.episode_statistics()
+        diagnostic["scene_query_episode_stats"] = self.scene_query_episode_stats
         return text, sample, diagnostic
 
     def _generate_with_local_graph_memory(

@@ -104,7 +104,8 @@ class _Provider:
         self.user_payloads: list[dict] = []
         self.calls = 0
 
-    def complete(self, messages: list[dict], tools: list[dict]) -> dict:
+    def complete(self, messages: list[dict], tools: list[dict], *,
+                 tool_choice: str = "auto") -> dict:
         self.calls += 1
         payload = json.loads(messages[1]["content"])
         self.user_payloads.append(payload)
@@ -112,6 +113,10 @@ class _Provider:
             raise TimeoutError("synthetic API timeout")
         if self.mode == "invalid_json":
             return {"content": "not a JSON object"}
+        if self.mode == "no_final":
+            return {"content": json.dumps({
+                "action": "THINK", "reason_code": "STILL_THINKING",
+            })}
         if self.mode == "no_memory" or payload["current_step"] == 0:
             return _final("NO_MEMORY")
         if self.mode == "l1":
@@ -321,6 +326,20 @@ def test_scene_query_builds_one_context_and_preserves_original_prompt(monkeypatc
     assert diagnostic["decision"] == "USE_BOTH"
     assert diagnostic["memory_context_item_count"] == 1
     assert diagnostic["actual_injection"] is True
+    assert diagnostic.get("failure_category") is None
+    assert diagnostic["injection_failure_reason"] is None
+    assert diagnostic["memory_context_attempted"] is True
+    assert diagnostic["evidence_link_success_rate"] == 1.0
+    assert diagnostic["api_request_count"] == 3
+    assert len(diagnostic["request_latencies_ms"]) == 3
+    assert diagnostic["api_round_request_counts"] == [1, 1, 1]
+    assert diagnostic["tool_call_counts"] == {"find_objects": 1, "read_evidence": 1}
+    assert diagnostic["tool_calls_requested"] == 2
+    assert diagnostic["tool_calls_executed"] == 2
+    assert diagnostic["tool_calls_succeeded"] == 2
+    assert diagnostic["tool_calls_reused"] == 0
+    assert diagnostic["tool_calls_rejected_budget"] == 0
+    assert diagnostic["duplicate_tool_call_count"] == 0
     assert diagnostic["actual_historical_injection"] is True
     assert set(diagnostic["injected_evidence_ids"]) == {
         *diagnostic["selected_l1_fact_ids"],
@@ -334,7 +353,21 @@ def test_scene_query_builds_one_context_and_preserves_original_prompt(monkeypatc
     assert stats["step_count"] == 2
     assert stats["both_selection_count"] == 1
     assert stats["l3_query_count"] == 2
+    assert stats["api_request_count"] == 4
+    assert stats["tool_find_objects_call_count"] == 1
+    assert stats["tool_read_evidence_call_count"] == 1
+    assert stats["tool_calls_requested"] == 2
+    assert stats["tool_calls_executed"] == 2
+    assert stats["tool_calls_succeeded"] == 2
+    assert stats["tool_calls_reused"] == 0
+    assert stats["tool_calls_rejected_budget"] == 0
     assert stats["actual_injection_step_count"] == 1
+    assert stats["spatial_evidence_minted_count"] == 2
+    assert stats["spatial_evidence_linked_count"] == 2
+    assert stats["evidence_link_success_rate"] == 1.0
+    assert stats["actual_injection_rate"] == 0.5
+    assert stats["attempted_context_injection_success_rate"] == 1.0
+    assert stats["actual_injection_failure_count"] == 0
     assert diagnostic["scene_query_episode_stats"] == stats
     assert diagnostic["native_visual_source_steps"]
     assert diagnostic["native_visual_overlap_count"] == 1
@@ -364,6 +397,9 @@ def test_scene_query_overflow_drops_whole_fact_and_restores_baseline() -> None:
     assert diagnostic["selected_l3_evidence_ids"] == []
     assert diagnostic["injected_evidence_ids"] == []
     assert diagnostic["actual_injection"] is False
+    assert diagnostic["memory_context_attempted"] is True
+    assert diagnostic["failure_category"] == "ACTUAL_INJECTION_FAILED"
+    assert diagnostic["injection_failure_reason"] == "processor_token_budget"
     assert diagnostic["prompt_hash_before"] == diagnostic["prompt_hash_after"]
     assert diagnostic["deduplicated_fact_count"] == 0
     assert diagnostic["native_visual_overlap_count"] == 0
@@ -371,6 +407,104 @@ def test_scene_query_overflow_drops_whole_fact_and_restores_baseline() -> None:
     assert diagnostic["scene_query_episode_stats"]["no_memory_count"] == 2
     assert diagnostic["scene_query_episode_stats"]["rendered_fact_count"] == 0
     assert diagnostic["scene_query_episode_stats"]["actual_prompt_memory_tokens"] == 0
+    assert diagnostic["scene_query_episode_stats"]["actual_injection_failure_count"] == 1
+    assert diagnostic["scene_query_episode_stats"]["memory_context_attempt_count"] == 1
+    assert diagnostic["scene_query_episode_stats"]["attempted_context_injection_success_rate"] == 0.0
+
+
+def test_evidence_link_rate_uses_minted_segmentation_evidence() -> None:
+    class ThreeMasks(_SegExtractor):
+        def extract(self, rgb: np.ndarray, step_id: int) -> list[SegmentationInstance]:
+            mask = np.ones(rgb.shape[:2], dtype=np.bool_)
+            box = (0.0, 0.0, float(rgb.shape[1]), float(rgb.shape[0]))
+            return [
+                SegmentationInstance(label, 0.95, mask, box)
+                for label in ("chair", "lamp", "sofa")
+            ]
+
+    policy, manager, _ = _policy(_Provider("no_memory"))
+    manager.spatial_extractor = ThreeMasks()
+    _act(policy, 0)
+    diagnostic = policy.last_memory_diagnostic
+    assert diagnostic is not None
+    assert diagnostic["spatial_l3"]["segmentation_count"] == 3
+    assert diagnostic["spatial_l3"]["evidence_minted"] == 3
+    assert diagnostic["spatial_l3"]["evidence_linked"] == 1
+    assert diagnostic["spatial_l3"]["evidence_unmatched"] == 2
+    assert diagnostic["spatial_l3"]["evidence_unmatched_no_same_class"] == 2
+    assert sum(diagnostic["spatial_l3"][f"evidence_{reason}"] for reason in (
+        "unmatched_no_same_class", "unmatched_invalid_l1_bbox",
+        "unmatched_low_iou", "unmatched_low_mask_coverage",
+        "unmatched_invalid_l1_evidence",
+    )) == 2
+    assert diagnostic["evidence_link_success_rate"] == pytest.approx(1 / 3)
+    stats = policy.scene_query_episode_stats
+    assert stats is not None
+    assert stats["spatial_evidence_minted_count"] == 3
+    assert stats["spatial_evidence_linked_count"] == 1
+    assert stats["spatial_evidence_unmatched_no_same_class_count"] == 2
+    assert stats["evidence_link_success_rate"] == pytest.approx(1 / 3)
+    assert stats["memory_context_attempt_count"] == 0
+    assert stats["actual_injection_failure_count"] == 0
+
+
+def test_unconfirmed_final_prompt_is_an_injection_failure_not_an_api_failure() -> None:
+    class InvisibleAuditEngine(_Engine):
+        def generate(self, sample: dict) -> tuple[str, float]:
+            result = super().generate(sample)
+            if "_rgm_trace" in sample:
+                self.last_input_diagnostic["memory_text_present_in_final_tokens"] = False
+                self.last_input_diagnostic["model_visible_evidence_ids"] = []
+            return result
+
+    engine = InvisibleAuditEngine()
+    policy, _, _ = _policy(_Provider("both"), engine=engine)
+    _act(policy, 0)
+    _act(policy, 1)
+    diagnostic = policy.last_memory_diagnostic
+    assert diagnostic is not None
+    assert diagnostic["decision"] == "USE_BOTH"
+    assert diagnostic["memory_context_attempted"] is True
+    assert diagnostic["actual_injection"] is False
+    assert diagnostic["failure_category"] == "ACTUAL_INJECTION_FAILED"
+    assert diagnostic["injection_failure_reason"] == "memory_block_not_visible_in_final_tokens"
+    assert diagnostic["scene_query_episode_stats"]["api_failure_count"] == 0
+    assert diagnostic["scene_query_episode_stats"]["actual_injection_failure_count"] == 1
+    assert diagnostic["scene_query_episode_stats"]["actual_injection_rate"] == 0.0
+
+
+@pytest.mark.parametrize(("failing_stage", "expected_stage", "graph_failure"), [
+    ("segmentation", "segmentation", False),
+    ("object_map", "object_map_observe", True),
+])
+def test_spatial_failure_stage_distinguishes_graph_fusion_from_segmentation(
+    monkeypatch: pytest.MonkeyPatch,
+    failing_stage: str,
+    expected_stage: str,
+    graph_failure: bool,
+) -> None:
+    policy, manager, _ = _policy(_Provider("no_memory"))
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("synthetic sidecar failure")
+
+    target = manager.spatial_map if failing_stage == "object_map" else manager.spatial_extractor
+    method = "observe" if failing_stage == "object_map" else "extract"
+    monkeypatch.setattr(target, method, fail)
+    _act(policy, 0)
+    diagnostic = policy.last_memory_diagnostic
+    assert diagnostic is not None
+    assert diagnostic["spatial_l3"]["failure_stage"] == expected_stage
+    assert "synthetic sidecar failure" in diagnostic["spatial_l3"]["rejection_reason"]
+    assert diagnostic["graph_fusion_build_failure"] is graph_failure
+    assert diagnostic.get("failure_category") == (
+        "GRAPH_FUSION_FAILED" if graph_failure else None
+    )
+    stats = policy.scene_query_episode_stats
+    assert stats is not None
+    assert stats["graph_fusion_build_failure_count"] == int(graph_failure)
+    assert stats["graph_fusion_failure_count"] == int(graph_failure)
+    assert stats["actual_injection_failure_count"] == 0
 
 
 @pytest.mark.parametrize("failure", ["timeout", "invalid_json"])
@@ -393,9 +527,35 @@ def test_api_failure_uses_exact_original_lightnav_sample(failure: str) -> None:
                 assert actual[key] == expected[key]
     assert "_rgm_trace" not in sample
     assert diagnostic["fallback_reason"]
+    expected_category = "API_REQUEST_FAILED" if failure == "timeout" else "API_NO_FINAL"
+    assert diagnostic["failure_category"] == expected_category
     assert diagnostic["selected_l3_evidence_ids"] == []
     assert diagnostic["actual_injection"] is False
+    assert diagnostic["memory_context_attempted"] is False
+    assert diagnostic["injection_failure_reason"] is None
+    assert diagnostic["scene_query_episode_stats"]["api_failure_count"] == int(failure == "timeout")
+    assert diagnostic["scene_query_episode_stats"]["api_no_final_count"] == int(
+        failure == "invalid_json"
+    )
+    assert diagnostic["scene_query_episode_stats"]["actual_injection_failure_count"] == 0
     assert "Spatial history:" not in sample["conversations"][0]["value"]
+
+
+def test_no_final_is_separate_from_api_and_actual_injection_failures() -> None:
+    policy, _, engine = _policy(_Provider("no_final"))
+    _act(policy, 0)
+    diagnostic = policy.last_memory_diagnostic
+    assert diagnostic is not None
+    assert diagnostic["failure_category"] == "API_NO_FINAL"
+    assert diagnostic["api_rounds"] == policy._scene_query_controller.config.max_rounds
+    assert diagnostic["decision"] == "NO_MEMORY"
+    assert diagnostic["actual_injection"] is False
+    assert "_rgm_trace" not in engine.samples[-1]
+    stats = policy.scene_query_episode_stats
+    assert stats is not None
+    assert stats["api_no_final_count"] == 1
+    assert stats["api_failure_count"] == 0
+    assert stats["actual_injection_failure_count"] == 0
 
 
 def test_disabled_scene_query_keeps_existing_spatial_l3_mode() -> None:

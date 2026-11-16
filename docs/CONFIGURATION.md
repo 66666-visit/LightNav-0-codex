@@ -416,11 +416,20 @@ not choose robot actions.
 | `MEMORY_QUERY_MODEL` | empty | External query model identifier |
 | `MEMORY_QUERY_TIMEOUT` | `30` | Request timeout in seconds |
 | `MEMORY_QUERY_MAX_ROUNDS` | `4` | Safety limit on API decision rounds, including Think, Query and Final |
+| `MEMORY_QUERY_MAX_TOOL_CALLS` | `12` | Maximum tool calls requested by the API in one decision step, including repeats; cached repeats skip local map dispatch but still count toward this safety cap |
+| `MEMORY_QUERY_THINKING` | unset | `enabled` or `disabled` sends the DeepSeek-compatible `thinking.type` field; unset omits this extension for other OpenAI-compatible endpoints |
 
 Set the API environment variables in the client process, then use a fresh
 output directory. For example:
 
 ```bash
+export MEMORY_QUERY_BASE_URL=https://api.deepseek.com
+export MEMORY_QUERY_MODEL=deepseek-v4-pro
+export MEMORY_QUERY_THINKING=enabled
+export MEMORY_QUERY_TIMEOUT=30
+export MEMORY_QUERY_MAX_ROUNDS=4
+export MEMORY_QUERY_MAX_TOOL_CALLS=12
+# Supply MEMORY_QUERY_API_KEY through the client environment's secret manager.
 lightnav-eval-habitat \
     --model_path /path/to/LightNav-0 --server tcp://127.0.0.1:5555 \
     --episodes 1 --output_dir output/scene_query_smoke \
@@ -433,6 +442,21 @@ lightnav-eval-habitat \
     --memory_query_enabled
 ```
 
+Leaving `MEMORY_QUERY_THINKING` unset does not explicitly disable DeepSeek
+thinking: DeepSeek may enable it by default. For DeepSeek Chat Completions with
+`tools`, every assistant `reasoning_content` must be returned unchanged in
+subsequent requests, including assistant turns without a tool call; omission
+can produce an HTTP 400. The Controller keeps it only in the transient API
+conversation and does not write it to navigation diagnostics. See the official
+[Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/) and
+[Tool Calls](https://api-docs.deepseek.com/guides/tool_calls/) documentation.
+At a query budget boundary, the Controller keeps the same tool definitions but
+sets `tool_choice` to `none` for the Final request. This disables further tool
+calls while keeping prior `reasoning_content` available to DeepSeek; omitting
+`tools` would make DeepSeek ignore that content. The setting cannot force valid
+selection JSON. If Final cannot be verified, that step uses the original
+LightNav input.
+
 The legacy Local Graph `320`-character card limit does not filter raw L3
 candidates in this mode. Complete selected facts are checked against the real
 model Token capacity before injection. API timeouts, invalid responses, or
@@ -441,6 +465,15 @@ not trigger the old L3-priority fallback. The new-mode
 `conceptgraphs_l3_protocol.json` records scene query settings without the API
 key, and each Episode's `results.jsonl` row includes
 `scene_query_episode_stats`.
+Step diagnostics distinguish missing Final, exhausted round/tool budgets,
+Evidence validation, fused-map validation, and final Token injection failures.
+They also record each API request latency, per-tool call counts, duplicate
+queries, cache reuse, and the exact L3 Evidence eligibility rejection reason.
+`evidence_link_success_rate` is the same-frame L1 bbox to L3 mask link count
+divided by minted segmentation Evidence; it is not the valid L3 map rate.
+Unmatched links are broken down by class, bbox, IoU, mask coverage, and L1
+provenance checks. A raw `read_evidence` result does not imply that a fused
+Object passed the existing all-contributor confidence gate.
 Step diagnostics separate Controller choices from entries retained after the
 Processor token check. Episode injection counts use only facts confirmed in
 the final model input. `native_visual_source_steps` and

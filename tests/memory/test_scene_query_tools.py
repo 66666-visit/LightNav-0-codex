@@ -9,13 +9,15 @@ import pytest
 
 from lightnav.memory.conceptgraphs_lite import (
     CameraIntrinsics,
+    GeometryConfig,
     InstanceMask,
     ObjectMap,
     Pose3D,
     RGBDFrame,
 )
 from lightnav.memory.scene_query_tools import OPENAI_TOOLS, TOOL_SCHEMAS, SceneQueryTools
-from lightnav.memory.v3_schemas import canonical_evidence_key
+from lightnav.memory.v3_schemas import EvidenceRecord, canonical_evidence_key
+from lightnav.memory.v3_store import V3MemoryStore
 
 
 def _frame(*, x: float = 0.0) -> RGBDFrame:
@@ -28,11 +30,11 @@ def _frame(*, x: float = 0.0) -> RGBDFrame:
     )
 
 
-def _instance(left: int, right: int, number: int) -> InstanceMask:
+def _instance(left: int, right: int, number: int, *, confidence: float = 0.9) -> InstanceMask:
     mask = np.zeros((8, 8), dtype=bool)
     mask[:, left:right] = True
     return InstanceMask(
-        class_name="chair", confidence=0.9, mask=mask,
+        class_name="chair", confidence=confidence, mask=mask,
         evidence_id=canonical_evidence_key("scene", "episode", 0, f"seg_{number}"),
     )
 
@@ -62,7 +64,13 @@ def test_find_objects_reads_existing_nodes_and_unbudgeted_candidates(queried_map
         "l3_object_node_count": len(graph.objects),
         "l3_raw_candidate_count": 2,
         "l3_evidence_valid_count": 2,
+        "l3_evidence_record_count": 2,
+        "l3_eligible_historical_evidence_count": 2,
+        "l3_evidence_below_injection_floor_count": 0,
+        "l3_evidence_rejected_geometry_count": 0,
+        "l3_evidence_unassigned_count": 0,
     }
+    assert tools.call("find_objects", {"history_eligible_only": True}) == found
     assert all(schema["additionalProperties"] is False for schema in TOOL_SCHEMAS.values())
     assert {tool["function"]["name"] for tool in OPENAI_TOOLS} == set(TOOL_SCHEMAS)
 
@@ -79,6 +87,8 @@ def test_read_node_returns_real_object_fields(queried_map) -> None:
         "observation_count": 1,
         "geometry_status": "observed",
         "evidence_ids": [evidence_ids[0]],
+        "historical_eligible_evidence_ids": [evidence_ids[0]],
+        "historical_rejection_reasons": {},
     }
     assert "points_world" not in node
 
@@ -135,6 +145,8 @@ def test_unknown_or_malformed_arguments_are_rejected(queried_map) -> None:
             tools.call("read_node", arguments)
     with pytest.raises(ValueError, match="missing"):
         tools.call("read_node", {})
+    with pytest.raises(ValueError, match="must be a boolean"):
+        tools.call("find_objects", {"history_eligible_only": "true"})
 
 
 def test_queries_leave_objectmap_unchanged_and_return_detached_data(queried_map) -> None:
@@ -163,6 +175,149 @@ def test_same_label_nodes_keep_distinct_ids_and_evidence(queried_map) -> None:
     assert first["object_ids"] == [object_ids[0]]
     assert first["step_id"] == 0
     assert first["confidence"] == pytest.approx(0.9)
+    assert first["historical_eligible_object_ids"] == [object_ids[0]]
+    assert first["historical_rejection_reasons"] == {}
+    assert first["unassigned_reason"] is None
+    assert first["validated_linked_l1_evidence_id"] is None
     assert tools.validate_history(object_ids[0], evidence_ids[0])["object_id"] == object_ids[0]
     with pytest.raises(ValueError, match="does not belong"):
         tools.validate_history(object_ids[0], evidence_ids[1])
+
+
+def test_raw_evidence_can_be_read_but_weak_fused_object_is_not_injectable() -> None:
+    graph = ObjectMap()
+    graph.reset_episode("scene", "episode")
+    strong = _instance(0, 3, 0, confidence=0.9)
+    weak = _instance(0, 3, 1, confidence=0.3)
+    first = graph.observe(_frame(), [strong], step_id=0)[0]
+    second = graph.observe(_frame(), [weak], step_id=1)[0]
+    assert first.object_id == second.object_id
+    assert graph.objects[first.object_id].evidence_ids == [strong.evidence_id, weak.evidence_id]
+    tools = SceneQueryTools(
+        graph, None, scene_id="scene", episode_id="episode", rollout_idx=0,
+        step=2, scope="episode_local", min_confidence=0.5,
+    )
+
+    raw = tools.call("read_evidence", {"evidence_id": strong.evidence_id})
+    assert raw["object_ids"] == [first.object_id]
+    assert raw["confidence"] == pytest.approx(0.9)
+    assert raw["historical_eligible_object_ids"] == []
+    assert weak.evidence_id in raw["historical_rejection_reasons"][first.object_id]
+    assert tools.call("find_objects", {"history_eligible_only": True}) == []
+    node = tools.call("read_node", {"object_id": first.object_id})
+    assert node["historical_eligible_evidence_ids"] == []
+    assert all(
+        weak.evidence_id in reason
+        for reason in node["historical_rejection_reasons"].values()
+    )
+    assert tools.candidate_counts() == {
+        "l3_object_node_count": 1,
+        "l3_raw_candidate_count": 1,
+        "l3_evidence_valid_count": 0,
+        "l3_evidence_record_count": 2,
+        "l3_eligible_historical_evidence_count": 0,
+        "l3_evidence_below_injection_floor_count": 1,
+        "l3_evidence_rejected_geometry_count": 0,
+        "l3_evidence_unassigned_count": 0,
+    }
+    with pytest.raises(ValueError, match="fused Object has missing or weak Evidence"):
+        tools.validate_history(first.object_id, strong.evidence_id)
+
+
+def test_fused_object_requires_each_contributor_source_edge() -> None:
+    graph = ObjectMap()
+    graph.reset_episode("scene", "episode")
+    first = _instance(0, 3, 0)
+    second = _instance(0, 3, 1)
+    object_id = graph.observe(_frame(), [first], step_id=0)[0].object_id
+    assert graph.observe(_frame(), [second], step_id=1)[0].object_id == object_id
+    graph.edges = [
+        edge for edge in graph.edges
+        if not (edge.relation_type == "observed_from"
+                and edge.evidence_id == second.evidence_id)
+    ]
+    tools = SceneQueryTools(
+        graph, None, scene_id="scene", episode_id="episode", rollout_idx=0,
+        step=2, scope="episode_local", min_confidence=0.5,
+    )
+    raw = tools.call("read_evidence", {"evidence_id": first.evidence_id})
+    assert raw["historical_eligible_object_ids"] == []
+    assert second.evidence_id in raw["historical_rejection_reasons"][object_id]
+    assert tools.candidate_counts()["l3_evidence_valid_count"] == 0
+    with pytest.raises(ValueError, match="contributor requires one observed_from edge"):
+        tools.validate_history(object_id, first.evidence_id)
+
+
+def test_rejected_depth_evidence_has_no_invented_object_association() -> None:
+    graph = ObjectMap(GeometryConfig(min_points=100))
+    graph.reset_episode("scene", "episode")
+    instance = _instance(0, 3, 0)
+    assert graph.observe(_frame(), [instance], step_id=0) == []
+    tools = SceneQueryTools(
+        graph, None, scene_id="scene", episode_id="episode", rollout_idx=0,
+        step=1, scope="episode_local", min_confidence=0.5,
+    )
+    raw = tools.call("read_evidence", {"evidence_id": instance.evidence_id})
+    assert raw["geometry_status"] == "rejected_depth"
+    assert raw["object_ids"] == []
+    assert raw["historical_eligible_object_ids"] == []
+    assert raw["unassigned_reason"] == "Evidence has no ObjectNode association"
+    counts = tools.candidate_counts()
+    assert counts["l3_evidence_record_count"] == 1
+    assert counts["l3_evidence_rejected_geometry_count"] == 1
+    assert counts["l3_evidence_unassigned_count"] == 1
+
+
+def test_raw_l1_link_without_store_provenance_is_not_reported_as_verified() -> None:
+    graph = ObjectMap()
+    graph.reset_episode("scene", "episode")
+    instance = _instance(0, 3, 0)
+    raw_l1_id = canonical_evidence_key("scene", "episode", 0, "unverified_l1")
+    linked = InstanceMask(
+        instance.class_name, instance.confidence, instance.mask,
+        instance.evidence_id, linked_l1_evidence_id=raw_l1_id,
+    )
+    object_id = graph.observe(_frame(), [linked], step_id=0)[0].object_id
+    tools = SceneQueryTools(
+        graph, None, scene_id="scene", episode_id="episode", rollout_idx=0,
+        step=1, scope="episode_local", min_confidence=0.5,
+    )
+    raw = tools.call("read_evidence", {"evidence_id": linked.evidence_id})
+    assert raw["object_ids"] == [object_id]
+    assert raw["historical_eligible_object_ids"] == [object_id]
+    assert raw["linked_l1_evidence_id"] == raw_l1_id
+    assert raw["validated_linked_l1_evidence_id"] is None
+
+
+@pytest.mark.parametrize("provenance_validity", [True, False])
+def test_l1_link_verification_requires_real_v3_provenance(
+    provenance_validity: bool,
+) -> None:
+    store = V3MemoryStore()
+    store.begin_episode("scene", "episode", "find the chair")
+    store.add(EvidenceRecord(
+        evidence_id="l1_detection_0", scene_id="scene", episode_id="episode",
+        rollout_idx=0, step=0, event_type="object_observation",
+        semantic_label="chair", observation_status="observed",
+        provenance_validity=provenance_validity,
+    ))
+    l1_id = canonical_evidence_key("scene", "episode", 0, "l1_detection_0")
+    instance = _instance(0, 3, 0)
+    linked = InstanceMask(
+        instance.class_name, instance.confidence, instance.mask,
+        instance.evidence_id, linked_l1_evidence_id=l1_id,
+    )
+    graph = ObjectMap()
+    graph.reset_episode("scene", "episode")
+    object_id = graph.observe(_frame(), [linked], step_id=0)[0].object_id
+    tools = SceneQueryTools(
+        graph, store, scene_id="scene", episode_id="episode", rollout_idx=0,
+        step=1, scope="episode_local", min_confidence=0.5,
+    )
+    raw = tools.call("read_evidence", {"evidence_id": linked.evidence_id})
+    expected_link = l1_id if provenance_validity else None
+    assert raw["linked_l1_evidence_id"] == l1_id
+    assert raw["validated_linked_l1_evidence_id"] == expected_link
+    assert tools.validate_history(object_id, linked.evidence_id)[
+        "linked_l1_evidence_id"
+    ] == expected_link

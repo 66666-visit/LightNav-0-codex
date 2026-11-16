@@ -29,7 +29,19 @@ def make_spatial_evidence(
     same-class mask and detector box agree without ambiguity.
     """
     masks: list[InstanceMask] = []
-    counts = {"unmatched": 0, "ambiguous": 0, "linked": 0, "minted": 0}
+    # An unmatched mask is assigned exactly one diagnostic reason: the first
+    # gate after the furthest stage reached by any same-frame L1 event.
+    unmatched_reasons = (
+        "unmatched_no_same_class",
+        "unmatched_invalid_l1_bbox",
+        "unmatched_low_iou",
+        "unmatched_low_mask_coverage",
+        "unmatched_invalid_l1_evidence",
+    )
+    counts = {
+        "unmatched": 0, "ambiguous": 0, "linked": 0, "minted": 0,
+        **{reason: 0 for reason in unmatched_reasons},
+    }
     used_evidence: set[str] = set()
     for index, instance in enumerate(instances):
         mask = np.asarray(instance.mask)
@@ -41,6 +53,7 @@ def make_spatial_evidence(
             continue
         seg_area = max(0.0, sx2 - sx1) * max(0.0, sy2 - sy1)
         matches: list[tuple[float, str]] = []
+        furthest_match_stage = 0
         for event in events:
             if event.kind not in {"object_observation", "landmark"}:
                 continue
@@ -48,6 +61,7 @@ def make_spatial_evidence(
                 instance.class_name.casefold()
             ):
                 continue
+            furthest_match_stage = max(furthest_match_stage, 1)
             box = event.metadata.get("bbox_xyxy")
             if not isinstance(box, (list, tuple)) or len(box) != 4:
                 continue
@@ -59,6 +73,7 @@ def make_spatial_evidence(
                     or x1 < 0 or y1 < 0 or x2 > width or y2 > height
                     or x2 <= x1 or y2 <= y1):
                 continue
+            furthest_match_stage = max(furthest_match_stage, 2)
             intersection = max(0.0, min(sx2, x2) - max(sx1, x1)) * max(
                 0.0, min(sy2, y2) - max(sy1, y1)
             )
@@ -66,11 +81,13 @@ def make_spatial_evidence(
             iou = intersection / union if union > 0 else 0.0
             if iou < min_iou:
                 continue
+            furthest_match_stage = max(furthest_match_stage, 3)
             xlo, xhi = max(0, int(math.floor(x1))), min(width, int(math.ceil(x2)))
             ylo, yhi = max(0, int(math.floor(y1))), min(height, int(math.ceil(y2)))
             covered = float(mask[ylo:yhi, xlo:xhi].sum()) / float(mask.sum())
             if covered < 0.8:
                 continue
+            furthest_match_stage = max(furthest_match_stage, 4)
             evidence_id = canonical_evidence_key(
                 scene_id, episode_id, rollout_idx, event.event_id,
             )
@@ -86,6 +103,7 @@ def make_spatial_evidence(
         best_id = None
         if not matches:
             counts["unmatched"] += 1
+            counts[unmatched_reasons[furthest_match_stage]] += 1
         elif (len(matches) > 1 and matches[0][0] - matches[1][0] < ambiguity_margin):
             counts["ambiguous"] += 1
         elif matches[0][1] in used_evidence:

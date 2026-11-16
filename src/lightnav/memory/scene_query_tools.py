@@ -11,7 +11,7 @@ import json
 import math
 from typing import Any
 
-from lightnav.memory.conceptgraphs_lite import ObjectMap
+from lightnav.memory.conceptgraphs_lite import ObjectMap, SpatialEvidence
 from lightnav.memory.v3_schemas import parse_evidence_key
 from lightnav.memory.v3_store import V3MemoryStore
 
@@ -22,6 +22,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "class_name": {"type": "string", "minLength": 1},
             "object_id": {"type": "string", "minLength": 1},
             "min_observation_count": {"type": "integer", "minimum": 1},
+            "history_eligible_only": {"type": "boolean"},
         },
         "required": [],
         "additionalProperties": False,
@@ -47,9 +48,9 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 
 _DESCRIPTIONS = {
-    "find_objects": "Find recorded 3D object nodes by exact class, ID, or observation count.",
-    "read_node": "Read one existing ObjectMap node and its Evidence IDs.",
-    "read_evidence": "Read one recorded spatial Evidence and its Object IDs.",
+    "find_objects": "Find recorded 3D nodes by class, ID, or observation count; optionally require verified historical Evidence.",
+    "read_node": "Read one ObjectMap node, raw Evidence IDs, and verified historical Evidence IDs.",
+    "read_evidence": "Read raw spatial Evidence, its Object IDs, and historical injection eligibility or rejection reasons.",
     "get_edges_for_node": "Read actual observed_from provenance edges of one object.",
 }
 
@@ -103,6 +104,9 @@ def _validate_arguments(name: str, arguments: dict[str, Any] | str) -> dict[str,
         elif field["type"] == "integer":
             if type(value) is not int or value < field["minimum"]:
                 raise ValueError(f"{name}.{key} must be an integer >= {field['minimum']}")
+        elif field["type"] == "boolean":
+            if type(value) is not bool:
+                raise ValueError(f"{name}.{key} must be a boolean")
     return arguments
 
 
@@ -163,6 +167,7 @@ class SceneQueryTools:
     def find_objects(
         self, *, class_name: str | None = None, object_id: str | None = None,
         min_observation_count: int | None = None,
+        history_eligible_only: bool = False,
     ) -> list[dict]:
         if object_id is not None and object_id not in self.object_map.objects:
             raise ValueError(f"invalid Object ID: {object_id}")
@@ -175,7 +180,10 @@ class SceneQueryTools:
             if (min_observation_count is not None
                     and node.observation_count < min_observation_count):
                 continue
-            result.append(self._node_record(node.object_id))
+            record = self._node_record(node.object_id)
+            if history_eligible_only and not record["historical_eligible_evidence_ids"]:
+                continue
+            result.append(record)
         return sorted(result, key=lambda row: row["object_id"])
 
     def read_node(self, *, object_id: str) -> dict:
@@ -189,6 +197,15 @@ class SceneQueryTools:
         if not isinstance(node.bbox_3d, (tuple, list)) or len(node.bbox_3d) != 2:
             raise ValueError("object bounding box is invalid")
         box = [_finite_vector(part, 3, "object bounding box") for part in node.bbox_3d]
+        eligible: list[str] = []
+        rejected: dict[str, str] = {}
+        for evidence_id in node.evidence_ids:
+            try:
+                self.validate_history(object_id, evidence_id)
+            except ValueError as exc:
+                rejected[evidence_id] = str(exc)
+            else:
+                eligible.append(evidence_id)
         return {
             "object_id": node.object_id,
             "class_name": node.class_name,
@@ -197,6 +214,8 @@ class SceneQueryTools:
             "observation_count": node.observation_count,
             "geometry_status": node.geometry_status,
             "evidence_ids": list(node.evidence_ids),
+            "historical_eligible_evidence_ids": eligible,
+            "historical_rejection_reasons": rejected,
         }
 
     def read_evidence(self, *, evidence_id: str) -> dict:
@@ -207,6 +226,15 @@ class SceneQueryTools:
             node.object_id for node in self.object_map.objects.values()
             if evidence_id in node.evidence_ids
         )
+        eligible: list[str] = []
+        rejected: dict[str, str] = {}
+        for object_id in object_ids:
+            try:
+                self.validate_history(object_id, evidence_id)
+            except ValueError as exc:
+                rejected[object_id] = str(exc)
+            else:
+                eligible.append(object_id)
         return {
             "evidence_id": record.evidence_id,
             "object_ids": object_ids,
@@ -221,6 +249,12 @@ class SceneQueryTools:
             "depth_point_count": record.depth_point_count,
             "geometry_status": record.geometry_status,
             "linked_l1_evidence_id": record.linked_l1_evidence_id,
+            "validated_linked_l1_evidence_id": self._validated_l1_link(record),
+            "historical_eligible_object_ids": eligible,
+            "historical_rejection_reasons": rejected,
+            "unassigned_reason": (
+                "Evidence has no ObjectNode association" if not object_ids else None
+            ),
         }
 
     def get_edges_for_node(self, *, object_id: str) -> list[dict]:
@@ -245,15 +279,38 @@ class SceneQueryTools:
             if node.geometry_status == "observed"
         ]
         valid = 0
+        valid_evidence_ids: set[str] = set()
         for object_id in raw_ids:
             node = self.object_map.objects[object_id]
-            if any(self._history_or_none(object_id, eid) is not None
-                   for eid in node.evidence_ids):
+            eligible = [
+                eid for eid in node.evidence_ids
+                if self._history_or_none(object_id, eid) is not None
+            ]
+            valid_evidence_ids.update(eligible)
+            if eligible:
                 valid += 1
+        evidence_records = tuple(self.object_map.evidence.values())
+        assigned_evidence_ids = {
+            key for node in self.object_map.objects.values() for key in node.evidence_ids
+        }
         return {
             "l3_object_node_count": len(self.object_map.objects),
             "l3_raw_candidate_count": len(raw_ids),
             "l3_evidence_valid_count": valid,
+            "l3_evidence_record_count": len(evidence_records),
+            "l3_eligible_historical_evidence_count": len(valid_evidence_ids),
+            "l3_evidence_below_injection_floor_count": sum(
+                record.geometry_status == "observed"
+                and (not math.isfinite(record.confidence)
+                     or record.confidence < self.min_confidence)
+                for record in evidence_records
+            ),
+            "l3_evidence_rejected_geometry_count": sum(
+                record.geometry_status != "observed" for record in evidence_records
+            ),
+            "l3_evidence_unassigned_count": sum(
+                record.evidence_id not in assigned_evidence_ids for record in evidence_records
+            ),
         }
 
     def _history_or_none(self, object_id: str, evidence_id: str) -> dict | None:
@@ -261,6 +318,22 @@ class SceneQueryTools:
             return self.validate_history(object_id, evidence_id)
         except ValueError:
             return None
+
+    def _validated_l1_link(self, record: SpatialEvidence) -> str | None:
+        linked_l1_id = record.linked_l1_evidence_id
+        if linked_l1_id is None or self.store is None:
+            return None
+        l1 = self.store.get_evidence(linked_l1_id)
+        if (l1 is None or l1.scene_id != record.scene_id
+                or l1.episode_id != record.episode_id
+                or l1.rollout_idx != record.rollout_idx
+                or l1.step != record.step_id
+                or l1.observation_status != "observed"
+                or not l1.provenance_validity
+                or l1.event_type not in {"object_observation", "landmark"}
+                or (l1.semantic_label or "").casefold() != record.class_name.casefold()):
+            return None
+        return linked_l1_id
 
     def validate_history(self, object_id: str, evidence_id: str) -> dict:
         """Verify one old observation and the complete fused-node provenance.
@@ -283,11 +356,44 @@ class SceneQueryTools:
             raise ValueError("Object has no Evidence")
         for ref in node.evidence_ids:
             contributor = self.object_map.evidence.get(ref)
-            if (contributor is None or contributor.geometry_status != "observed"
-                    or contributor.class_name.casefold() != node.class_name.casefold()
-                    or not math.isfinite(contributor.confidence)
-                    or contributor.confidence < self.min_confidence):
-                raise ValueError("fused Object has missing or weak Evidence")
+            if contributor is None:
+                raise ValueError(f"fused Object has missing or weak Evidence: missing {ref}")
+            if contributor.geometry_status != "observed":
+                raise ValueError(
+                    f"fused Object has missing or weak Evidence: {ref} geometry={contributor.geometry_status}"
+                )
+            if contributor.class_name.casefold() != node.class_name.casefold():
+                raise ValueError(f"fused Object has missing or weak Evidence: {ref} class mismatch")
+            if not math.isfinite(contributor.confidence) or contributor.confidence < self.min_confidence:
+                raise ValueError(
+                    f"fused Object has missing or weak Evidence: {ref} confidence={contributor.confidence}"
+                )
+            try:
+                contributor_identity = parse_evidence_key(contributor.evidence_id)[:3]
+            except ValueError as exc:
+                raise ValueError(f"fused Object contributor has invalid Evidence ID: {ref}") from exc
+            if (contributor.evidence_id != ref or contributor_identity != (
+                contributor.scene_id, contributor.episode_id, contributor.rollout_idx,
+            )):
+                raise ValueError(f"fused Object contributor provenance disagrees: {ref}")
+            contributor_edges = [
+                edge for edge in self.object_map.edges
+                if edge.relation_type == "observed_from"
+                and edge.object_id == object_id and edge.evidence_id == ref
+            ]
+            if len(contributor_edges) != 1:
+                raise ValueError(f"fused Object contributor requires one observed_from edge: {ref}")
+            contributor_viewpoint = self.object_map.viewpoints.get(
+                contributor_edges[0].viewpoint_id
+            )
+            if contributor_viewpoint is None or (
+                contributor.scene_id, contributor.episode_id,
+                contributor.rollout_idx, contributor.step_id,
+            ) != (
+                contributor_viewpoint.scene_id, contributor_viewpoint.episode_id,
+                contributor_viewpoint.rollout_idx, contributor_viewpoint.step_id,
+            ):
+                raise ValueError(f"fused Object contributor viewpoint provenance disagrees: {ref}")
         record = self.object_map.evidence[evidence_id]
         try:
             ref_identity = parse_evidence_key(record.evidence_id)[:3]
@@ -327,15 +433,7 @@ class SceneQueryTools:
         viewpoint_position = _finite_vector(
             viewpoint.camera_pose.position, 3, "viewpoint camera position",
         )
-        linked_l1_id = record.linked_l1_evidence_id
-        if linked_l1_id is not None:
-            l1 = self.store.get_evidence(linked_l1_id) if self.store is not None else None
-            if (l1 is None or l1.scene_id != record.scene_id
-                    or l1.episode_id != record.episode_id
-                    or l1.rollout_idx != record.rollout_idx
-                    or l1.step != record.step_id
-                    or l1.observation_status != "observed"):
-                linked_l1_id = None
+        linked_l1_id = self._validated_l1_link(record)
         provenance = {
             "scene_id": record.scene_id,
             "episode_id": record.episode_id,
