@@ -18,6 +18,7 @@ from lightnav.habitat.runner import HabitatEvalConfig, MemoryConfig, run_habitat
 from lightnav.memory.conceptgraphs_lite import GeometryConfig
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.rgm_config import RGMConfig
+from lightnav.memory.scene_query_config import SceneQueryConfig
 from lightnav.memory.spatial_l3_config import SpatialL3Config
 from lightnav.memory.v3_config import RGMV3Config
 from lightnav.memory.v4_config import RGMV4Config
@@ -253,6 +254,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Minimum best-versus-second L1 Evidence IoU margin.")
     p.add_argument("--spatial_l3_min_injection_confidence", type=float, default=0.5,
                    help="Minimum independent segmentation confidence for Prompt injection.")
+    p.add_argument("--memory_query_enabled", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="Use active L1/L3 scene queries; defaults to MEMORY_QUERY_ENABLED.")
     geometry_defaults = GeometryConfig()
     for name in (
         "min_depth_m", "max_depth_m", "voxel_size_m", "max_center_distance_m",
@@ -448,6 +452,7 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                     )
                 }),
             ),
+            scene_query=SceneQueryConfig.from_env(enabled=args.memory_query_enabled),
         ),
         save_video=args.save_video,
         video_fps=args.video_fps,

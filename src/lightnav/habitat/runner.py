@@ -48,6 +48,7 @@ from lightnav.habitat.results import (
 )
 from lightnav.memory.local_graph_config import LOCAL_GRAPH_PROTOCOL_VERSION, LocalGraphConfig
 from lightnav.memory.rgm_config import RGMConfig
+from lightnav.memory.scene_query_config import SceneQueryConfig
 from lightnav.memory.spatial_l3_config import SpatialL3Config
 from lightnav.memory.v3_config import RGM_V3_PROTOCOL_VERSION, RGMV3Config
 from lightnav.memory.v4_config import RGM_V4_PROTOCOL_VERSION, RGMV4Config
@@ -86,6 +87,7 @@ class MemoryConfig:
     rgm_v4: RGMV4Config = field(default_factory=RGMV4Config)
     local_graph: LocalGraphConfig = field(default_factory=LocalGraphConfig)
     spatial_l3: SpatialL3Config = field(default_factory=SpatialL3Config)
+    scene_query: SceneQueryConfig = field(default_factory=SceneQueryConfig)
 
     def __post_init__(self) -> None:
         if self.top_k < 1 or self.max_context_chars < 1:
@@ -130,6 +132,10 @@ class MemoryConfig:
             raise ValueError("local graph requires memory_enabled")
         if self.spatial_l3.mode != "off" and not self.local_graph.enabled:
             raise ValueError("spatial L3 requires local graph enabled")
+        if self.scene_query.enabled and not self.local_graph.enabled:
+            raise ValueError("scene query requires local graph enabled")
+        if self.scene_query.enabled and self.spatial_l3.mode != "inject":
+            raise ValueError("scene query requires spatial L3 inject mode")
         if self.spatial_l3.mode != "off" and self.extractor != "yolo11":
             raise ValueError("spatial L3 requires the independent L1 yolo11 detector")
         if (self.spatial_l3.mode != "off" and self.spatial_l3.seg_model_path
@@ -457,6 +463,7 @@ def build_velocity_policy(
             local_graph_config=cfg.memory.local_graph,
             spatial_l3_config=cfg.memory.spatial_l3,
             spatial_extractor=spatial_extractor,
+            scene_query_config=cfg.memory.scene_query,
         )
     return TrajVocabVLNCEPolicy(
         engine,
@@ -892,16 +899,22 @@ def _prepare_local_graph_output_dir(output_dir: str, config: LocalGraphConfig) -
         stream.write("\n")
 
 
-def _write_spatial_l3_protocol(output_dir: str, config: SpatialL3Config) -> None:
+def _write_spatial_l3_protocol(
+    output_dir: str, config: SpatialL3Config, *,
+    scene_query: SceneQueryConfig | None = None,
+) -> None:
     """Identify the spatial experiment without changing the Local Graph marker."""
     if config.mode == "off":
         return
     marker = Path(output_dir) / "conceptgraphs_l3_protocol.json"
+    snapshot = {
+        "protocol_version": "conceptgraphs_lite_l3_v1_1",
+        "spatial_l3": asdict(config),
+    }
+    if scene_query is not None and scene_query.enabled:
+        snapshot["scene_query"] = asdict(scene_query)
     with marker.open("x", encoding="utf-8") as stream:
-        json.dump({
-            "protocol_version": "conceptgraphs_lite_l3_v1_1",
-            "spatial_l3": asdict(config),
-        }, stream, indent=2)
+        json.dump(snapshot, stream, indent=2)
         stream.write("\n")
 
 
@@ -963,7 +976,10 @@ def run_habitat_eval(
         _prepare_v4_output_dir(output_dir, cfg.memory.rgm_v4, resume=cfg.resume)
     elif cfg.memory.local_graph.enabled:
         _prepare_local_graph_output_dir(output_dir, cfg.memory.local_graph)
-        _write_spatial_l3_protocol(output_dir, cfg.memory.spatial_l3)
+        _write_spatial_l3_protocol(
+            output_dir, cfg.memory.spatial_l3,
+            scene_query=cfg.memory.scene_query,
+        )
     else:
         _guard_non_v3_v4_output_dir(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -1398,6 +1414,10 @@ def run_habitat_eval(
                     if inference_latencies else None
                 ),
             }
+            if cfg.memory.scene_query.enabled:
+                result["scene_query_episode_stats"] = getattr(
+                    policy, "scene_query_episode_stats", None,
+                )
             if video_rel is not None:
                 result["video"] = video_rel
             if cfg.strict_full_eval and result["steps"] < 1:

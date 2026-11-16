@@ -172,6 +172,17 @@ class TrajVocabVLNCEPolicy:
             self.memory_manager = memory_manager
         else:
             self.memory_manager = None
+        self._scene_query_controller = None
+        self._scene_query_frame_ids_by_step: dict[int, int] = {}
+        if self.memory_manager is not None and getattr(
+            getattr(self.memory_manager, "scene_query_config", None), "enabled", False,
+        ):
+            from lightnav.memory.scene_query_controller import SceneQueryController
+
+            self._scene_query_controller = SceneQueryController(
+                self.memory_manager.scene_query_config,
+                self.memory_manager.scene_query_provider,
+            )
         self._memory_episode_index = -1
         self._memory_episode_open = False
         self._memory_step = 0
@@ -220,6 +231,9 @@ class TrajVocabVLNCEPolicy:
             self._memory_step = 0
             self._last_executed_action = None
             self._last_prediction = None
+            if self._scene_query_controller is not None:
+                self._scene_query_controller.reset_episode()
+                self._scene_query_frame_ids_by_step = {}
 
     def close_episode(self, *, outcome: str | None = None) -> None:
         """Release the explicit memory of the current episode, if enabled."""
@@ -236,6 +250,13 @@ class TrajVocabVLNCEPolicy:
             self._memory_episode_open = False
             self._last_executed_action = None
             self._last_prediction = None
+
+    @property
+    def scene_query_episode_stats(self) -> dict[str, int | float] | None:
+        """Cumulative selection and actual-injection counts for the current Episode."""
+        if self._scene_query_controller is None:
+            return None
+        return self._scene_query_controller.episode_statistics()
 
     def observe(self, obs: dict[str, Any], info: dict[str, Any] | None = None) -> None:
         """Push the RGB frame into the history buffer without running inference."""
@@ -445,6 +466,260 @@ class TrajVocabVLNCEPolicy:
             "v4_diagnostic": v4_diagnostic,
             "model_input_diagnostic": dict(model_input) if checked else None,
         }
+        return text, sample, diagnostic
+
+    def _generate_with_scene_query_memory(
+        self, obs: dict[str, Any], info: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        """Run one read-only L1/L3 selection before the frozen LightNav input path."""
+        from html import escape
+
+        from lightnav.memory.memory_context_builder import (
+            audit_prompt_injection,
+            build_context_text,
+            inject_memory_context,
+        )
+        from lightnav.memory.scene_query_controller import read_l1_facts
+        from lightnav.memory.schemas import MemoryContext, ObservationPacket
+
+        manager = self.memory_manager
+        controller = self._scene_query_controller
+        assert manager is not None and controller is not None
+        step = self._memory_step
+        events = manager.observe(ObservationPacket(
+            step_id=step, rgb=obs["rgb"], instruction=self.instruction,
+            last_action=self._last_executed_action, prediction=self._last_prediction,
+        ))
+        self._memory_step += 1
+        with _preserve_global_rng():
+            spatial_diagnostic = manager.observe_spatial(obs, info, events, step=step)
+        self._scene_query_frame_ids_by_step[step] = int(self.agent._history_frame_ids[-1])
+        base_sample = build_vln_traj_sample(
+            self.agent._get_video_tensor(), self.agent.instruction,
+            list(self.agent._history_frame_ids), self.engine.bundle,
+        )
+        native_frame_ids = {
+            int(frame_id)
+            for segment in base_sample["video_segments"]
+            for frame_id in (segment.get("frame_indices") or ())
+        }
+        native_visual_source_steps = tuple(sorted(
+            source_step for source_step, frame_id in self._scene_query_frame_ids_by_step.items()
+            if frame_id in native_frame_ids
+        ))
+        context, diagnostic = controller.run(
+            manager, instruction=self.instruction, step=step,
+            agent_pose=(manager.last_spatial_frame.agent_pose
+                        if manager.last_spatial_frame is not None else None),
+            native_visual_source_steps=native_visual_source_steps,
+        )
+        diagnostic["episode_id"] = manager.working.state.episode_id
+        diagnostic["events_written"] = len(events)
+        diagnostic["spatial_l3"] = spatial_diagnostic
+        diagnostic["pre_budget_selected_l1_fact_ids"] = list(diagnostic["selected_l1_fact_ids"])
+        diagnostic["pre_budget_selected_l3_object_ids"] = list(diagnostic["selected_l3_object_ids"])
+        diagnostic["pre_budget_selected_l3_evidence_ids"] = list(diagnostic["selected_l3_evidence_ids"])
+        base_prompt = next(
+            turn["value"] for turn in base_sample["conversations"]
+            if turn.get("from") == "human"
+        )
+        base_hash = sha256(base_prompt.encode("utf-8")).hexdigest()
+        sample = base_sample
+        memory_text = ""
+        prompt_audit = None
+        removed_items: list[dict[str, Any]] = []
+        length_rejections = 0
+        started = perf_counter()
+        while True:
+            if context is not None:
+                try:
+                    # The legacy 320/600-char caps do not apply. The existing
+                    # Processor checks the real model token capacity below.
+                    budget = len(escape(context.text.strip(), quote=False))
+                    memory_text = build_context_text(context, max_chars=budget)
+                    if not memory_text or len(memory_text) != budget:
+                        raise ValueError("scene query text was not rendered whole")
+                    augmented = inject_memory_context(base_sample, context, max_chars=budget)
+                    prompt_audit = audit_prompt_injection(
+                        base_sample, augmented, context, max_chars=budget,
+                    )
+                    accepted = []
+                    for item in context.layer_items:
+                        line = item.metadata["serialized_text"]
+                        if not isinstance(line, str) or line not in memory_text:
+                            raise ValueError("scene query fact was not injected whole")
+                        accepted.append({
+                            "evidence_ids": list(item.metadata["evidence_ids"]),
+                            "text": line,
+                        })
+                    if len(accepted) != len(context.layer_items):
+                        raise ValueError("scene query Evidence and prompt lines disagree")
+                    sample = {
+                        **augmented,
+                        "_rgm_trace": {
+                            "episode_id": manager.working.state.episode_id,
+                            "scene_id": manager.v3_scene_id,
+                            "rollout_idx": manager.v3_rollout_idx,
+                            # Reuse the existing strict Processor/token audit path.
+                            "memory_backend": "local_graph",
+                            "memory_use_mode": "scene_query",
+                            "step_id": step,
+                            "original_instruction": self.instruction,
+                            "memory_text": memory_text,
+                            "accepted_records": accepted,
+                            "original_prompt_sha256": prompt_audit["base_sha256"],
+                            "injected_prompt_sha256": prompt_audit["augmented_sha256"],
+                            "injected_memory_chars": len(memory_text),
+                            "evidence_provenance": [
+                                source for item in context.layer_items
+                                for source in item.metadata["provenance"]
+                            ],
+                            "_base_sample": base_sample,
+                        },
+                    }
+                except (KeyError, ValueError) as exc:
+                    diagnostic["fallback_reason"] = f"prompt_contract: {exc}"
+                    context = None
+                    sample = base_sample
+                    memory_text = ""
+                    prompt_audit = None
+            try:
+                text, _ = self.engine.generate(sample)
+                break
+            except ValueError as exc:
+                if context is None or "processor input length" not in str(exc):
+                    raise
+                length_rejections += 1
+                victim = max(context.layer_items, key=lambda item: len(item.description))
+                removed_items.append({
+                    "object_id": victim.metadata.get("object_id"),
+                    "evidence_ids": list(victim.metadata["evidence_ids"]),
+                    "reason": "processor_token_budget",
+                })
+                remaining = [item for item in context.layer_items if item is not victim]
+                context = MemoryContext(
+                    text="[Navigation Memory]\n" + "\n".join(item.description for item in remaining),
+                    layer_items=remaining,
+                ) if remaining else None
+                if context is None:
+                    diagnostic["fallback_reason"] = "all scene query facts exceeded Processor token budget"
+                sample = base_sample
+                memory_text = ""
+                prompt_audit = None
+        self.last_model_inference_ms = (perf_counter() - started) * 1000.0
+
+        model_input = getattr(self.engine, "last_input_diagnostic", None)
+        checked = isinstance(model_input, dict)
+        block_visible = bool(
+            context is not None and checked
+            and model_input.get("memory_text_present_in_final_tokens") is True
+        )
+        if block_visible and getattr(self.engine, "backend", None) == "vllm_local":
+            block_visible = bool(
+                model_input.get("memory_text_present_in_vllm_prompt") is True
+                and model_input.get("vllm_prompt_matches_final_tokens") is True
+            )
+        visible_ids = list(model_input.get("model_visible_evidence_ids", [])) if block_visible else []
+        selected_ids = {
+            key for item in context.layer_items for key in item.metadata["evidence_ids"]
+        } if context is not None else set()
+        visible_ids = [key for key in visible_ids if key in selected_ids]
+        actual_injection = bool(context is not None and block_visible and visible_ids)
+        historical_ids = [
+            key for key in visible_ids
+            if (record := manager.spatial_map.evidence.get(key)) is not None
+            and ((record.episode_id, record.rollout_idx)
+                 != (manager.working.state.episode_id, manager.v3_rollout_idx)
+                 or record.step_id < step)
+        ]
+        final_items = context.layer_items if context is not None else []
+        final_lines = [item.description for item in final_items]
+        final_l1_ids = [
+            key for key in diagnostic["pre_budget_selected_l1_fact_ids"]
+            if key in selected_ids
+        ]
+        final_l3_object_ids = [
+            item.metadata["object_id"] for item in final_items
+            if item.metadata.get("object_id")
+        ]
+        final_l3_evidence_ids = [
+            key for key in diagnostic["pre_budget_selected_l3_evidence_ids"]
+            if key in selected_ids
+        ]
+        current_l1_ids = {
+            fact["fact_id"] for fact in read_l1_facts(manager, step) if fact["current"]
+        }
+        native_overlap_ids = list(dict.fromkeys(
+            ref.event_id for item in final_items for ref in item.evidence_refs
+            if ref.step_id in native_visual_source_steps and ref.event_id in visible_ids
+        ))
+        native_overlap_item_count = sum(
+            any(ref.step_id in native_visual_source_steps and ref.event_id in visible_ids
+                for ref in item.evidence_refs)
+            for item in final_items
+        ) if actual_injection else 0
+        diagnostic["pre_budget_deduplicated_fact_count"] = diagnostic["deduplicated_fact_count"]
+        diagnostic["pre_budget_duplicate_fact_expression_count"] = (
+            diagnostic["duplicate_fact_expression_count"]
+        )
+        diagnostic["pre_budget_native_visual_overlap_count"] = (
+            diagnostic["native_visual_overlap_count"]
+        )
+        diagnostic.update({
+            "decision": (
+                "USE_BOTH" if final_l1_ids and final_l3_object_ids
+                else "USE_L3" if final_l3_object_ids
+                else "USE_L1" if final_l1_ids else "NO_MEMORY"
+            ),
+            "selected_l1_fact_ids": final_l1_ids,
+            "selected_l3_object_ids": final_l3_object_ids,
+            "selected_l3_evidence_ids": final_l3_evidence_ids,
+            "deduplicated_fact_count": sum(
+                item.metadata.get("role") == "current_and_spatial" for item in final_items
+            ),
+            "duplicate_fact_expression_count": len(final_lines) - len(set(final_lines)),
+            "native_visual_overlap_count": native_overlap_item_count,
+            "native_visual_overlap_evidence_ids": native_overlap_ids if actual_injection else [],
+            "native_visual_source_steps": list(native_visual_source_steps),
+            "current_l1_visual_proxy_count": sum(key in current_l1_ids for key in final_l1_ids),
+            "memory_context_item_count": len(final_items),
+            "memory_context_chars": len(memory_text),
+            "memory_context_tokens": (
+                0 if context is None else
+                model_input.get("injected_memory_tokens") if checked else None
+            ),
+            "final_prompt_token_count": (
+                model_input.get("final_token_count") if checked else None
+            ),
+            "actual_injection": actual_injection if checked or context is None else None,
+            "actual_historical_injection": bool(historical_ids) if checked or context is None else None,
+            "injected_evidence_ids": visible_ids,
+            "injected_historical_evidence_ids": historical_ids,
+            "removed_due_token_limit": removed_items,
+            "processor_length_rejections": length_rejections,
+            "prompt_roundtrip_ok": prompt_audit["roundtrip_ok"] if prompt_audit else True,
+            "prompt_hash_before": base_hash,
+            "prompt_hash_after": prompt_audit["augmented_sha256"] if prompt_audit else base_hash,
+            "model_input_diagnostic": dict(model_input) if checked else None,
+        })
+        controller.record_injection(
+            step=step, injected_ids=visible_ids, actual=actual_injection,
+            memory_tokens=diagnostic["memory_context_tokens"],
+            final_token_count=model_input.get("final_token_count") if checked else None,
+            removed_items=len(removed_items), historical_ids=historical_ids,
+            injected_object_ids=[
+                item.metadata["object_id"] for item in final_items
+                if item.metadata.get("object_id") and any(
+                    key in visible_ids for key in item.metadata["evidence_ids"]
+                )
+            ],
+            injected_l1_fact_ids=[key for key in final_l1_ids if key in visible_ids],
+            final_item_count=len(final_items),
+            duplicate_fact_expression_count=diagnostic["duplicate_fact_expression_count"],
+            native_visual_overlap_item_count=native_overlap_item_count,
+            final_decision=diagnostic["decision"],
+        )
+        diagnostic["scene_query_episode_stats"] = controller.episode_statistics()
         return text, sample, diagnostic
 
     def _generate_with_local_graph_memory(
@@ -672,7 +947,10 @@ class TrajVocabVLNCEPolicy:
                 getattr(self.memory_manager, "v4_config", None), "enabled", False,
             )
         )
-        if v4_enabled:
+        if self._memory_episode_open and self._scene_query_controller is not None:
+            text, sample, diagnostic = self._generate_with_scene_query_memory(obs, info)
+            rgm_enabled = False
+        elif v4_enabled:
             text, sample, diagnostic = self._generate_with_v4_memory(obs)
             rgm_enabled = False  # V4 diagnostics are finalized in the helper.
         elif self._memory_episode_open and getattr(

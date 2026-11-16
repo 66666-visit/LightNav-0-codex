@@ -23,6 +23,9 @@ from lightnav.habitat.runner import (
     resolve_action_decoder,
     run_habitat_eval,
 )
+from lightnav.memory.local_graph_config import LocalGraphConfig
+from lightnav.memory.scene_query_config import SceneQueryConfig
+from lightnav.memory.spatial_l3_config import SpatialL3Config
 
 # (scene_id, episode_id, language, instruction). Note the repeated episode_id "1" in a
 # second scene: HM3D episode ids are scene-local, so dedupe must key on the pair.
@@ -164,6 +167,37 @@ def _cfg(tmp_path: Path, **overrides) -> HabitatEvalConfig:
 
 def _read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def test_scene_query_episode_statistics_are_written_to_results(tmp_path):
+    class QueryPolicy(FakePolicy):
+        @property
+        def scene_query_episode_stats(self):
+            return {"l3_query_count": 2, "actual_injection_step_count": 1}
+
+    memory = MemoryConfig(
+        enabled=True, strategy="hierarchical", layers=("short", "mid", "long"),
+        extractor="yolo11", extractor_model_path="/fake/det.pt",
+        local_graph=LocalGraphConfig(enabled=True),
+        spatial_l3=SpatialL3Config(mode="inject", seg_model_path="/fake/seg.pt"),
+        scene_query=SceneQueryConfig(enabled=True),
+    )
+    cfg = _cfg(tmp_path, episodes=1, memory=memory)
+    policy = QueryPolicy()
+    results = run_habitat_eval(
+        cfg, env_factory=lambda c: FakeEnv(steps_to_terminate=1),
+        policy_factory=lambda c, e, b, i: policy,
+        engine_factory=lambda c: (object(), SimpleNamespace(action_method="flat")),
+    )
+
+    expected = {"l3_query_count": 2, "actual_injection_step_count": 1}
+    assert results[0]["scene_query_episode_stats"] == expected
+    assert _read_jsonl(Path(cfg.output_dir) / "results.jsonl")[0][
+        "scene_query_episode_stats"
+    ] == expected
+    protocol = json.loads((Path(cfg.output_dir) / "conceptgraphs_l3_protocol.json").read_text())
+    assert protocol["scene_query"]["enabled"] is True
+    assert "api_key" not in protocol["scene_query"]
 
 
 # -- episode loop ----------------------------------------------------------------------

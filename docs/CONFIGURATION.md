@@ -395,6 +395,59 @@ Token audit. A missing geometric candidate falls back to the original Local
 Graph candidate path; an empty/failed final prompt falls back to the original
 LightNav sample.
 
+### Active L1/L3 scene query (independent experiment)
+
+`--memory_query_enabled` selects the active scene query path. It requires
+`--memory_enabled --memory_strategy hierarchical --memory_layers short,mid,long
+--local_graph_enabled --spatial_l3_mode inject`, the independent L1 YOLO11
+detector, and the independent L3 YOLO11n-seg model. `shadow` keeps its existing
+no-injection meaning and cannot be combined with scene query. The old Local
+Graph and spatial L3 selection paths remain available when this switch is off.
+The scene query controller reads structured short observations and the existing
+3D ObjectMap, calls the external API to select evidence IDs, then validates and
+renders those facts locally before the existing Prompt and Token audit. It does
+not choose robot actions.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `--memory_query_enabled` / `--no-memory_query_enabled` | `MEMORY_QUERY_ENABLED` | Explicitly enable or disable active scene query; the environment setting defaults to off |
+| `MEMORY_QUERY_BASE_URL` | empty | OpenAI-compatible API base URL or Chat Completions endpoint |
+| `MEMORY_QUERY_API_KEY` | empty | API credential read only by the provider at request time; never written to a config snapshot |
+| `MEMORY_QUERY_MODEL` | empty | External query model identifier |
+| `MEMORY_QUERY_TIMEOUT` | `30` | Request timeout in seconds |
+| `MEMORY_QUERY_MAX_ROUNDS` | `4` | Safety limit on API decision rounds, including Think, Query and Final |
+
+Set the API environment variables in the client process, then use a fresh
+output directory. For example:
+
+```bash
+lightnav-eval-habitat \
+    --model_path /path/to/LightNav-0 --server tcp://127.0.0.1:5555 \
+    --episodes 1 --output_dir output/scene_query_smoke \
+    --memory_enabled --memory_strategy hierarchical \
+    --memory_layers short,mid,long --local_graph_enabled \
+    --memory_extractor yolo11 \
+    --memory_extractor_model_path /path/to/yolo11n.pt \
+    --spatial_l3_mode inject \
+    --spatial_l3_seg_model_path /path/to/yolo11n-seg.pt \
+    --memory_query_enabled
+```
+
+The legacy Local Graph `320`-character card limit does not filter raw L3
+candidates in this mode. Complete selected facts are checked against the real
+model Token capacity before injection. API timeouts, invalid responses, or
+unverifiable IDs safely use the original LightNav input for that step; they do
+not trigger the old L3-priority fallback. The new-mode
+`conceptgraphs_l3_protocol.json` records scene query settings without the API
+key, and each Episode's `results.jsonl` row includes
+`scene_query_episode_stats`.
+Step diagnostics separate Controller choices from entries retained after the
+Processor token check. Episode injection counts use only facts confirmed in
+the final model input. `native_visual_source_steps` and
+`native_visual_overlap_count` compare memory Evidence steps with the RGB frame
+IDs actually sampled into LightNav's video input; this is source-frame overlap,
+not a semantic comparison with video embeddings.
+
 The underlying `scripts/eval_habitat.sh` also accepts `STRICT_FULL_EVAL=1`
 for the full-split gate, `RESUME=1` to skip existing completed Episodes,
 `EPISODE_MANIFEST_PATH` to create or compare a shared manifest, `SEED` for

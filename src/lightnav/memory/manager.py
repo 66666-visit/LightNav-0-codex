@@ -23,6 +23,8 @@ from lightnav.memory.place_verification import TwoStagePlaceVerifier
 from lightnav.memory.retriever import MemoryRetriever
 from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.scene_graph import SceneGraph
+from lightnav.memory.scene_query_config import SceneQueryConfig
+from lightnav.memory.scene_query_provider import QueryProvider
 from lightnav.memory.schemas import (
     LayerMemoryItem,
     MemoryContext,
@@ -77,6 +79,8 @@ class MemoryManager:
         local_graph_config: LocalGraphConfig | None = None,
         spatial_l3_config: SpatialL3Config | None = None,
         spatial_extractor: object | None = None,
+        scene_query_config: SceneQueryConfig | None = None,
+        scene_query_provider: QueryProvider | None = None,
     ) -> None:
         if top_k < 0:
             raise ValueError("top_k must be nonnegative")
@@ -108,6 +112,12 @@ class MemoryManager:
         self.v4_config = v4_config or RGMV4Config()
         self.local_graph_config = local_graph_config or LocalGraphConfig()
         self.spatial_l3_config = spatial_l3_config or SpatialL3Config()
+        self.scene_query_config = scene_query_config or SceneQueryConfig()
+        self.scene_query_provider = scene_query_provider
+        if self.scene_query_config.enabled and not self.local_graph_config.enabled:
+            raise ValueError("scene query requires Local Graph to be enabled")
+        if self.scene_query_config.enabled and self.spatial_l3_config.mode != "inject":
+            raise ValueError("scene query requires spatial L3 inject mode")
         if self.spatial_l3_config.mode != "off" and not self.local_graph_config.enabled:
             raise ValueError("spatial L3 requires Local Graph to be enabled")
         if self.spatial_l3_config.mode != "off" and spatial_extractor is None:
