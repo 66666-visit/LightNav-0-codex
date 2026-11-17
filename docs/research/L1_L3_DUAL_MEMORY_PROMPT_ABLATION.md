@@ -350,6 +350,61 @@ Prompt 文本、注入位置、预算或执行路径。
 `l1_l3_original_concat` 不是 legacy：前者按 token 预算拼接两层原文，legacy 仍走
 原 L3/L1 二选一注入路径。二者在统计器中是独立组。
 
+### 6.3 Local Graph / Prompt 协议字段冲突与第一组恢复
+
+第一组 88/88 推理完成后，`verify_local_graph_shards.py` 报：
+
+```text
+ValueError: root snapshot lacks one enabled Local Graph protocol
+```
+
+根因是 `eval_habitat.sh` 的 snapshot 写入了**同一个** `protocol_version` 字段：
+
+1. 先写 `local_graph_effective.protocol_version = local_graph_v1`；
+2. 随后为了记录 Prompt 实验协议，把根级 `protocol_version` 覆盖为
+   `l1_l3_prompt_ablation_v1`；
+3. verifier 要求根级 `protocol_version` 与 `local_graph_effective.protocol_version`
+   完全相等，因此判定失败。shard 的 `local_graph_protocol.json` 本身是正确的。
+
+修复：
+
+- 新 snapshot 中根级 `protocol_version` **只表示 Local Graph 后端协议**；
+- Prompt/实验协议写入独立字段 `prompt_protocol_version`；
+- `prompt_effective.protocol_version` 仍记录 Prompt 协议；
+- verifier 不降低 Local Graph 标准：仍要求
+  `local_graph_effective` 完整且 enabled、`memory_effective.local_graph_effective`
+  一致、每个 shard 的 `local_graph_protocol.json` 逐字段一致；
+- 为恢复旧运行，verifier 额外识别**唯一的旧冲突形态**：根级 protocol 等于
+  `prompt_effective.protocol_version`，且 `prompt_effective.prompt_mode` 属于已知
+  七种模式。缺 prompt_effective、协议不一致或任意 Local Graph 字段缺失仍然失败。
+
+新增 [finalize_l1_l3_group.py](scripts/finalize_l1_l3_group.py)：
+
+- `--check-only` 只检查 shard 是否完整；
+- 默认验证 shard 协议、shard 结果唯一且恰好 88、shard manifest 与根 manifest 一致，
+  然后合并 `results.jsonl`/`summary.json`、`memory_diagnostics.jsonl`、prompt 产物，
+  运行 `experiment_integrity verify`，最后写 completion marker；
+- 任何检查失败都不写完成标记；不删除/不重写 shard 结果；
+- 支持旧冲突 snapshot 的恢复。
+
+launcher 新增 `--resume`：
+
+- `pilot_complete.json` 已存在的组：验证后跳过；
+- 推理完成但后处理失败的组：调用 finalizer 安全恢复，不重新推理；
+- 只有部分 shard 的组：停止并保留现场，不覆盖；
+- 尚未运行的组：正常启动；
+- 恢复前核对 provenance 的 manifest SHA256、checkpoint 权重/config/eval_config
+  SHA256、L1/L3 权重 SHA256、Habitat 配置 SHA256、pilot SHA256、seed 与 GPU 顺序；
+- 已完成组也必须通过同一 provenance 身份检查，不能只凭 `pilot_complete.json` 被跳过；
+- finalizer 要求每个 shard 的 prompt protocol 完全一致，并校验 version/mode/
+  layer_activation/strategy/original char budget，拒绝混合来源；
+- comparison 对标记完成的组仍检查 prompt 诊断的逐 Step 覆盖，避免“完成标记 + 不完整
+  prompt 诊断”永久跳过。
+
+第一组恢复时使用原 `GPU_IDS`（必须与第一次运行的 shard 顺序一致）。本次本地
+没有 AutoDL 的第一组目录，因此无法实际执行恢复；恢复逻辑由 finalizer 的合成
+shard 测试（新/旧 snapshot、完整、缺失、跨 shard 重复）覆盖。
+
 ## 7. 实际修改文件
 
 新增：
@@ -364,7 +419,10 @@ Prompt 文本、注入位置、预算或执行路径。
 - `src/lightnav/habitat/prompt_artifacts.py`：`prompt_protocol.json`、
   `prompt_diagnostics.jsonl`、`per_episode.csv`、legacy 测量行与 shard 合并 CLI；
 - `scripts/run_l1_l3_prompt_ablation.sh`：六组实验 + 第七组 legacy、preflight、
-  历史 88 结果扫描；
+  历史 88 结果扫描、`--resume` 安全续跑；
+- `scripts/finalize_l1_l3_group.py`：从完整 shard 恢复/合并/验证，不重跑推理；
+- `scripts/verify_local_graph_shards.py`：Local Graph/Prompt 协议字段分离与旧冲突
+  形态恢复；
 - `scripts/compare_l1_l3_prompt_ablation.py`：七组聚合、配对差异、McNemar、
   Bootstrap、`final_report.md`；
 - 测试：`tests/memory/test_prompt_modes.py`、
@@ -373,7 +431,9 @@ Prompt 文本、注入位置、预算或执行路径。
   `tests/habitat/test_prompt_mode_cli.py`、
   `tests/habitat/test_prompt_artifacts.py`、
   `tests/habitat/test_prompt_token_budget.py`、
-  `tests/habitat/test_l1_l3_prompt_ablation_launcher.py`。
+  `tests/habitat/test_l1_l3_prompt_ablation_launcher.py`、
+  `tests/habitat/test_finalize_l1_l3_group.py`、
+  `tests/test_verify_local_graph_shards.py`。
 
 修改：
 
@@ -388,7 +448,8 @@ Prompt 文本、注入位置、预算或执行路径。
   超长时明确拒绝而不是静默截断；
 - `src/lightnav/cli/eval_habitat.py`：`--memory_prompt_mode`、
   `--prompt_measurement_enabled`；
-- `scripts/eval_habitat.sh`：模式/测量解析、token 预算 snapshot、shard 产物合并；
+- `scripts/eval_habitat.sh`：模式/测量解析、token 预算 snapshot、协议字段分离、
+  shard 产物合并；
 - `docs/CONFIGURATION.md`：新增模式表与约束。
 
 未修改 `.references/`、模型权重、动作解码、YOLO/RGB-D/ObjectMap 源码。
@@ -397,8 +458,9 @@ Prompt 文本、注入位置、预算或执行路径。
 
 本轮本地测试（CPU，`.venv311`，`PYTHONPATH=src`）：
 
-- 新增定向测试：**71 passed**（模式/组织/联合/隔离/token 预算/7 组配置/CLI/产物/launcher/
-  跨 Episode/并发确认/原始 L3 块一致性/构建失败回退/legacy 测量）；
+- 新增/扩展定向测试：**90 passed, 17 subtests passed**（模式/组织/联合/隔离/token 预算/
+  7 组配置/CLI/产物/launcher/跨 Episode/并发确认/原始 L3 块一致性/构建失败回退/
+  legacy 测量/协议字段冲突恢复/shard 恢复/导航效果判定）；
 - legacy 一致性：`legacy` 与 `l1_original_only` 在 L3 关闭时 Prompt 与 sample
   conversation 逐字节相同；
 - L1-only：L3 分割器调用次数 0，spatial map 为空，Prompt 无 L3 文本；
@@ -415,7 +477,13 @@ Prompt 文本、注入位置、预算或执行路径。
 - 跨 Episode：joint 模式 reset 后上一轮 L1 事实与 L3 ObjectMap 均不进入新 Episode；
 - launcher：88 唯一 Episode、SHA256、历史 manifest 冲突停止、非 88 停止、
   `--dry-run` 不写文件、六组实验 + legacy 七组配置一致性正/负例、历史 legacy
-  候选扫描为空时 `legacy_group_required=true`。
+  候选扫描为空时 `legacy_group_required=true`、`--resume` provenance 校验；
+- 协议：六种非 Legacy 模式的新 root snapshot 均通过 verifier；旧 `protocol_version`
+  覆盖形态仅在 prompt_effective 完整且模式已知时通过；缺失块或标记不一致失败；
+- 恢复：完整 shard 不重跑推理即可 finalize；缺失 shard、跨 shard 重复 Episode
+  被拒绝且不写完成标记；新/旧 snapshot 均可恢复；
+- 报告：导航效果判定以 legacy 为唯一对照，McNemar p<0.05 才标记显著；latency
+  进入 group/paired 统计，不允许用 Prompt 长度代替导航效果。
 
 14 项验收要求与测试的对应关系：
 
@@ -445,8 +513,8 @@ git diff --check                                  # 通过
 bash -n scripts/eval_habitat.sh scripts/run_l1_l3_prompt_ablation.sh  # 通过
 ```
 
-全仓 CPU 套件（`pytest -q -m "not gpu"`）本次结果：**1077 passed, 14 skipped,
-1 failed, 82 subtests passed**。唯一失败是改动前已存在的
+全仓 CPU 套件（`pytest -q -m "not gpu"`）本次结果：**1093 passed, 14 skipped,
+1 failed, 99 subtests passed**。唯一失败是改动前已存在的
 `tests/memory/test_rgm_place.py::RGMPlaceTests::test_initial_reference_and_global_ambiguity`
 （期望 `ambiguous.reason == "unresolved_competing_candidate"`，实际
 `ambiguous_global_candidates`），与 L1/L3 Prompt 无关，未修改 place verification 代码。
@@ -492,6 +560,17 @@ bash -n scripts/eval_habitat.sh scripts/run_l1_l3_prompt_ablation.sh  # 通过
 | 26 | legacy 组没有 prompt 产物，统计器无法报告其 Prompt token/截断 | 增加 `--prompt_measurement_enabled`，只测量不改路径 |
 | 27 | token 预算可能每步测量失败；若直接假设 320 会掩盖问题 | 回退原 320 并记录 `char_fallback_320` 与原因；统计器汇总 fallback 步数 |
 | 28 | token 预算超限时可能只按近似字符裁剪 | 加入精确 human prompt token 差核验与最低优先级条目重试 |
+| 29 | `eval_habitat.sh` 用同一个根 `protocol_version` 记录 Local Graph 和 Prompt 协议，覆盖导致 verifier 失败 | 根字段只保留 `local_graph_v1`，Prompt 协议独立为 `prompt_protocol_version` |
+| 30 | 旧第一组 snapshot 已带冲突形态，直接重跑会丢结果 | verifier 仅对“prompt_effective 完整、模式已知、协议一致”的旧形态放行；其余仍拒绝 |
+| 31 | 推理完成但后处理失败的组无法续跑，`eval_habitat.sh` 又拒绝非空目录 | 新增 finalize 脚本和 launcher `--resume`：完整 shard 只做合并/验证，不重跑推理；partial 停止并保留 |
+| 32 | 报告只比较文本/诊断，可能被误读成导航改善 | 新增 legacy 配对导航判定：只有 McNemar p<0.05 的 SR 改善才标记显著；latency 纳入统计 |
+| 33 | `--resume` 只凭 `pilot_complete.json` 跳过组，不核对组 config 与 root provenance | comparison 对所有组强制核对 checkpoint/config/eval/Habitat/seed/GPU/pilot SHA256 |
+| 34 | finalizer 的 provenance 检查可选且缺少 model config | 改为必需 provenance，并核对权重、model config、eval config、Habitat、seed、GPU、manifest canonical digest、L1/L3 权重 |
+| 35 | finalizer 只检查 shard prompt mode/strategy，可能混合不同 budget shard | 要求所有 shard prompt protocol 完全一致，并核对 version/mode/layer/strategy/char budget |
+| 36 | resume preflight 未核对 config/eval_config SHA | 加入 checkpoint config/eval_config SHA 检查 |
+| 37 | 有完成标记但 prompt 诊断不完整的组可在 verify-only 中漏过 | 标记完成的组也必须通过逐 Step prompt 覆盖检查 |
+| 38 | 不完整报告仍可输出“显著改善”且未提多重比较 | 不完整报告只输出“暂定”；6 组对照注明未做多重比较校正 |
+| 39 | verifier 对 marker 只查字段存在，null/非法值可通过 | 增加 protocol/scope/正整数校验；旧 prompt 形态要求显式 prompt 块与已知模式 |
 
 复审确认仍然成立的点：
 
@@ -505,7 +584,15 @@ bash -n scripts/eval_habitat.sh scripts/run_l1_l3_prompt_ablation.sh  # 通过
 - `prompt_protocol.json`、`prompt_diagnostics.jsonl`、`per_episode.csv` 按组生成，
   shard 合并有明确定义。
 
-本轮（320 字符/legacy 对照补充）的复审重点与结论：
+本轮（协议冲突修复/七组续跑/最终报告）的复审重点与结论：
+
+- 根 `protocol_version` 不再被 Prompt 协议覆盖；
+- verifier 对 Local Graph 字段和 shard marker 的严格比较未降低；
+- 第一组恢复只读 shard，并先验证 88 条唯一 Episode、manifest、协议和配置；
+- partial/缺 shard 不写完成标记；
+- 报告不会仅凭 Prompt 长度或诊断指标声称导航改善，且必须与 legacy 做配对检验。
+
+上一轮（320 字符/legacy 对照补充）的复审重点与结论：
 
 - `320` 只在 legacy 路径保留；六个实验组使用同一 token 预算策略；
 - token 预算来自现有 Processor/Tokenizer、`bundle.max_seq_len`、后端
@@ -514,6 +601,14 @@ bash -n scripts/eval_habitat.sh scripts/run_l1_l3_prompt_ablation.sh  # 通过
 - `l1_l3_original_concat` 与 legacy 在 launcher/统计器中是独立组；
 - legacy 测量产物不改变 Prompt 文本、注入位置、预算或执行路径；
 - 历史 88 结果扫描为空，因此第七组必须运行。
+
+第二轮窄范围独立审查（协议恢复/续跑/报告）返回 **ACCEPT WITH FIXES**。其 HIGH
+问题是“resume 仅凭 pilot_complete 跳过组、未核对组与 root provenance 的身份”，已通过
+comparison 的 group-provenance 绑定修复；MEDIUM 的 finalizer 可选 provenance、
+shard prompt protocol 混合、resume 缺 config/eval SHA、标记完成组 prompt 覆盖也在
+上表 33–37 修复。独立审查同时确认 finalizer 的 88 唯一 Episode、重复检测、manifest
+并集和“未完成不写标记”逻辑是可靠的，未发现 partial 结果被标记完成或 shard 被删除/
+重跑。
 
 审查限制：宽范围子代理没有完成对全部文件的独立阅读；manager/组织器/比较脚本/新
 token 预算模块的部分结论来自主代理复审与测试。该限制不影响已列出的修复，但审阅
@@ -531,7 +626,39 @@ bash scripts/run_l1_l3_prompt_ablation.sh \
   --output-root output/l1_l3_prompt_ablation
 ```
 
-建议先在 AutoDL 上做只读检查：
+AutoDL 第一组已完成推理但后处理失败时，用**相同 root、相同 GPU_IDS、相同环境**续跑：
+
+```bash
+ROOT=/path/to/existing/root
+MODEL_PATH=... YOLO_MODEL_PATH=... SEG_MODEL_PATH=... \
+EPISODE_MANIFEST_PATH=... PILOT_MANIFEST_PATH=... \
+GPU_IDS="$(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["gpu_ids"]))' "$ROOT/provenance.json")" \
+bash scripts/run_l1_l3_prompt_ablation.sh --output-root "$ROOT" --resume
+```
+
+先只检查第一组 shard 是否可恢复（不写文件、不启动 Habitat）：
+
+```bash
+GPU_IDS="$(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["gpu_ids"]))' "$ROOT/provenance.json")"
+PYTHONPATH=src:. python3 scripts/finalize_l1_l3_group.py \
+  "$ROOT/l1_original_only" --check-only --gpu-ids $GPU_IDS \
+  --episode-manifest "$ROOT/episode_manifest.json" \
+  --pilot-manifest "$PILOT_MANIFEST_PATH" \
+  --yolo-model "$YOLO_MODEL_PATH" --seg-model "$SEG_MODEL_PATH"
+```
+
+成功输出 `"status": "postprocess_ready"` 后，再执行上面的 `--resume`。若检查失败，
+按错误逐项报告（shard、Episode、manifest、协议、prompt 诊断），不能写完成标记。
+
+launcher 会：
+
+- 对 `l1_original_only`：发现 `pilot_complete.json` 不存在但 `shard_*` 完整，
+  调用 finalizer 只做协议验证、合并、完整性验证，不重新推理；
+- 对其余已完整组：验证后跳过；
+- 对未运行组：正常启动；
+- 对 partial/缺 shard 组：停止并保留现场，不覆盖。
+
+建议先做只读检查（新 root）：
 
 ```bash
 # 只校验并打印七组命令，不写文件
@@ -552,7 +679,9 @@ preflight 会：
    Habitat 配置 SHA256、seed、GPU、预算来源）；
 6. 扫描历史 legacy 结果并写入 `legacy_history_candidates`；没有完全匹配的 88 结果时
    `legacy_group_required=true`，第七组照常运行；
-7. 不存在 manifest 时拒绝继续，绝不重新采样或创建新 manifest。
+7. `--resume` 时核对 provenance 的 manifest/checkpoint/L1/L3/Habitat/pilot SHA256、
+   seed 和 GPU 顺序，不重写 provenance；
+8. 不存在 manifest 时拒绝继续，绝不重新采样或创建新 manifest。
 
 ## 11. 七组输出目录与统计方式
 
@@ -578,7 +707,7 @@ preflight 会：
 - `prompt_diagnostics.jsonl`：逐推理步的层贡献、证据、对齐、冲突、去重、截断、
   token 预算字段（legacy 为原字符预算测量行）；
 - 另有 `results.jsonl`、`memory_diagnostics.jsonl`、`episode_manifest.json`、
-  `pilot_complete.json`、shard/日志。
+  `pilot_complete.json`、`postprocess_provenance.json`（恢复时）、shard/日志。
 
 汇总口径：
 
@@ -595,11 +724,18 @@ preflight 会：
 | 实体匹配成功率 | joint 组 `confirmed / attempted`，只用已记录链接 |
 | 冲突数量 | joint 组逐 Step `conflict_count` 之和 |
 | 重复信息数量 | L1 内部去重 + Joint 内部完全相同行/证据去重 |
+| 模型推理延迟 | `results.jsonl` 的 `inference_latency_ms_mean`（仅模型调用，不含 Prompt/Memory 测量），按组/配对统计 |
 
 统计：逐 Episode 七组结果；所有 21 个两两配对给出均值差与按 Episode 配对的
 95% Bootstrap 区间（2000 次，seed 0）；成功/失败翻转用双侧精确 McNemar 检验。
 `comparison.json` 保存全量，`comparison.csv` 是 group/paired 的均值和区间，
 `paired_episode_deltas.csv` 是逐 Episode 宽表，`final_report.md` 是自动生成的中文报告。
+`final_report.md` 第 4 节以 legacy 为唯一对照输出**导航效果判定**：只有配对 SR 提升且
+双侧 McNemar p<0.05 才标记统计显著；同时报告 ΔSPL/ΔNE/ΔLatency。Prompt 长度、
+Token 数、诊断计数只用于解释机制，不作为导航改善证据；若没有显著 SR 改善，报告明确写
+“本数据不能证明任一组织方式真正改善导航效果”。6 个实验组分别与 legacy 比较，
+p<0.05 未做多重比较校正，McNemar 结果是探索性的；不完整报告只输出中间结果，不输出
+最终导航结论。
 
 ## 12. 已知限制
 
@@ -630,7 +766,17 @@ preflight 会：
    指标。
 10. **HiMemVLN 本地不完整**：Localer/Globaler 源码缺失，只能核对 trainer 外层调度；
    论文细节不能当作已核对实现。
-11. **既有测试失败**：`tests/memory/test_rgm_place.py` 的
+11. **第一组恢复要求源码身份一致**：comparison 的 `common` 配置仍要求
+    `source_python_sha256` 一致。本轮的修复只改脚本/测试/文档，`src/lightnav` 未变；
+    如果 AutoDL 第一组是在另一次 `src/lightnav` 修改之后运行的，finalizer 仍可合并
+    shard，但最终 comparison 会拒绝跨源码版本混用，此时需要重跑第一组。
+12. **恢复只适用于完整 shard**：缺 shard、结果不足 88、跨 shard 重复或 prompt 诊断
+    不完整时 finalizer 拒绝写完成标记；必须保留现场并人工判断，不能静默续跑。
+13. **shard 结果没有独立的 checkpoint 身份文件**：finalizer 用 root provenance、
+    root config snapshot、shard manifest 和协议 marker 绑定一次运行；如果人工把另一
+    checkpoint 的 shard 结果与相同协议 marker 混入同一目录，仅凭现有文件无法识别。
+    正常 launcher 生成的目录不存在这种情况；不要手工混用 shard。
+13. **既有测试失败**：`tests/memory/test_rgm_place.py` 的
    `test_initial_reference_and_global_ambiguity` 为改动前既有失败，未修改相关代码。
 
 ## 13. 代码验收 vs 真实导航效果

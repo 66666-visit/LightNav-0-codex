@@ -25,6 +25,7 @@ MODES=(l1_original_only l1_organized_only l3_original_only l3_organized_only l1_
 ABLATION_ROOT="${ABLATION_ROOT:-$REPO_ROOT/output/l1_l3_prompt_ablation_$(date +%Y%m%d_%H%M%S)}"
 PREFLIGHT_ONLY=0
 DRY_RUN=0
+RESUME=0
 
 die() { echo "$TAG ERROR: $*" >&2; exit 1; }
 usage() {
@@ -33,7 +34,7 @@ Usage:
   MODEL_PATH=... YOLO_MODEL_PATH=... SEG_MODEL_PATH=... \
   EPISODE_MANIFEST_PATH=... PILOT_MANIFEST_PATH=... \
     bash scripts/run_l1_l3_prompt_ablation.sh [--output-root DIR] \
-      [--preflight-only] [--dry-run]
+      [--preflight-only] [--dry-run] [--resume]
 
 Always runs the six experimental conditions and the unchanged legacy control:
   l1_original_only l1_organized_only l3_original_only l3_organized_only
@@ -42,9 +43,14 @@ Always runs the six experimental conditions and the unchanged legacy control:
 --preflight-only validates the manifest/checkpoint/config, writes the run
 snapshot and exits. --dry-run performs the same read-only checks and prints the
 seven commands without writing anything or starting Habitat.
-The launcher does not resume: keep a failed group for inspection, then either
-fix the cause and use a new --output-root or reuse a completed group only when
-its pilot_complete.json already exists.
+
+--resume DIR (with --output-root DIR) continues an existing root:
+  * a group with pilot_complete.json is verified and skipped;
+  * a group whose shards are complete but whose post-processing failed is
+    finalized from those shards without rerunning inference;
+  * a group with partial/missing shards stops the launcher and is preserved;
+  * a not-yet-created group runs normally.
+The root provenance/manifest/checkpoint identity is checked before anything runs.
 EOF
 }
 
@@ -53,6 +59,7 @@ while (($#)); do
         --output-root) [ "$#" -ge 2 ] || die '--output-root needs a directory'; ABLATION_ROOT=$2; shift 2 ;;
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
+        --resume) RESUME=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
@@ -117,13 +124,17 @@ PILOT_MANIFEST_PATH="$(cd "$(dirname "$PILOT_MANIFEST_PATH")" && pwd -P)/$(basen
 HABITAT_CONFIG="$(cd "$(dirname "$HABITAT_CONFIG")" && pwd -P)/$(basename "$HABITAT_CONFIG")"
 [ -d "$MANIFEST_SEARCH_ROOT" ] || MANIFEST_SEARCH_ROOT="$(dirname "$EPISODE_MANIFEST_PATH")"
 
-if [ "$DRY_RUN" -eq 0 ] && [ "$PREFLIGHT_ONLY" -eq 0 ]; then
-    [ ! -e "$ABLATION_ROOT" ] || die "output directory already exists: $ABLATION_ROOT; keep it or choose a new --output-root"
+if [ "$DRY_RUN" -eq 0 ] && [ "$PREFLIGHT_ONLY" -eq 0 ] && [ "$RESUME" -eq 0 ]; then
+    [ ! -e "$ABLATION_ROOT" ] || die "output directory already exists: $ABLATION_ROOT; keep it or choose a new --output-root, or pass --resume"
     mkdir -p "$ABLATION_ROOT"
 fi
 if [ "$PREFLIGHT_ONLY" -eq 1 ]; then
     [ ! -e "$ABLATION_ROOT" ] || die "preflight output directory already exists: $ABLATION_ROOT"
     mkdir -p "$ABLATION_ROOT"
+fi
+if [ "$RESUME" -eq 1 ]; then
+    [ -d "$ABLATION_ROOT" ] || die "resume root not found: $ABLATION_ROOT"
+    [ -f "$ABLATION_ROOT/provenance.json" ] || die "resume root lacks provenance.json: $ABLATION_ROOT"
 fi
 if [ "$DRY_RUN" -eq 0 ] || [ "$PREFLIGHT_ONLY" -eq 1 ]; then
     ABLATION_ROOT="$(cd "$ABLATION_ROOT" && pwd -P)"
@@ -134,7 +145,7 @@ export MODEL_PATH YOLO_MODEL_PATH SEG_MODEL_PATH EPISODE_MANIFEST_PATH \
 export CLIENT_PYTHON="$INFERENCE_PYTHON"
 export SEED=42 BACKEND=vllm_local EXPECTED_EPISODES=88
 export GPU_IDS GPU_MEM_UTIL BASE_PORT
-export DRY_RUN PREFLIGHT_ONLY
+export DRY_RUN PREFLIGHT_ONLY RESUME
 export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 # Preflight: validate 88 unique Episodes, checkpoint identity and every
@@ -158,6 +169,7 @@ model_path = Path(os.environ["MODEL_PATH"])
 habitat_config = Path(os.environ["HABITAT_CONFIG"])
 dry_run = os.environ["DRY_RUN"] == "1"
 preflight_only = os.environ["PREFLIGHT_ONLY"] == "1"
+resume = os.environ["RESUME"] == "1"
 
 
 def die(message):
@@ -427,20 +439,50 @@ provenance = {
 }
 print(json.dumps(provenance, indent=2, ensure_ascii=False))
 
-if dry_run:
-    raise SystemExit(0)
-
-target = root / "provenance.json"
-with target.open("x", encoding="utf-8") as stream:
-    json.dump(provenance, stream, indent=2, ensure_ascii=False)
-    stream.write("\n")
-(root / "manifest.sha256").write_text(
-    manifest_sha256 + "  " + str(manifest_path) + "\n", encoding="utf-8",
-)
-(root / "checkpoint.sha256").write_text(
-    weights_sha256 + "  " + str(model_path) + "\n", encoding="utf-8",
-)
-(root / "episode_manifest.json").write_bytes(manifest_path.read_bytes())
+if resume:
+    existing = json.loads((root / "provenance.json").read_text(encoding="utf-8"))
+    checks = {
+        "episode_manifest_sha256": manifest_sha256,
+        "episode_manifest_canonical_sha256": canonical_sha256,
+        "checkpoint_sha256": weights_sha256,
+        "checkpoint_config_sha256": hashlib.sha256(
+            (model_path / "config.json").read_bytes()
+        ).hexdigest() if (model_path / "config.json").is_file() else None,
+        "checkpoint_eval_config_sha256": hashlib.sha256(
+            (model_path / "eval_config.json").read_bytes()
+        ).hexdigest() if (model_path / "eval_config.json").is_file() else None,
+        "l1_yolo_model_sha256": provenance["l1_yolo_model_sha256"],
+        "l3_seg_model_sha256": provenance["l3_seg_model_sha256"],
+        "habitat_config_sha256": provenance["habitat_config_sha256"],
+        "pilot_manifest_sha256": provenance["pilot_manifest_sha256"],
+        "seed": 42,
+        "gpu_ids": os.environ["GPU_IDS"].split(),
+    }
+    for key, expected in checks.items():
+        if existing.get(key) != expected:
+            die(f"resume provenance differs at {key}: {existing.get(key)!r} != {expected!r}")
+    root_manifest = validate_manifest(
+        json.loads((root / "episode_manifest.json").read_text(encoding="utf-8"))
+    )
+    if canonical_identity(root_manifest) != identity:
+        die("resume root episode_manifest.json differs from the provided manifest")
+    print(f"[l1_l3_prompt_ablation] resume provenance verified: {root}")
+    if dry_run:
+        raise SystemExit(0)
+else:
+    if dry_run:
+        raise SystemExit(0)
+    target = root / "provenance.json"
+    with target.open("x", encoding="utf-8") as stream:
+        json.dump(provenance, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
+    (root / "manifest.sha256").write_text(
+        manifest_sha256 + "  " + str(manifest_path) + "\n", encoding="utf-8",
+    )
+    (root / "checkpoint.sha256").write_text(
+        weights_sha256 + "  " + str(model_path) + "\n", encoding="utf-8",
+    )
+    (root / "episode_manifest.json").write_bytes(manifest_path.read_bytes())
 PY
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -488,7 +530,27 @@ for mode in "${MODES[@]}"; do
                 --group "$group_dir" --mode "$mode"
         continue
     fi
-    [ ! -e "$group_dir" ] || die "$mode output exists without pilot_complete.json; inspect it before rerunning"
+    if [ -d "$group_dir" ]; then
+        echo "$TAG $mode exists without pilot_complete.json; attempting safe post-processing recovery"
+        PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+            "$INFERENCE_PYTHON" "$REPO_ROOT/scripts/finalize_l1_l3_group.py" \
+                "$group_dir" --gpu-ids $GPU_IDS \
+                --episode-manifest "$ABLATION_ROOT/episode_manifest.json" \
+                --pilot-manifest "$PILOT_MANIFEST_PATH" \
+                --yolo-model "$YOLO_MODEL_PATH" \
+                --seg-model "$SEG_MODEL_PATH" \
+                --expected-episodes 88 \
+            || die "$mode could not be finalized from its shards; partial results preserved"
+        [ -f "$group_dir/pilot_complete.json" ] ||
+            die "$mode post-processing did not write pilot_complete.json"
+        PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+            "$INFERENCE_PYTHON" -m lightnav.habitat.prompt_artifacts verify \
+                --group "$group_dir" --mode "$mode"
+        "$INFERENCE_PYTHON" "$REPO_ROOT/scripts/compare_l1_l3_prompt_ablation.py" \
+            --verify-only --root "$ABLATION_ROOT" >/dev/null
+        echo "$TAG $mode recovered from complete shards without rerunning inference"
+        continue
+    fi
     echo "$TAG running $mode"
     started=$SECONDS
     MODEL_PATH="$MODEL_PATH" HABITAT_CONFIG="$HABITAT_CONFIG" TASK=vlnce \

@@ -607,8 +607,10 @@ if local_graph_effective is not None:
     snapshot["local_graph_effective"] = local_graph_effective
     snapshot["memory_effective"]["local_graph_effective"] = local_graph_effective
 if prompt_effective is not None:
-    if prompt_mode != "legacy":
-        snapshot["protocol_version"] = PROMPT_PROTOCOL_VERSION
+    # Keep the root protocol_version as the Local Graph backend protocol. The
+    # prompt/experiment protocol is a separate field so one field never has to
+    # mean two different things (and Local Graph shard verification stays exact).
+    snapshot["prompt_protocol_version"] = PROMPT_PROTOCOL_VERSION
     snapshot["prompt_effective"] = prompt_effective
     snapshot["memory_effective"]["prompt_mode"] = prompt_mode
     snapshot["memory_effective"]["prompt_measurement_enabled"] = prompt_measurement

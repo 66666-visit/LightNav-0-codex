@@ -55,7 +55,9 @@ _LEGACY_ACTIVATION = {
     "joint_alignment_enabled": False,
 }
 EXPECTED_EPISODES = 88
-METRICS = ("SR_pct", "SPL_pct", "NE_m", "nDTW_pct", "TL_m", "OSR_pct")
+METRICS = (
+    "SR_pct", "SPL_pct", "NE_m", "nDTW_pct", "TL_m", "OSR_pct", "Latency_ms",
+)
 PROMPT_METRICS = (
     "mean_prompt_chars", "mean_injected_memory_chars", "mean_prompt_tokens",
     "mean_available_memory_tokens", "mean_memory_block_tokens",
@@ -193,6 +195,11 @@ def _episode_metrics(result: dict[str, Any]) -> dict[str, float | None]:
     path_length = _optional_number(result.get("path_length"), "path_length")
     if path_length is not None and path_length < 0:
         raise ValueError("path_length must be nonnegative")
+    latency = _optional_number(
+        result.get("inference_latency_ms_mean"), "inference_latency_ms_mean",
+    )
+    if latency is not None and latency < 0:
+        raise ValueError("inference_latency_ms_mean must be nonnegative")
     return {
         "SR_pct": success * 100.0,
         "SPL_pct": spl * 100.0,
@@ -200,6 +207,7 @@ def _episode_metrics(result: dict[str, Any]) -> dict[str, float | None]:
         "nDTW_pct": ndtw * 100.0,
         "TL_m": path_length,
         "OSR_pct": oracle * 100.0,
+        "Latency_ms": latency,
     }
 
 
@@ -343,12 +351,29 @@ def _load_group(
     prompt_effective = config.get("prompt_effective")
     if not isinstance(prompt_effective, dict) or prompt_effective.get("prompt_mode") != mode:
         raise ValueError(f"{mode} config snapshot does not select its prompt mode")
-    budget_strategy = prompt_effective.get("budget_strategy")
-    original_char_budget = prompt_effective.get("original_char_budget_chars")
+    protocol_budget = protocol.get("budget", {})
+    if not isinstance(protocol_budget, dict):
+        protocol_budget = {}
+    # The prompt protocol is the artifact that actually records the builder
+    # budget; older snapshots may not duplicate these fields. Prefer the
+    # snapshot, fall back to the protocol, never invent a value.
+    budget_strategy = (
+        prompt_effective.get("budget_strategy")
+        or protocol_budget.get("strategy")
+    )
+    original_char_budget = (
+        prompt_effective.get("original_char_budget_chars")
+        or protocol_budget.get("original_char_budget_chars")
+        or protocol_budget.get("chars")
+    )
     if budget_strategy not in {"original_char_budget", "token_aware_context"}:
         raise ValueError(f"{mode} config snapshot lacks a valid budget strategy")
     if type(original_char_budget) is not int or original_char_budget < 1:
         raise ValueError(f"{mode} config snapshot lacks a valid original character budget")
+    layer_activation = (
+        prompt_effective.get("layer_activation")
+        or protocol.get("layer_activation")
+    )
     _validate_prompt_protocol(
         protocol, mode=mode, budget_strategy=budget_strategy,
         original_char_budget=original_char_budget,
@@ -378,7 +403,10 @@ def _load_group(
         raise ValueError(f"{mode} summary count differs from its result rows")
 
     prompt_rows, prompt_steps = _load_prompt_rows(group_dir, mode=mode, records=records)
-    if not allow_incomplete:
+    marked_complete = (group_dir / "pilot_complete.json").is_file()
+    if marked_complete and missing:
+        raise ValueError(f"{mode} is marked complete but misses {len(missing)} Episodes")
+    if not allow_incomplete or marked_complete:
         _check_step_coverage(group_dir, records, prompt_steps)
     if not (group_dir / "per_episode.csv").is_file() and not allow_incomplete:
         raise FileNotFoundError(f"required file is missing: {group_dir / 'per_episode.csv'}")
@@ -398,6 +426,7 @@ def _load_group(
         "complete": complete,
         "budget_strategy": budget_strategy,
         "original_char_budget_chars": original_char_budget,
+        "layer_activation": layer_activation,
     }
 
 
@@ -410,7 +439,34 @@ def _token_value(arguments: list[str], flag: str, default: int) -> int:
     return default
 
 
-def _validate_common_configuration(groups: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _validate_group_identity(
+    mode: str, config: dict[str, Any], provenance: dict[str, Any] | None,
+) -> None:
+    """Bind every complete group to the root run's checkpoint/benchmark identity."""
+    if not provenance:
+        return
+    common = config.get("common", {})
+    checks = {
+        "model_weights_sha256": provenance.get("checkpoint_sha256"),
+        "model_config_sha256": provenance.get("checkpoint_config_sha256"),
+        "eval_config_sha256": provenance.get("checkpoint_eval_config_sha256"),
+        "habitat_config_sha256": provenance.get("habitat_config_sha256"),
+        "seed": provenance.get("seed"),
+        "gpu_ids": provenance.get("gpu_ids"),
+    }
+    for key, expected in checks.items():
+        if common.get(key) != expected:
+            raise ValueError(
+                f"{mode} group identity differs from the run provenance at {key}"
+            )
+    if config.get("pilot_manifest_sha256") != provenance.get("pilot_manifest_sha256"):
+        raise ValueError(f"{mode} pilot manifest differs from the run provenance")
+
+
+def _validate_common_configuration(
+    groups: dict[str, dict[str, Any]],
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Reject any difference outside the single experimental variable."""
     if not groups:
         raise ValueError("no ablation groups to compare")
@@ -443,6 +499,7 @@ def _validate_common_configuration(groups: dict[str, dict[str, Any]]) -> dict[st
         raise ValueError("the config snapshot lacks the prompt-ablation protocol version")
     for mode, group in groups.items():
         config = group["config"]
+        _validate_group_identity(mode, config, provenance)
         if config.get("common") != common:
             raise ValueError(f"{mode} common checkpoint/seed/server settings differ")
         if config.get("server_args") != reference.get("server_args"):
@@ -461,27 +518,32 @@ def _validate_common_configuration(groups: dict[str, dict[str, Any]]) -> dict[st
         prompt_effective = config.get("prompt_effective")
         if not isinstance(prompt_effective, dict) or prompt_effective.get("prompt_mode") != mode:
             raise ValueError(f"{mode} config snapshot selects a different prompt mode")
-        if prompt_effective.get("layer_activation") != _expected_activation(mode):
+        if group["layer_activation"] != _expected_activation(mode):
             raise ValueError(f"{mode} layer activation differs from its mode plan")
-        strategy = prompt_effective.get("budget_strategy")
+        strategy = group["budget_strategy"]
         expected_strategy = (
             "original_char_budget" if mode == "legacy" else "token_aware_context"
         )
         if strategy != expected_strategy:
             raise ValueError(f"{mode} budget strategy differs from its mode contract")
-        if prompt_effective.get("original_char_budget_chars") != expected_budget:
+        if group["original_char_budget_chars"] != expected_budget:
             raise ValueError(f"{mode} original character budget differs")
-        if mode != "legacy" and config.get("protocol_version") != PROMPT_PROTOCOL_VERSION:
-            raise ValueError(f"{mode} config snapshot protocol version differs")
-        if mode == "legacy" and config.get("protocol_version") not in {
-            PROMPT_PROTOCOL_VERSION, "local_graph_v1",
-        }:
-            raise ValueError(f"{mode} config snapshot protocol version differs")
+        root_protocol = config.get("protocol_version")
+        prompt_version = config.get("prompt_protocol_version")
+        if root_protocol not in {PROMPT_PROTOCOL_VERSION, "local_graph_v1"}:
+            raise ValueError(f"{mode} config snapshot root protocol version differs")
+        if prompt_version is not None and prompt_version != PROMPT_PROTOCOL_VERSION:
+            raise ValueError(f"{mode} config snapshot prompt protocol version differs")
+        if root_protocol == PROMPT_PROTOCOL_VERSION and (
+            prompt_effective.get("protocol_version") != PROMPT_PROTOCOL_VERSION
+        ):
+            # Recovery shape from an early prompt-ablation snapshot: the root
+            # field was overwritten, so the explicit prompt block must agree.
+            raise ValueError(f"{mode} old prompt snapshot lacks a matching prompt protocol")
         _validate_prompt_protocol(
             group["protocol"], mode=mode, budget_strategy=strategy,
-            original_char_budget=prompt_effective.get("original_char_budget_chars"),
+            original_char_budget=group["original_char_budget_chars"],
         )
-        group["budget_strategy"] = strategy
         group["budget_chars"] = expected_budget
     for mode in groups:
         expected = "original_char_budget" if mode == "legacy" else "token_aware_context"
@@ -656,7 +718,7 @@ def compare(
             groups[mode] = group
     if not groups:
         raise ValueError("no ablation group is present")
-    checks = _validate_common_configuration(groups)
+    checks = _validate_common_configuration(groups, provenance)
     if set(groups) != set(GROUPS) and not allow_incomplete:
         missing = sorted(set(GROUPS) - set(groups))
         raise ValueError(f"ablation groups are missing: {missing}")
@@ -702,6 +764,9 @@ def compare(
             paired[f"{second}_minus_{first}"] = report
             paired_rows.extend(rows)
 
+    navigation = _navigation_analysis(
+        group_report, episode_metrics, expected, samples=samples, seed=seed,
+    )
     complete = all(
         group_report[mode]["complete"] for mode in groups
     ) and set(groups) == set(GROUPS)
@@ -716,6 +781,7 @@ def compare(
         "bootstrap": {"samples": samples, "seed": seed, "unit": "episode"},
         "groups": group_report,
         "paired_differences": paired,
+        "navigation_analysis": navigation,
         "notes": {
             "TL_m": "mean measured Habitat PathLength; null when the server omits it",
             "entity_match_rate": "confirmed trusted L3->L1 links / attempted alignments (joint only)",
@@ -730,6 +796,112 @@ def compare(
         },
     }
     return report, paired_rows
+
+
+def _navigation_analysis(
+    group_report: dict[str, Any],
+    episode_metrics: dict[str, dict[EpisodeKey, dict[str, float | None]]],
+    expected: list[EpisodeKey], *, samples: int, seed: int,
+) -> dict[str, Any]:
+    """Paired navigation verdict against the unchanged legacy control.
+
+    Only a paired SR improvement with a two-sided McNemar p < 0.05 is labelled
+    statistically significant. Prompt length and diagnostic counts are
+    deliberately not used as evidence of a navigation improvement.
+    """
+    if "legacy" not in episode_metrics:
+        return {"status": "missing_legacy", "modes": {}}
+    legacy = episode_metrics["legacy"]
+    rows: dict[str, Any] = {}
+    significant_up: list[str] = []
+    significant_down: list[str] = []
+    for mode in GROUPS:
+        if mode == "legacy" or mode not in episode_metrics:
+            continue
+        current = episode_metrics[mode]
+        deltas: dict[str, list[float]] = {
+            "SR_pct": [], "SPL_pct": [], "NE_m": [], "Latency_ms": [],
+        }
+        legacy_success: list[bool] = []
+        mode_success: list[bool] = []
+        for key in expected:
+            base = legacy.get(key)
+            other = current.get(key)
+            if base is None or other is None:
+                continue
+            for metric in deltas:
+                left, right = base.get(metric), other.get(metric)
+                if left is not None and right is not None:
+                    deltas[metric].append(float(right) - float(left))
+            legacy_success.append(bool(base["SR_pct"] >= 100.0))
+            mode_success.append(bool(other["SR_pct"] >= 100.0))
+        mcnemar = mcnemar_exact(legacy_success, mode_success)
+        sr = deltas["SR_pct"]
+        spl = deltas["SPL_pct"]
+        ne = deltas["NE_m"]
+        latency = deltas["Latency_ms"]
+        sr_mean = fmean(sr) if sr else None
+        if mcnemar["p_value_exact_two_sided"] < 0.05 and sr_mean is not None:
+            if sr_mean > 0:
+                significant_up.append(mode)
+            elif sr_mean < 0:
+                significant_down.append(mode)
+        rows[mode] = {
+            "paired_count": len(sr),
+            "delta_SR_pct": {
+                "mean": sr_mean,
+                "ci95": paired_bootstrap_ci(sr, samples=samples, seed=seed) if sr else None,
+            },
+            "delta_SPL_pct": {
+                "mean": fmean(spl) if spl else None,
+                "ci95": paired_bootstrap_ci(spl, samples=samples, seed=seed) if spl else None,
+            },
+            "delta_NE_m": {
+                "mean": fmean(ne) if ne else None,
+                "ci95": paired_bootstrap_ci(ne, samples=samples, seed=seed) if ne else None,
+            },
+            "delta_Latency_ms": {
+                "mean": fmean(latency) if latency else None,
+                "ci95": (
+                    paired_bootstrap_ci(latency, samples=samples, seed=seed)
+                    if latency else None
+                ),
+            },
+            "mcnemar": mcnemar,
+            "verdict": (
+                "significant_sr_improvement" if mode in significant_up else
+                "significant_sr_degradation" if mode in significant_down else
+                "not_demonstrated"
+            ),
+        }
+    best_sr_mode = max(
+        (mode for mode in group_report if mode != "legacy"),
+        key=lambda mode: (
+            group_report[mode]["metrics"]["SR_pct"]["mean"]
+            if group_report[mode]["metrics"]["SR_pct"]["mean"] is not None else -1.0
+        ),
+        default=None,
+    )
+    all_complete = (
+        set(group_report) == set(GROUPS)
+        and all(group_report[mode]["complete"] for mode in GROUPS)
+    )
+    return {
+        "status": "complete" if all_complete else "incomplete",
+        "baseline": "legacy",
+        "criterion": (
+            "paired SR delta > 0 and two-sided exact McNemar p < 0.05; "
+            "no claim from Prompt length or diagnostic counts"
+        ),
+        "modes": rows,
+        "significant_sr_improvement": significant_up,
+        "significant_sr_degradation": significant_down,
+        "best_mean_sr_mode": best_sr_mode,
+        "best_mean_sr_pct": (
+            group_report[best_sr_mode]["metrics"]["SR_pct"]["mean"]
+            if best_sr_mode is not None else None
+        ),
+    }
 
 
 def write_reports(
@@ -785,6 +957,8 @@ def _markdown_report(report: dict[str, Any]) -> str:
         f"- Episode 数：{report['manifest']['expected_count']}",
         f"- Manifest SHA256：`{report['manifest_sha256']}`",
     ]
+    if report.get("status") != "complete":
+        lines.append("- **警告：报告不完整，缺失组或 Episode；以下统计仅供检查，不是最终结论。**")
     provenance = report.get("provenance") or {}
     if provenance:
         lines.append(f"- Checkpoint SHA256：`{provenance.get('checkpoint_sha256')}`")
@@ -793,13 +967,13 @@ def _markdown_report(report: dict[str, Any]) -> str:
         "",
         "## 1. 基准指标",
         "",
-        "| 组 | SR (%) | SPL (%) | NE (m) | nDTW (%) | TL (m) | OSR (%) |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 组 | SR (%) | SPL (%) | NE (m) | nDTW (%) | TL (m) | OSR (%) | Model latency (ms) |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for mode, detail in report["groups"].items():
         metrics = detail["metrics"]
         lines.append(
-            "| `{mode}` | {sr} | {spl} | {ne} | {ndt} | {tl} | {osr} |".format(
+            "| `{mode}` | {sr} | {spl} | {ne} | {ndt} | {tl} | {osr} | {lat} |".format(
                 mode=mode,
                 sr=_fmt(metrics["SR_pct"]["mean"]),
                 spl=_fmt(metrics["SPL_pct"]["mean"]),
@@ -807,12 +981,14 @@ def _markdown_report(report: dict[str, Any]) -> str:
                 ndt=_fmt(metrics["nDTW_pct"]["mean"]),
                 tl=_fmt(metrics["TL_m"]["mean"]),
                 osr=_fmt(metrics["OSR_pct"]["mean"]),
+                lat=_fmt(metrics["Latency_ms"]["mean"], 1),
             )
         )
     lines += [
         "",
-        "括号外的均值来自逐 Episode 实测；95% Bootstrap 区间（2000 次、按 Episode 重采样）"
-        "保存在 `comparison.json`。任一指标缺失时报告 `null`，不做插补。",
+        "括号外的均值来自逐 Episode 实测；Model latency 为模型推理耗时均值，"
+        "不含 Prompt 构造/Memory 测量；95% Bootstrap 区间（2000 次、按 Episode "
+        "重采样）保存在 `comparison.json`。任一指标缺失时报告 `null`，不做插补。",
         "",
         "## 2. Prompt 组织统计",
         "",
@@ -854,20 +1030,21 @@ def _markdown_report(report: dict[str, Any]) -> str:
         "",
         "## 3. 配对差异与 McNemar 检验",
         "",
-        "| 配对（后 − 前） | ΔSR | ΔSPL | ΔNE | ΔnDTW | ΔOSR | b / c | McNemar p |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 配对（后 − 前） | ΔSR | ΔSPL | ΔNE | ΔnDTW | ΔOSR | ΔLatency | b / c | McNemar p |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for pair, detail in report["paired_differences"].items():
         metrics = detail["metrics"]
         flips = detail["success_flips"]
         lines.append(
-            "| `{pair}` | {dsr} | {dspl} | {dne} | {dndtw} | {dosr} | {b}/{c} | {p} |".format(
+            "| `{pair}` | {dsr} | {dspl} | {dne} | {dndtw} | {dosr} | {dlat} | {b}/{c} | {p} |".format(
                 pair=pair,
                 dsr=_fmt(metrics["SR_pct"]["mean"]),
                 dspl=_fmt(metrics["SPL_pct"]["mean"]),
                 dne=_fmt(metrics["NE_m"]["mean"], 3),
                 dndtw=_fmt(metrics["nDTW_pct"]["mean"]),
                 dosr=_fmt(metrics["OSR_pct"]["mean"]),
+                dlat=_fmt(metrics["Latency_ms"]["mean"], 1),
                 b=flips["first_only_success"],
                 c=flips["second_only_success"],
                 p=_fmt(detail["mcnemar"]["p_value_exact_two_sided"], 4),
@@ -879,7 +1056,64 @@ def _markdown_report(report: dict[str, Any]) -> str:
         "`paired_episode_deltas.csv`。McNemar 采用双侧精确二项检验；b 为“前组成功、后组失败”，"
         "c 为“前组失败、后组成功”。",
         "",
-        "## 4. 一致性检查",
+        "## 4. 导航效果判定（legacy 对照）",
+        "",
+    ]
+    navigation = report.get("navigation_analysis") or {}
+    if navigation.get("status") == "missing_legacy":
+        lines.append("Legacy 对照缺失，无法进行导航效果判定；不得以 concat 代替 legacy。")
+    elif navigation.get("status") != "complete":
+        lines.append(
+            "本报告不完整（并非七组全部完成），下表的导航判定只是中间结果，"
+            "不得作为最终结论；补齐七组后重新生成。"
+        )
+    else:
+        lines += [
+            "判定规则：只有**配对 SR 提升且双侧精确 McNemar p < 0.05**才标记为统计显著；"
+            "Prompt 长度、Token 数、诊断计数不作为导航改善证据。",
+            "",
+            "| 组 vs legacy | ΔSR | McNemar p | ΔSPL | ΔNE | ΔLatency | 判定 |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        ]
+        for mode, detail in navigation["modes"].items():
+            lines.append(
+                "| `{mode}` | {sr} | {p} | {spl} | {ne} | {lat} | {verdict} |".format(
+                    mode=mode,
+                    sr=_fmt(detail["delta_SR_pct"]["mean"]),
+                    p=_fmt(detail["mcnemar"]["p_value_exact_two_sided"], 4),
+                    spl=_fmt(detail["delta_SPL_pct"]["mean"]),
+                    ne=_fmt(detail["delta_NE_m"]["mean"], 3),
+                    lat=_fmt(detail["delta_Latency_ms"]["mean"], 1),
+                    verdict=detail["verdict"],
+                )
+            )
+        up = navigation.get("significant_sr_improvement") or []
+        down = navigation.get("significant_sr_degradation") or []
+        best = navigation.get("best_mean_sr_mode")
+        lines += [
+            "",
+            (
+                "统计显著 SR 改善的组：" + (", ".join(f"`{item}`" for item in up) if up else "无")
+            ),
+            (
+                "统计显著 SR 下降的组：" + (", ".join(f"`{item}`" for item in down) if down else "无")
+            ),
+            (
+                f"平均 SR 最高的组：`{best}`（{_fmt(navigation.get('best_mean_sr_pct'))}%）；"
+                "这只是点估计排名，不构成显著性结论。"
+                if best else "没有可比较的 SR 均值。"
+            ),
+            "",
+            "结论必须同时看 SR/SPL/NE 与配对检验；若没有 McNemar 显著改善，则本数据不能"
+            "证明任一 Prompt 组织方式真正改善导航效果，也不能用文本更短或诊断指标更好来替代。",
+            "",
+            "注意：这里有 6 个实验组分别与 legacy 比较，p<0.05 未做多重比较校正；"
+            "McNemar 结果是探索性的，需结合 SPL/NE 的方向和效应大小解释，不能仅凭单个 p 值"
+            "宣称某种 Prompt 组织方式真正更优。",
+        ]
+    lines += [
+        "",
+        "## 5. 一致性检查",
         "",
     ]
     checks = report.get("checks", {})
@@ -893,7 +1127,7 @@ def _markdown_report(report: dict[str, Any]) -> str:
         "- `l1_l3_original_concat` 不是 legacy：前者拼接两层原文，legacy 走原有"
         "L3/L1 二选一注入路径。",
         "",
-        "## 5. 方法与限制",
+        "## 6. 方法与限制",
         "",
         "1. 七组使用同一 88 Episode manifest、同一 checkpoint、seed=42、500 步、"
         "`NO_FORCE_STOP=1`、同一 Habitat 配置与动作解码。",
@@ -932,7 +1166,11 @@ def verify_only(root: Path, *, samples: int = 2000, seed: int = 0) -> int:
             groups[mode] = group
     if not groups:
         raise ValueError("no completed group is available to verify")
-    _validate_common_configuration(groups)
+    provenance_path = root / "provenance.json"
+    provenance = (
+        _read_json(provenance_path) if provenance_path.is_file() else None
+    )
+    _validate_common_configuration(groups, provenance)
     print(f"verified {len(groups)} group(s): {', '.join(groups)}")
     return 0
 

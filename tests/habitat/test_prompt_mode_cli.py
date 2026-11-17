@@ -159,7 +159,8 @@ def test_eval_launcher_snapshot_records_prompt_mode_and_shared_budget(tmp_path: 
     assert effective["budget_strategy"] == "token_aware_context"
     assert effective["original_char_budget_chars"] == 320
     assert effective["layer_activation"]["joint_alignment_enabled"] is True
-    assert snapshot["protocol_version"] == "l1_l3_prompt_ablation_v1"
+    assert snapshot["protocol_version"] == "local_graph_v1"
+    assert snapshot["prompt_protocol_version"] == "l1_l3_prompt_ablation_v1"
     assert snapshot["memory_effective"]["prompt_mode"] == "l1_l3_joint"
     assert "--memory_prompt_mode" in snapshot["memory_args"]
 
@@ -199,4 +200,5 @@ def test_eval_launcher_snapshot_records_legacy_measurement_without_token_budget(
     assert effective["layer_activation"]["joint_alignment_enabled"] is False
     assert snapshot["memory_effective"]["prompt_measurement_enabled"] is True
     assert snapshot["protocol_version"] == "local_graph_v1"
+    assert snapshot["prompt_protocol_version"] == "l1_l3_prompt_ablation_v1"
     assert "--prompt_measurement_enabled" in snapshot["memory_args"]

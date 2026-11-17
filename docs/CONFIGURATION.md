@@ -449,11 +449,30 @@ is used by the seventh legacy arm of the ablation.
 
 The run writes `prompt_protocol.json` once and `prompt_diagnostics.jsonl` per
 inference step, plus `per_episode.csv`; `scripts/eval_habitat.sh` merges shard
-diagnostics into the group root. `scripts/run_l1_l3_prompt_ablation.sh` runs the
-six experimental modes plus the unchanged `legacy` control on one fixed
+diagnostics into the group root. The root `config_snapshot.yaml` keeps
+`protocol_version` for the Local Graph backend and stores the prompt/experiment
+protocol separately as `prompt_protocol_version`; this prevents one field from
+being overwritten by two protocols. `scripts/run_l1_l3_prompt_ablation.sh` runs
+the six experimental modes plus the unchanged `legacy` control on one fixed
 88-Episode manifest and `scripts/compare_l1_l3_prompt_ablation.py` writes the
 paired comparison. See
 [L1_L3_DUAL_MEMORY_PROMPT_ABLATION.md](research/L1_L3_DUAL_MEMORY_PROMPT_ABLATION.md).
+
+If inference finished but post-processing failed, use the same root and GPU
+order with `--resume`:
+
+```bash
+GPU_IDS='0 1' MODEL_PATH=... YOLO_MODEL_PATH=... SEG_MODEL_PATH=... \
+EPISODE_MANIFEST_PATH=... PILOT_MANIFEST_PATH=... \
+  bash scripts/run_l1_l3_prompt_ablation.sh \
+    --output-root /existing/root --resume
+```
+
+A completed group is verified and skipped; a group with complete shards but no
+completion marker is finalized by `scripts/finalize_l1_l3_group.py` without
+rerunning inference; a group with missing/partial shards stops the launcher and
+is preserved. The resume path checks the provenance manifest/checkpoint/L1/L3/
+Habitat/pilot SHA256, seed and GPU order before touching any group.
 
 The underlying `scripts/eval_habitat.sh` also accepts `STRICT_FULL_EVAL=1`
 for the full-split gate, `RESUME=1` to skip existing completed Episodes,

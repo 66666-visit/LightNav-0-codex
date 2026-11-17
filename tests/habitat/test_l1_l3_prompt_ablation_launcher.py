@@ -191,6 +191,24 @@ def _memory_config(mode: str) -> MemoryConfig:
     )
 
 
+def _write_provenance(root: Path, manifest: dict) -> None:
+    from hashlib import sha256
+
+    digest = sha256(
+        json.dumps(manifest, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    (root / "provenance.json").write_text(json.dumps({
+        "checkpoint_sha256": "e" * 64,
+        "checkpoint_config_sha256": "c" * 64,
+        "checkpoint_eval_config_sha256": "d" * 64,
+        "habitat_config_sha256": "f" * 64,
+        "episode_manifest_canonical_sha256": digest,
+        "pilot_manifest_sha256": "b" * 64,
+        "seed": 42,
+        "gpu_ids": ["0"],
+    }), encoding="utf-8")
+
+
 def _group_artifacts(root: Path, mode: str, manifest: dict) -> None:
     from hashlib import sha256
 
@@ -217,6 +235,11 @@ def _group_artifacts(root: Path, mode: str, manifest: dict) -> None:
         "common": {
             "task": "vlnce", "split": "val_unseen", "expected_episodes": 88,
             "max_steps": 500, "force_stop_at_max_steps": False, "seed": 42,
+            "model_weights_sha256": "e" * 64,
+            "model_config_sha256": "c" * 64,
+            "eval_config_sha256": "d" * 64,
+            "habitat_config_sha256": "f" * 64,
+            "gpu_ids": ["0"],
         },
         "memory_args": [
             "--memory_enabled", "--memory_extractor", "yolo11",
@@ -242,7 +265,8 @@ def _group_artifacts(root: Path, mode: str, manifest: dict) -> None:
             ),
         },
         "server_args": [],
-        "protocol_version": PROMPT_PROTOCOL_VERSION,
+        "protocol_version": "local_graph_v1",
+        "prompt_protocol_version": PROMPT_PROTOCOL_VERSION,
         "pilot_manifest_path": "/data/pilot_manifest.json",
         "pilot_manifest_sha256": "b" * 64,
     }
@@ -258,6 +282,7 @@ def _group_artifacts(root: Path, mode: str, manifest: dict) -> None:
             "success": success, "oracle_success": success, "spl": success,
             "ndtw": 0.5, "final_distance": 1.0, "min_distance": 0.8,
             "steps": 1, "path_length": 2.0, "forced_stop": False,
+            "inference_latency_ms_mean": 12.5,
         }
         results.append(result)
         prompt_rows.append({
@@ -298,6 +323,7 @@ def test_seven_group_artifacts_pass_verification_and_compare(tmp_path: Path) -> 
     root.mkdir()
     manifest = _manifest()
     (root / "episode_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    _write_provenance(root, manifest)
     for mode in _MODES:
         _group_artifacts(root, mode, manifest)
     assert verify_only(root) == 0
@@ -314,6 +340,11 @@ def test_seven_group_artifacts_pass_verification_and_compare(tmp_path: Path) -> 
         assert (root / name).is_file()
     report_text = (root / "final_report.md").read_text()
     assert "McNemar" in report_text and "代码验收" in report_text
+    assert "导航效果判定" in report_text
+    assert "not_demonstrated" in report_text
+    assert "Latency" in report_text
+    assert report["navigation_analysis"]["status"] == "complete"
+    assert report["navigation_analysis"]["baseline"] == "legacy"
     assert "l1_l3_joint" in (root / "comparison.csv").read_text()
 
 
@@ -324,6 +355,7 @@ def test_a_changed_non_prompt_memory_argument_breaks_consistency(tmp_path: Path)
     root.mkdir()
     manifest = _manifest()
     (root / "episode_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    _write_provenance(root, manifest)
     for mode in _MODES:
         _group_artifacts(root, mode, manifest)
     config_path = root / "l1_l3_joint" / "config_snapshot.yaml"
@@ -333,4 +365,94 @@ def test_a_changed_non_prompt_memory_argument_breaks_consistency(tmp_path: Path)
     ]
     config_path.write_text(json.dumps(config), encoding="utf-8")
     with pytest.raises(ValueError, match="differs outside --memory_prompt_mode"):
+        verify_only(root)
+
+
+def test_resume_verifies_existing_provenance_and_rejects_a_different_manifest(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "out"
+    created = _run(tmp_path, {}, "--preflight-only", "--output-root", str(output))
+    assert created.returncode == 0, created.stderr
+    resumed = _run(
+        tmp_path, {}, "--resume", "--dry-run", "--output-root", str(output),
+    )
+    assert resumed.returncode == 0, resumed.stderr
+    assert "resume provenance verified" in resumed.stdout
+
+    other_yolo = tmp_path / "other_yolo.pt"
+    other_yolo.write_bytes(b"different L1 weights")
+    changed = _run(
+        tmp_path, {"YOLO_MODEL_PATH": str(other_yolo)},
+        "--resume", "--dry-run", "--output-root", str(output),
+    )
+    assert changed.returncode != 0
+    assert "resume provenance differs" in changed.stderr
+
+
+def test_resume_requires_an_existing_root(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+    result = _run(
+        tmp_path, {}, "--resume", "--output-root", str(missing),
+    )
+    assert result.returncode != 0
+    assert "resume root not found" in result.stderr
+
+
+def test_comparison_recovers_old_snapshot_without_duplicated_budget_fields(
+    tmp_path: Path,
+) -> None:
+    from scripts.compare_l1_l3_prompt_ablation import verify_only
+
+    root = tmp_path / "ablation"
+    root.mkdir()
+    manifest = _manifest()
+    (root / "episode_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    _write_provenance(root, manifest)
+    for mode in _MODES:
+        _group_artifacts(root, mode, manifest)
+    config_path = root / "l1_original_only" / "config_snapshot.yaml"
+    config = json.loads(config_path.read_text())
+    config["protocol_version"] = "l1_l3_prompt_ablation_v1"
+    config.pop("prompt_protocol_version", None)
+    config["prompt_effective"].pop("budget_strategy", None)
+    config["prompt_effective"].pop("original_char_budget_chars", None)
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    assert verify_only(root) == 0
+
+
+def test_group_identity_is_bound_to_root_provenance(tmp_path: Path) -> None:
+    from scripts.compare_l1_l3_prompt_ablation import verify_only
+
+    root = tmp_path / "ablation"
+    root.mkdir()
+    manifest = _manifest()
+    (root / "episode_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    _write_provenance(root, manifest)
+    for mode in _MODES:
+        _group_artifacts(root, mode, manifest)
+    config_path = root / "l1_original_only" / "config_snapshot.yaml"
+    config = json.loads(config_path.read_text())
+    config["common"]["model_weights_sha256"] = "0" * 64
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(ValueError, match="identity differs"):
+        verify_only(root)
+
+
+def test_marked_complete_group_with_incomplete_prompt_steps_is_rejected(
+    tmp_path: Path,
+) -> None:
+    from scripts.compare_l1_l3_prompt_ablation import verify_only
+
+    root = tmp_path / "ablation"
+    root.mkdir()
+    manifest = _manifest()
+    (root / "episode_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    _write_provenance(root, manifest)
+    for mode in _MODES:
+        _group_artifacts(root, mode, manifest)
+    diagnostics = root / "l1_original_only" / "prompt_diagnostics.jsonl"
+    lines = diagnostics.read_text().splitlines()
+    diagnostics.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="lacks complete prompt diagnostics"):
         verify_only(root)
