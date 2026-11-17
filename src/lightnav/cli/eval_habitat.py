@@ -17,6 +17,7 @@ import sys
 from lightnav.habitat.runner import HabitatEvalConfig, MemoryConfig, run_habitat_eval
 from lightnav.memory.conceptgraphs_lite import GeometryConfig
 from lightnav.memory.local_graph_config import LocalGraphConfig
+from lightnav.memory.prompt_modes import MEMORY_PROMPT_MODES
 from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.spatial_l3_config import SpatialL3Config
 from lightnav.memory.v3_config import RGMV3Config
@@ -230,6 +231,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Maximum characters in the V4 memory block.")
     p.add_argument("--rgm_v4_revisit_enabled", action=argparse.BooleanOptionalAction,
                    default=True, help="Audit DINO visual revisit candidates in V4.")
+    p.add_argument(
+        "--memory_prompt_mode", choices=MEMORY_PROMPT_MODES, default="legacy",
+        help="L1/L3 prompt organization mode (default: legacy, unchanged original path).",
+    )
+    p.add_argument(
+        "--prompt_measurement_enabled", action="store_true",
+        help="Write prompt_protocol/prompt_diagnostics/per_episode for a legacy "
+        "control run without changing its prompt path.",
+    )
     p.add_argument("--local_graph_enabled", action="store_true",
                    help="Enable independent local graph navigation context.")
     p.add_argument("--local_graph_scope", choices=("episode_local", "scene_persistent"),
@@ -423,6 +433,8 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                 prompt_max_chars=args.rgm_v4_prompt_max_chars,
                 revisit_enabled=args.rgm_v4_revisit_enabled,
             ),
+            prompt_mode=args.memory_prompt_mode,
+            prompt_measurement=args.prompt_measurement_enabled,
             local_graph=LocalGraphConfig(
                 enabled=args.local_graph_enabled, scope=args.local_graph_scope,
                 prompt_max_chars=args.local_graph_prompt_max_chars,
@@ -468,7 +480,8 @@ def main(argv: list[str] | None = None) -> int:
     raw_args = sys.argv[1:] if argv is None else argv
     parser = build_parser()
     args = parser.parse_args(raw_args)
-    if (args.rgm_v3_enabled or args.rgm_v4_enabled or args.local_graph_enabled) and not any(
+    if (args.rgm_v3_enabled or args.rgm_v4_enabled or args.local_graph_enabled
+            or args.memory_prompt_mode != "legacy") and not any(
         token == "--output_dir" or token.startswith("--output_dir=")
         for token in raw_args
     ):

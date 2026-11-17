@@ -499,7 +499,10 @@ class Qwen3VLDataProcessor:
         result = self._apply_max_length(
             result, strict_prompt=(
                 isinstance(trace, dict)
-                and trace.get("memory_backend") in {"rgm_v3", "rgm_v4", "local_graph"}
+                and (
+                    trace.get("memory_backend") in {"rgm_v3", "rgm_v4", "local_graph"}
+                    or str(trace.get("memory_backend", "")).startswith("l1_l3_prompt:")
+                )
                 and (trace.get("memory_backend") == "rgm_v3" or bool(trace.get("memory_text")))
             ),
         )

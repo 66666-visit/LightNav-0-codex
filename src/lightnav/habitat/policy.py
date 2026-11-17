@@ -111,6 +111,7 @@ class TrajVocabVLNCEPolicy:
         memory_enabled: bool = False,
         memory_manager: MemoryManager | None = None,
         memory_verbose: bool = False,
+        memory_prompt_mode: str = "legacy",
     ) -> None:
         if (centroids is None) == (rvq_bundle is None):
             raise ValueError("pass exactly one of `centroids` (flat) or `rvq_bundle` (rvq).")
@@ -168,9 +169,13 @@ class TrajVocabVLNCEPolicy:
             if memory_manager is None:
                 from lightnav.memory.manager import MemoryManager
 
-                memory_manager = MemoryManager()
+                memory_manager = MemoryManager(prompt_mode=memory_prompt_mode)
+            # An injected manager is authoritative: its plan was validated when
+            # it was constructed, and the runner passes the same mode to both.
             self.memory_manager = memory_manager
         else:
+            if memory_prompt_mode != "legacy":
+                raise ValueError("memory prompt modes require memory_enabled")
             self.memory_manager = None
         self._memory_episode_index = -1
         self._memory_episode_open = False
@@ -658,6 +663,340 @@ class TrajVocabVLNCEPolicy:
             }
         return text, sample, diagnostic
 
+    def _generate_with_prompt_mode(
+        self, obs: dict[str, Any], info: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        """Build the selected L1/L3 context and run one unchanged inference step."""
+        from lightnav.memory.memory_context_builder import (
+            audit_prompt_injection,
+            build_context_text,
+            inject_memory_context,
+        )
+        from lightnav.memory.prompt_modes import PROMPT_PROTOCOL_VERSION
+        from lightnav.memory.schemas import MemoryContext, ObservationPacket
+        from lightnav.memory.token_budget import (
+            UNBOUNDED_CHAR_LIMIT,
+            MemoryTokenBudget,
+            measure_memory_token_budget,
+            trim_context_for_overflow,
+        )
+
+        manager = self.memory_manager
+        plan = manager.plan
+        step = self._memory_step
+        events = manager.observe(ObservationPacket(
+            step_id=step, rgb=obs["rgb"], instruction=self.instruction,
+            last_action=self._last_executed_action, prediction=self._last_prediction,
+        ))
+        self._memory_step += 1
+        frame = None
+        spatial_diagnostic = None
+        spatial_fallback_reason = None
+        if plan.uses_l3:
+            try:
+                spatial_diagnostic = manager.observe_spatial(obs, info, events, step=step)
+                frame = manager.last_spatial_frame
+            except Exception as exc:  # noqa: BLE001
+                spatial_fallback_reason = f"spatial_candidate: {exc}"
+                spatial_diagnostic = {
+                    "mode": "inject", "step": step,
+                    "rejection_reason": f"{type(exc).__name__}: {exc}",
+                }
+        base_sample = build_vln_traj_sample(
+            self.agent._get_video_tensor(), self.agent.instruction,
+            list(self.agent._history_frame_ids), self.engine.bundle,
+        )
+        token_budget_measurement = measure_memory_token_budget(self.engine, base_sample)
+        token_budget = (
+            token_budget_measurement
+            if isinstance(token_budget_measurement, MemoryTokenBudget) else None
+        )
+        budget_failure = (
+            None if token_budget is not None else token_budget_measurement
+        )
+        context_error: str | None = None
+        try:
+            result = manager.build_prompt_context(
+                step=step, instruction=self.instruction, events=events,
+                rgb_width=int(obs["rgb"].shape[1]), frame=frame,
+                token_budget=token_budget, budget_failure=budget_failure,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # An experimental formatter must never break the frozen action path.
+            context_error = f"prompt_context: {type(exc).__name__}: {exc}"
+            result = None
+            manager.discard_prompt_context()
+        base_prompt = next(
+            turn["value"] for turn in base_sample["conversations"]
+            if turn.get("from") == "human"
+        )
+        base_hash = sha256(base_prompt.encode("utf-8")).hexdigest()
+        if result is not None:
+            budget = result.injection_max_chars
+            context = result.context
+            result_diagnostics = result.diagnostics
+        else:
+            budget = (
+                UNBOUNDED_CHAR_LIMIT if token_budget is not None
+                else manager.prompt_budget_chars
+            )
+            context = None
+            result_diagnostics = {
+                "mode": plan.mode, "source": None, "layers": {},
+                "context_chars": 0, "item_count": 0, "evidence_ids": [],
+                "empty_reason": context_error,
+                "budget": (
+                    token_budget.diagnostics() if token_budget is not None
+                    else budget_failure.diagnostics() if budget_failure is not None
+                    else {"budget_source": "char_fallback_320"}
+                ),
+            }
+        sample = base_sample
+        memory_text = ""
+        prompt_audit = None
+        fallback_reason = context_error
+        length_rejections = 0
+        accepted_records: list[dict[str, Any]] = []
+        token_overflow_drops = 0
+        memory_tokens_injected: int | None = None
+        started = perf_counter()
+        while True:
+            if context is not None:
+                try:
+                    augmented = inject_memory_context(base_sample, context, max_chars=budget)
+                    prompt_audit = audit_prompt_injection(
+                        base_sample, augmented, context, max_chars=budget,
+                    )
+                    memory_text = build_context_text(context, max_chars=budget)
+                    if not memory_text:
+                        raise ValueError("prompt-mode formatter returned no safe text")
+                    if token_budget is not None:
+                        tokenizer = getattr(
+                            getattr(self.engine, "bundle", None), "tokenizer", None,
+                        )
+                        if tokenizer is not None:
+                            augmented_human = next(
+                                turn["value"] for turn in augmented["conversations"]
+                                if turn.get("from") == "human"
+                            )
+                            delta = (
+                                len(tokenizer.encode(
+                                    augmented_human, add_special_tokens=False,
+                                ))
+                                - len(tokenizer.encode(
+                                    base_prompt, add_special_tokens=False,
+                                ))
+                            )
+                            if delta > token_budget.available_tokens:
+                                new_context, dropped = trim_context_for_overflow(context)
+                                token_overflow_drops += dropped
+                                if new_context is None or dropped == 0:
+                                    context = None
+                                    fallback_reason = (
+                                        "token budget overflow: no lower-priority "
+                                        "item could be dropped"
+                                    )
+                                    manager.discard_prompt_context()
+                                else:
+                                    context = new_context
+                                sample = base_sample
+                                memory_text = ""
+                                prompt_audit = None
+                                accepted_records = []
+                                memory_tokens_injected = None
+                                continue
+                            memory_tokens_injected = delta
+                    accepted_records = []
+                    for item in context.layer_items:
+                        line = item.metadata.get("serialized_text")
+                        if not isinstance(line, str) or line not in memory_text:
+                            raise ValueError("prompt-mode item text was not injected whole")
+                        accepted_records.append({
+                            "evidence_ids": list(item.metadata.get("evidence_ids", [])),
+                            "text": line,
+                            "layer_source": item.metadata.get("layer_source"),
+                            "layer_contribution": item.metadata.get("layer_contribution"),
+                        })
+                    sample = {
+                        **augmented,
+                        "_rgm_trace": {
+                            "episode_id": manager.working.state.episode_id,
+                            "scene_id": manager.v3_scene_id,
+                            "rollout_idx": manager.v3_rollout_idx,
+                            "memory_backend": f"l1_l3_prompt:{plan.mode}",
+                            "memory_use_mode": plan.mode,
+                            "step_id": step,
+                            "original_instruction": self.instruction,
+                            "memory_text": memory_text,
+                            "accepted_records": accepted_records,
+                            "original_prompt_sha256": prompt_audit["base_sha256"],
+                            "injected_prompt_sha256": prompt_audit["augmented_sha256"],
+                            "injected_memory_chars": len(memory_text),
+                            "evidence_provenance": [
+                                source for item in context.layer_items
+                                for source in item.metadata.get("provenance", [])
+                            ],
+                            "_base_sample": base_sample,
+                        },
+                    }
+                except (KeyError, ValueError) as exc:
+                    fallback_reason = f"prompt_contract: {exc}"
+                    manager.discard_prompt_context()
+                    context = None
+                    sample = base_sample
+                    memory_text = ""
+                    prompt_audit = None
+                    accepted_records = []
+                    memory_tokens_injected = None
+            try:
+                text, _ = self.engine.generate(sample)
+                break
+            except ValueError as exc:
+                if context is None or "processor input length" not in str(exc):
+                    raise
+                length_rejections += 1
+                memory_tokens_injected = None
+                if not context.layer_items:
+                    # A state-only card has nothing to drop; retry the original
+                    # sample rather than crashing the episode on max([]).
+                    context = None
+                    fallback_reason = "no remaining prompt-mode items to drop"
+                    manager.discard_prompt_context()
+                else:
+                    victim = max(
+                        context.layer_items, key=lambda item: len(item.description),
+                    )
+                    remaining = [
+                        item for item in context.layer_items if item is not victim
+                    ]
+                    drop_line = victim.description
+                    if remaining:
+                        text_lines = [
+                            line for line in context.text.splitlines()
+                            if line != drop_line
+                        ]
+                        context = MemoryContext(
+                            text="\n".join(text_lines), layer_items=remaining,
+                        )
+                    else:
+                        context = None
+                        fallback_reason = (
+                            "all prompt-mode items exceeded the Processor budget"
+                        )
+                        manager.discard_prompt_context()
+                sample = base_sample
+                memory_text = ""
+                prompt_audit = None
+                accepted_records = []
+                memory_tokens_injected = None
+        self.last_model_inference_ms = (perf_counter() - started) * 1000.0
+
+        model_input = getattr(self.engine, "last_input_diagnostic", None)
+        checked = isinstance(model_input, dict)
+        block_visible = bool(
+            context is not None and checked
+            and model_input.get("memory_text_present_in_final_tokens") is True
+        )
+        if block_visible and getattr(self.engine, "backend", None) == "vllm_local":
+            block_visible = bool(
+                model_input.get("memory_text_present_in_vllm_prompt") is True
+                and model_input.get("vllm_prompt_matches_final_tokens") is True
+            )
+        visible_ids = (
+            list(model_input.get("model_visible_evidence_ids", [])) if block_visible else []
+        )
+        actual_injection = bool(context is not None and block_visible)
+        if actual_injection:
+            manager.confirm_prompt_context(visible_ids, step=step)
+        else:
+            manager.discard_prompt_context()
+        historical_ids = []
+        for evidence_id in visible_ids:
+            record = manager.v3_store.get_evidence(evidence_id)
+            if record is not None and (
+                (record.episode_id, record.rollout_idx)
+                != (manager.working.state.episode_id, manager.v3_rollout_idx)
+                or record.step < step
+            ):
+                historical_ids.append(evidence_id)
+                continue
+            if manager.spatial_map is not None:
+                spatial = manager.spatial_map.evidence.get(evidence_id)
+                if spatial is not None and (
+                    (spatial.episode_id, spatial.rollout_idx)
+                    != (manager.working.state.episode_id, manager.v3_rollout_idx)
+                    or spatial.step_id < step
+                ):
+                    historical_ids.append(evidence_id)
+        prompt_context = dict(result_diagnostics)
+        budget_diagnostics = dict(prompt_context.get("budget", {}) or {})
+        if token_budget is not None:
+            if memory_tokens_injected is not None:
+                budget_diagnostics["memory_block_tokens"] = memory_tokens_injected
+            budget_diagnostics["token_overflow_drops"] = token_overflow_drops
+            budget_diagnostics["injected_chars"] = len(memory_text)
+        prompt_context["budget"] = budget_diagnostics
+        prompt_context.update({
+            "mode": plan.mode,
+            "protocol_version": PROMPT_PROTOCOL_VERSION,
+            "step": step,
+            "budget_chars": (
+                (result.budget_chars if result is not None
+                 else manager.prompt_budget_chars)
+                if token_budget is None else None
+            ),
+            "memory_tokens_injected": memory_tokens_injected,
+            "token_overflow_drops": token_overflow_drops,
+            "injected_memory_chars": len(memory_text),
+            "injected_memory_tokens": (
+                model_input.get("injected_memory_tokens") if checked else None
+            ),
+            "final_token_count": model_input.get("final_token_count") if checked else None,
+            "prompt_hash_before": base_hash,
+            "prompt_hash_after": (
+                prompt_audit["augmented_sha256"] if prompt_audit is not None else base_hash
+            ),
+            "prompt_roundtrip_ok": prompt_audit["roundtrip_ok"] if prompt_audit else True,
+            "actual_injection": actual_injection if checked else None,
+            "actual_historical_injection": bool(historical_ids) if checked else None,
+            "injected_evidence_ids": visible_ids,
+            "injected_historical_evidence_ids": historical_ids,
+            "processor_length_rejections": length_rejections,
+            "prompt_fallback_reason": fallback_reason,
+            "state_only_injection": bool(
+                context is not None and block_visible and not visible_ids
+            ),
+            "accepted_record_count": len(accepted_records),
+        })
+        if spatial_diagnostic is not None:
+            prompt_context["spatial_l3"] = {
+                **spatial_diagnostic,
+                "context_source": result.source if result is not None else "none",
+                "fallback_reason": spatial_fallback_reason,
+            }
+        diagnostic = {
+            "episode_id": manager.working.state.episode_id,
+            "memory_backend": f"l1_l3_prompt:{plan.mode}",
+            "prompt_mode": plan.mode,
+            "prompt_protocol_version": PROMPT_PROTOCOL_VERSION,
+            "step": step,
+            "events_written": len(events),
+            "memory_text": memory_text,
+            "actual_injection": actual_injection if checked else None,
+            "actual_historical_injection": bool(historical_ids) if checked else None,
+            "injected_evidence_ids": visible_ids,
+            "injected_historical_evidence_ids": historical_ids,
+            "processor_length_rejections": length_rejections,
+            "prompt_fallback_reason": fallback_reason,
+            "prompt_hash_before": base_hash,
+            "prompt_hash_after": (
+                prompt_audit["augmented_sha256"] if prompt_audit is not None else base_hash
+            ),
+            "prompt_context": prompt_context,
+            "model_input_diagnostic": dict(model_input) if checked else None,
+        }
+        return text, sample, diagnostic
+
     def act(self, obs: dict[str, Any], info: dict[str, Any] | None = None) -> dict:
         """Run one inference step and return a Habitat ``velocity_control`` action dict."""
         self.last_memory_diagnostic = None
@@ -667,12 +1006,20 @@ class TrajVocabVLNCEPolicy:
         self.last_memory_text = ""
         diagnostic: dict[str, Any] | None = None
         self.agent.observe(obs["rgb"])
+        prompt_mode_enabled = bool(
+            self._memory_episode_open and self.memory_manager is not None
+            and getattr(getattr(self.memory_manager, "plan", None), "mode", "legacy")
+            != "legacy"
+        )
         v4_enabled = bool(
             self._memory_episode_open and getattr(
                 getattr(self.memory_manager, "v4_config", None), "enabled", False,
             )
         )
-        if v4_enabled:
+        if prompt_mode_enabled:
+            text, sample, diagnostic = self._generate_with_prompt_mode(obs, info)
+            rgm_enabled = False
+        elif v4_enabled:
             text, sample, diagnostic = self._generate_with_v4_memory(obs)
             rgm_enabled = False  # V4 diagnostics are finalized in the helper.
         elif self._memory_episode_open and getattr(

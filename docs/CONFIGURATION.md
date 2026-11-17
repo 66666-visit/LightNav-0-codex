@@ -395,6 +395,66 @@ Token audit. A missing geometric candidate falls back to the original Local
 Graph candidate path; an empty/failed final prompt falls back to the original
 LightNav sample.
 
+### L1 + L3 prompt organization (`--memory_prompt_mode`)
+
+`--memory_prompt_mode` selects how the existing L1 short-term detector memory
+and the L3 3D semantic map are serialized into the one bounded block after
+`</navigation_task>`. It never changes the model weights, video input, action
+decoder, injection position or the legacy character budget. `legacy` (the
+default) keeps the original Local Graph/L3 execution path byte for byte.
+
+| Mode | Injected context |
+| --- | --- |
+| `legacy` | Original path: L3 spatial candidate when `inject`, otherwise the original Local Graph card |
+| `l1_original_only` | Original L1 Local Graph card; the L3 sidecar does not run |
+| `l1_organized_only` | Organized L1 card: current vs earlier detections, confidence, image sector, sightings; L3 does not run |
+| `l3_original_only` | Original L3 `Spatial history` line; no L1 prompt builder and no Local Graph fallback |
+| `l3_organized_only` | Organized L3 card: instruction-relevant objects, observation count, straight-line range/bearing marked "not a path", traversal evidence, unknown passage |
+| `l1_l3_original_concat` | Original L1 card followed by the original L3 card under the same total budget |
+| `l1_l3_joint` | Organized L1 + L3 fusion with trusted entity alignment, deduplication, preserved conflicts and explicit uncertainty |
+
+Every non-legacy mode requires `--memory_enabled`, `--memory_strategy
+hierarchical --memory_layers short,mid,long`, `--local_graph_enabled` and an
+explicit `--output_dir`; L3 modes additionally require `--spatial_l3_mode
+inject` and `--spatial_l3_seg_model_path`. `RESUME=1` is rejected for these
+modes.
+
+**Budget policy.** `min(--memory_max_context_chars,
+--local_graph_prompt_max_chars)` (320 with the defaults) is the original Local
+Graph module's character allowance, not the Qwen3-VL context limit. It therefore
+applies unchanged only to `legacy`. The six experimental modes select whole
+lines against a per-step, model-derived token budget:
+
+- context limit = the smallest known serving cap among
+  `bundle.max_seq_len`, `processor.model_max_length` and the backend
+  (`vllm.max_model_len`, or the HF model's `max_position_embeddings`);
+- occupied base tokens = one Processor pass over the unchanged sample
+  (`data_processor.process_sample(..., add_generation_prompt=True)`);
+- reserve = `engine.max_new_tokens`;
+- one token of boundary reserve for the inserted newline;
+- available memory tokens = limit − base − reserve − 1.
+
+The budget is measured with the checkpoint's existing Processor/Tokenizer; no
+external API, weight change or new fixed character allowance is used. If the
+Processor/Tokenizer, context limit or generation reserve is unavailable, the
+mode falls back to the original 320-character allowance and records
+`budget_source=char_fallback_320` plus the concrete reason in
+`prompt_diagnostics.jsonl`; it never guesses a larger budget. The measurement
+adds one CPU Processor pass per experimental inference step.
+
+`--prompt_measurement_enabled` writes the same `prompt_protocol.json`,
+`prompt_diagnostics.jsonl` and `per_episode.csv` for a `legacy` control run
+without changing its prompt path, injection point or 320-character budget. It
+is used by the seventh legacy arm of the ablation.
+
+The run writes `prompt_protocol.json` once and `prompt_diagnostics.jsonl` per
+inference step, plus `per_episode.csv`; `scripts/eval_habitat.sh` merges shard
+diagnostics into the group root. `scripts/run_l1_l3_prompt_ablation.sh` runs the
+six experimental modes plus the unchanged `legacy` control on one fixed
+88-Episode manifest and `scripts/compare_l1_l3_prompt_ablation.py` writes the
+paired comparison. See
+[L1_L3_DUAL_MEMORY_PROMPT_ABLATION.md](research/L1_L3_DUAL_MEMORY_PROMPT_ABLATION.md).
+
 The underlying `scripts/eval_habitat.sh` also accepts `STRICT_FULL_EVAL=1`
 for the full-split gate, `RESUME=1` to skip existing completed Episodes,
 `EPISODE_MANIFEST_PATH` to create or compare a shared manifest, `SEED` for

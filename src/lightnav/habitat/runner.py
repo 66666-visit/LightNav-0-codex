@@ -41,12 +41,26 @@ from lightnav.habitat.experiment_integrity import (
 )
 from lightnav.habitat.policy import TrajVocabVLNCEPolicy, extract_instruction
 from lightnav.habitat.progress import ProgressReporter
+from lightnav.habitat.prompt_artifacts import (
+    PROMPT_DIAGNOSTICS_FILENAME,
+    append_prompt_diagnostics,
+    build_prompt_protocol,
+    legacy_prompt_diagnostic_row,
+    prompt_diagnostic_row,
+    write_or_match_prompt_protocol,
+    write_per_episode_csv,
+)
 from lightnav.habitat.results import (
     make_json_safe,
     print_objectnav_summary,
     print_vlnce_summary,
 )
 from lightnav.memory.local_graph_config import LOCAL_GRAPH_PROTOCOL_VERSION, LocalGraphConfig
+from lightnav.memory.prompt_modes import (
+    MEMORY_PROMPT_MODES,
+    mode_plan,
+    validate_mode_backing,
+)
 from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.spatial_l3_config import SpatialL3Config
 from lightnav.memory.v3_config import RGM_V3_PROTOCOL_VERSION, RGMV3Config
@@ -86,6 +100,8 @@ class MemoryConfig:
     rgm_v4: RGMV4Config = field(default_factory=RGMV4Config)
     local_graph: LocalGraphConfig = field(default_factory=LocalGraphConfig)
     spatial_l3: SpatialL3Config = field(default_factory=SpatialL3Config)
+    prompt_mode: str = "legacy"
+    prompt_measurement: bool = False
 
     def __post_init__(self) -> None:
         if self.top_k < 1 or self.max_context_chars < 1:
@@ -146,6 +162,26 @@ class MemoryConfig:
             "short", "mid", "long",
         }:
             raise ValueError("RGM V3/V4/local graph requires short, mid and long memory layers")
+        if self.prompt_mode not in MEMORY_PROMPT_MODES:
+            raise ValueError(
+                f"memory.prompt_mode must be one of {MEMORY_PROMPT_MODES}"
+            )
+        if self.prompt_measurement and not self.enabled:
+            raise ValueError("prompt_measurement requires memory_enabled")
+        if self.prompt_mode != "legacy":
+            if not self.enabled:
+                raise ValueError("memory prompt modes require memory_enabled")
+            if not self.local_graph.enabled:
+                raise ValueError("memory prompt modes require local_graph_enabled")
+            if self.rgm.enabled or self.rgm_v3.enabled or self.rgm_v4.enabled:
+                raise ValueError(
+                    "memory prompt modes require the local graph backend only"
+                )
+            validate_mode_backing(
+                mode_plan(self.prompt_mode),
+                local_graph_enabled=self.local_graph.enabled,
+                spatial_l3_mode=self.spatial_l3.mode,
+            )
 
 
 @dataclass
@@ -408,8 +444,19 @@ def build_velocity_policy(
     )
     memory_manager = None
     if cfg.memory.enabled:
+        from dataclasses import replace
+
         from lightnav.memory.manager import MemoryManager
 
+        prompt_plan = mode_plan(cfg.memory.prompt_mode)
+        # A layer that the selected mode never injects must not run its
+        # sidecar: this is what keeps the L1-only arms free of any L3 read.
+        # Legacy keeps the exact configured backend, including spatial L3.
+        manager_spatial = (
+            cfg.memory.spatial_l3
+            if cfg.memory.prompt_mode == "legacy" or prompt_plan.uses_l3
+            else replace(cfg.memory.spatial_l3, mode="off")
+        )
         extractor = None
         place_extractor = None
         spatial_extractor = None
@@ -422,14 +469,14 @@ def build_velocity_policy(
                 confidence=cfg.memory.extractor_confidence,
                 every_n_steps=cfg.memory.extract_every_n_steps,
             )
-        if cfg.memory.spatial_l3.mode != "off":
+        if manager_spatial.mode != "off":
             from lightnav.memory.yolo_seg_extractor import YOLOSegExtractor
 
             spatial_extractor = YOLOSegExtractor(
-                model_path=cfg.memory.spatial_l3.seg_model_path,
-                device=cfg.memory.spatial_l3.seg_device,
-                confidence=cfg.memory.spatial_l3.seg_confidence,
-                every_n_steps=cfg.memory.spatial_l3.seg_every_n_steps,
+                model_path=manager_spatial.seg_model_path,
+                device=manager_spatial.seg_device,
+                confidence=manager_spatial.seg_confidence,
+                every_n_steps=manager_spatial.seg_every_n_steps,
             )
         if (
             cfg.memory.place_enabled and cfg.memory.strategy == "hierarchical"
@@ -455,8 +502,9 @@ def build_velocity_policy(
             v3_config=cfg.memory.rgm_v3,
             v4_config=cfg.memory.rgm_v4,
             local_graph_config=cfg.memory.local_graph,
-            spatial_l3_config=cfg.memory.spatial_l3,
+            spatial_l3_config=manager_spatial,
             spatial_extractor=spatial_extractor,
+            prompt_mode=cfg.memory.prompt_mode,
         )
     return TrajVocabVLNCEPolicy(
         engine,
@@ -469,6 +517,7 @@ def build_velocity_policy(
         memory_enabled=cfg.memory.enabled,
         memory_manager=memory_manager,
         memory_verbose=cfg.verbose,
+        memory_prompt_mode=cfg.memory.prompt_mode,
     )
 
 
@@ -962,11 +1011,29 @@ def run_habitat_eval(
     elif cfg.memory.rgm_v4.enabled:
         _prepare_v4_output_dir(output_dir, cfg.memory.rgm_v4, resume=cfg.resume)
     elif cfg.memory.local_graph.enabled:
+        from dataclasses import replace as _replace
+
         _prepare_local_graph_output_dir(output_dir, cfg.memory.local_graph)
-        _write_spatial_l3_protocol(output_dir, cfg.memory.spatial_l3)
+        _prompt_plan = mode_plan(cfg.memory.prompt_mode)
+        _effective_spatial = (
+            cfg.memory.spatial_l3
+            if cfg.memory.prompt_mode == "legacy" or _prompt_plan.uses_l3
+            else _replace(cfg.memory.spatial_l3, mode="off")
+        )
+        _write_spatial_l3_protocol(output_dir, _effective_spatial)
     else:
         _guard_non_v3_v4_output_dir(output_dir)
     os.makedirs(output_dir, exist_ok=True)
+    prompt_mode = cfg.memory.prompt_mode
+    prompt_measurement = prompt_mode != "legacy" or cfg.memory.prompt_measurement
+    legacy_char_budget = min(
+        cfg.memory.max_context_chars, cfg.memory.local_graph.prompt_max_chars,
+    )
+    prompt_diagnostics_path = None
+    if prompt_measurement:
+        write_or_match_prompt_protocol(output_dir, build_prompt_protocol(cfg.memory))
+        prompt_diagnostics_path = os.path.join(output_dir, PROMPT_DIAGNOSTICS_FILENAME)
+        Path(prompt_diagnostics_path).touch(exist_ok=True)
     results_jsonl = os.path.join(output_dir, "results.jsonl")
     diagnostics_jsonl = os.path.join(output_dir, "memory_diagnostics.jsonl")
     trace_jsonl = Path(output_dir) / "step_trace.jsonl"
@@ -1331,6 +1398,26 @@ def run_habitat_eval(
                         "memory_enabled": cfg.memory.enabled,
                     })
                     episode_diagnostics.append(row)
+                    if prompt_diagnostics_path is not None and not forced_stop:
+                        if prompt_mode == "legacy":
+                            row = legacy_prompt_diagnostic_row(
+                                diagnostic if isinstance(diagnostic, dict) else {},
+                                engine_diagnostic=getattr(
+                                    engine, "last_input_diagnostic", None,
+                                ),
+                                episode_id=episode_id,
+                                habitat_episode_id=habitat_ep_id,
+                                scene_id=habitat_scene_id,
+                                char_budget=legacy_char_budget,
+                            )
+                        else:
+                            row = prompt_diagnostic_row(
+                                diagnostic if isinstance(diagnostic, dict) else {},
+                                episode_id=episode_id,
+                                habitat_episode_id=habitat_ep_id,
+                                scene_id=habitat_scene_id,
+                            )
+                        append_prompt_diagnostics(prompt_diagnostics_path, row)
 
                     dtg = _safe_scalar(info.get("distance_to_goal"), default=float("inf"))
                     if dtg < min_distance_to_goal:
@@ -1398,6 +1485,12 @@ def run_habitat_eval(
                     if inference_latencies else None
                 ),
             }
+            # Only the experimental modes add the measured PathLength field; the
+            # legacy result schema stays exactly as before.
+            if (
+                prompt_mode != "legacy" or cfg.memory.prompt_measurement
+            ) and info.get("path_length") is not None:
+                result["path_length"] = info.get("path_length")
             if video_rel is not None:
                 result["video"] = video_rel
             if cfg.strict_full_eval and result["steps"] < 1:
@@ -1462,6 +1555,10 @@ def run_habitat_eval(
         ),
         "resumed": cfg.resume,
     }
+    if prompt_mode != "legacy":
+        extra_info["memory_prompt_mode"] = prompt_mode
+    if prompt_diagnostics_path is not None:
+        write_per_episode_csv(output_dir, results)
     if any(r.get("object_category") for r in results):
         print_objectnav_summary(results, elapsed, output_dir, extra_info=extra_info)
     else:

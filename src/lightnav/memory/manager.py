@@ -11,6 +11,9 @@ from uuid import uuid4
 
 from lightnav.memory.conceptgraphs_lite import ObjectMap, RGBDFrame
 from lightnav.memory.episodic_memory import EpisodicMemory
+from lightnav.memory.joint_prompt import JointPromptBuilder
+from lightnav.memory.l1_prompt_organizer import L1PromptOrganizer
+from lightnav.memory.l3_prompt_organizer import L3PromptOrganizer
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.local_graph_fusion import LocalGraphFusion
 from lightnav.memory.memory_fusion import MemoryFusion
@@ -20,6 +23,13 @@ from lightnav.memory.memory_write_gate import MemoryWriteGate
 from lightnav.memory.memory_writer import MemoryWriter, NullSceneExtractor, SceneExtractor
 from lightnav.memory.place_recognition import PlaceDescriptorExtractor
 from lightnav.memory.place_verification import TwoStagePlaceVerifier
+from lightnav.memory.prompt_assembly import PromptContextResult, build_prompt_context
+from lightnav.memory.prompt_modes import (
+    PromptModePlan,
+    mode_plan,
+    resolve_prompt_budget,
+    validate_mode_backing,
+)
 from lightnav.memory.retriever import MemoryRetriever
 from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.scene_graph import SceneGraph
@@ -35,6 +45,11 @@ from lightnav.memory.schemas import (
 from lightnav.memory.semantic_index import SemanticIndex
 from lightnav.memory.spatial_graph_adapter import SpatialGraphAdapter, make_spatial_evidence
 from lightnav.memory.spatial_l3_config import SpatialL3Config
+from lightnav.memory.token_budget import (
+    UNBOUNDED_CHAR_LIMIT,
+    MemoryTokenBudget,
+    TokenBudgetFailure,
+)
 from lightnav.memory.topological_memory import PlaceObservationResult, TopologicalMemory
 from lightnav.memory.v3_config import RGMV3Config
 from lightnav.memory.v3_formatter import V3PromptFormatter
@@ -77,6 +92,7 @@ class MemoryManager:
         local_graph_config: LocalGraphConfig | None = None,
         spatial_l3_config: SpatialL3Config | None = None,
         spatial_extractor: object | None = None,
+        prompt_mode: str = "legacy",
     ) -> None:
         if top_k < 0:
             raise ValueError("top_k must be nonnegative")
@@ -108,6 +124,28 @@ class MemoryManager:
         self.v4_config = v4_config or RGMV4Config()
         self.local_graph_config = local_graph_config or LocalGraphConfig()
         self.spatial_l3_config = spatial_l3_config or SpatialL3Config()
+        self.plan: PromptModePlan = mode_plan(prompt_mode)
+        validate_mode_backing(
+            self.plan,
+            local_graph_enabled=self.local_graph_config.enabled,
+            spatial_l3_mode=self.spatial_l3_config.mode,
+        )
+        self.prompt_budget_chars = resolve_prompt_budget(
+            max_context_chars=self.max_context_chars,
+            local_graph_prompt_max_chars=self.local_graph_config.prompt_max_chars,
+        )
+        self.l1_prompt_organizer = L1PromptOrganizer(
+            max_items=self.local_graph_config.max_landmarks,
+        )
+        self.l3_prompt_organizer = L3PromptOrganizer(
+            max_items=self.local_graph_config.max_landmarks,
+        )
+        self.joint_prompt_builder = JointPromptBuilder(
+            max_items=self.local_graph_config.max_landmarks + 1,
+        )
+        self._prompt_context_pending = False
+        self._prompt_context_pending_ids: frozenset[str] = frozenset()
+        self.last_prompt_context: PromptContextResult | None = None
         if self.spatial_l3_config.mode != "off" and not self.local_graph_config.enabled:
             raise ValueError("spatial L3 requires Local Graph to be enabled")
         if self.spatial_l3_config.mode != "off" and spatial_extractor is None:
@@ -125,6 +163,10 @@ class MemoryManager:
         if sum((self.rgm_config.enabled, self.v3_config.enabled,
                 self.v4_config.enabled, self.local_graph_config.enabled)) > 1:
             raise ValueError("legacy RGM, RGM V3, RGM V4 and local graph cannot run together")
+        if self.plan.mode != "legacy" and (
+            self.rgm_config.enabled or self.v3_config.enabled or self.v4_config.enabled
+        ):
+            raise ValueError("memory prompt modes require the Local Graph backend only")
         if self.rgm_config.enabled and strategy != "hierarchical":
             raise ValueError("RGM requires hierarchical memory")
         if (self.v3_config.enabled or self.v4_config.enabled
@@ -177,6 +219,17 @@ class MemoryManager:
             LocalGraphFusion(self.local_graph_config)
             if self.local_graph_config.enabled else None
         )
+        # Experimental modes apply the model-derived token limit instead of the
+        # original 320-character module budget. The original builder code is
+        # reused; only its internal character ceiling is lifted.
+        self.prompt_local_graph_fusion = (
+            LocalGraphFusion(replace(
+                self.local_graph_config, prompt_max_chars=UNBOUNDED_CHAR_LIMIT,
+            ))
+            if self.local_graph_config.enabled and self.plan.mode != "legacy"
+            else self.local_graph_fusion
+        )
+        self._active_prompt_fusion = self.prompt_local_graph_fusion
         self.v4_frame_ids_by_step: dict[FrameKey, int] = {}
         self.last_v4_context: NavigationMemoryContext | None = None
         self._v4_structured_context: NavigationMemoryContext | None = None
@@ -248,6 +301,11 @@ class MemoryManager:
             self.local_graph_fusion.reset_episode(
                 self.v3_scene_id, episode_id, rollout_idx,
             )
+        if (self.prompt_local_graph_fusion is not None
+                and self.prompt_local_graph_fusion is not self.local_graph_fusion):
+            self.prompt_local_graph_fusion.reset_episode(
+                self.v3_scene_id, episode_id, rollout_idx,
+            )
         if self.spatial_map is not None:
             self.spatial_map.reset_episode(self.v3_scene_id, episode_id, rollout_idx)
             self.last_spatial_frame = None
@@ -266,6 +324,10 @@ class MemoryManager:
         self.last_place_decision = None
         self.last_topology_edge_status = None
         self.last_v3_diagnostic = {}
+        self._prompt_context_pending = False
+        self._prompt_context_pending_ids = frozenset()
+        self._active_prompt_fusion = self.prompt_local_graph_fusion
+        self.last_prompt_context = None
         self.write_gate = (
             MemoryWriteGate(episode_id, instruction, self.rgm_config)
             if self.rgm_config.enabled else None
@@ -423,6 +485,87 @@ class MemoryManager:
             ),
             min_confidence=self.spatial_l3_config.min_injection_confidence,
         )
+
+    def build_prompt_context(
+        self, *, step: int, instruction: str, events: list[MemoryEvent],
+        rgb_width: int, frame: object | None,
+        token_budget: MemoryTokenBudget | None = None,
+        budget_failure: TokenBudgetFailure | None = None,
+    ) -> PromptContextResult:
+        """Select this step's context for the configured prompt mode."""
+        if self.plan.require_legacy():
+            raise RuntimeError("legacy prompts use the original Local Graph path")
+        if self.v3_store is None:
+            raise RuntimeError("memory prompt modes require a V3 evidence store")
+        token_limited = token_budget is not None and token_budget.available
+        fusion = (
+            self.prompt_local_graph_fusion
+            if self.plan.l1_source == "original" and token_limited
+            else self.local_graph_fusion
+        )
+        self._active_prompt_fusion = fusion
+        char_limit = (
+            UNBOUNDED_CHAR_LIMIT if token_limited else self.prompt_budget_chars
+        )
+        result = build_prompt_context(
+            self.plan,
+            store=self.v3_store,
+            object_map=self.spatial_map,
+            frame=frame,
+            local_graph_fusion=fusion,
+            spatial_adapter=self.spatial_adapter,
+            l1_organizer=self.l1_prompt_organizer,
+            l3_organizer=self.l3_prompt_organizer,
+            joint_builder=self.joint_prompt_builder,
+            scene_id=self.v3_scene_id,
+            episode_id=self.working.state.episode_id,
+            rollout_idx=self.v3_rollout_idx,
+            step=step,
+            instruction=instruction,
+            rgb_width=rgb_width,
+            events=events,
+            current_place_id=self.v3_place_id,
+            scope=self.local_graph_config.scope,
+            max_landmarks=self.local_graph_config.max_landmarks,
+            min_confidence=self.spatial_l3_config.min_injection_confidence,
+            budget_chars=self.prompt_budget_chars,
+            char_limit=char_limit,
+            token_budget=token_budget,
+            budget_failure=budget_failure,
+        )
+        if self.plan.l1_source == "original" and not result.local_graph_pending:
+            # The original builder created a pending selection that the mode
+            # did not serialize (for example its block was dropped by budget).
+            self._active_prompt_fusion.discard_selection()
+        self.last_prompt_context = result
+        self._prompt_context_pending = result.local_graph_pending
+        self._prompt_context_pending_ids = frozenset(result.l1_evidence_ids)
+        return result
+
+    def confirm_prompt_context(self, evidence_ids: list[str], *, step: int) -> None:
+        """Record an injected Local Graph selection only after the prompt proves it."""
+        if not self._prompt_context_pending:
+            return
+        self._prompt_context_pending = False
+        # Only the L1 evidence of this context may confirm its Local Graph
+        # selection; a joint/concat context also carries L3 ids.
+        confirmed = [
+            evidence_id for evidence_id in evidence_ids
+            if evidence_id in self._prompt_context_pending_ids
+        ]
+        self._prompt_context_pending_ids = frozenset()
+        if confirmed:
+            self._active_prompt_fusion.confirm_injected(confirmed, step)
+        else:
+            self._active_prompt_fusion.discard_selection()
+
+    def discard_prompt_context(self) -> None:
+        """Release a prompt-mode selection rejected by the prompt/token contract."""
+        if not self._prompt_context_pending:
+            return
+        self._prompt_context_pending = False
+        self._prompt_context_pending_ids = frozenset()
+        self._active_prompt_fusion.discard_selection()
 
     def record_v4_frame_id(self, step: int, frame_id: int) -> None:
         """Bind one memory Step to the TrackingAgent frame actually observed."""
@@ -691,6 +834,9 @@ class MemoryManager:
                 self._v4_dropped_candidates = []
             if self.local_graph_fusion is not None:
                 self.local_graph_fusion.close_episode()
+            if (self.prompt_local_graph_fusion is not None
+                    and self.prompt_local_graph_fusion is not self.local_graph_fusion):
+                self.prompt_local_graph_fusion.close_episode()
             if self.spatial_map is not None:
                 self.spatial_extractor.close_episode()
                 self.spatial_map.objects.clear()
@@ -721,6 +867,9 @@ class MemoryManager:
             self.retrieval_gate.decisions = []
             self.prompt_gate.last_selection = MemorySelection((), (), (), "")
             self.last_v3_diagnostic = {}
+            self._prompt_context_pending = False
+            self._prompt_context_pending_ids = frozenset()
+            self.last_prompt_context = None
 
     def _observe_place_v3(self, packet: ObservationPacket, events: list[MemoryEvent]) -> None:
         """Capture one DINO observation without claiming physical traversal."""

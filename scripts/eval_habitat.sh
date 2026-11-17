@@ -212,13 +212,34 @@ v4_client_enabled=0
 local_graph_client_enabled=0
 rgm_client_enabled=0
 memory_client_enabled=0
-for token in "${client_extra_args[@]}"; do
+prompt_mode="legacy"
+prompt_measurement=0
+for ((arg_index = 0; arg_index < ${#client_extra_args[@]}; arg_index++)); do
+    token="${client_extra_args[$arg_index]}"
     [ "$token" = --memory_enabled ] && memory_client_enabled=1
     [ "$token" = --rgm_enabled ] && rgm_client_enabled=1
     [ "$token" = --rgm_v3_enabled ] && v3_client_enabled=1
     [ "$token" = --rgm_v4_enabled ] && v4_client_enabled=1
     [ "$token" = --local_graph_enabled ] && local_graph_client_enabled=1
+    [ "$token" = --prompt_measurement_enabled ] && prompt_measurement=1
+    if [ "$token" = --memory_prompt_mode ]; then
+        [ $((arg_index + 1)) -lt ${#client_extra_args[@]} ] || {
+            echo "$TAG ERROR: --memory_prompt_mode needs a value" >&2; exit 1; }
+        prompt_mode="${client_extra_args[$((arg_index + 1))]}"
+    elif [[ "$token" == --memory_prompt_mode=* ]]; then
+        prompt_mode="${token#--memory_prompt_mode=}"
+    fi
 done
+if [ "$prompt_mode" != legacy ] || [ "$prompt_measurement" -eq 1 ]; then
+    if [ "$memory_client_enabled" -ne 1 ] || [ "$local_graph_client_enabled" -ne 1 ]; then
+        echo "$TAG ERROR: prompt measurement/modes require --memory_enabled and --local_graph_enabled" >&2
+        exit 1
+    fi
+    if [ "$RESUME" = 1 ]; then
+        echo "$TAG ERROR: prompt measurement/modes require a fresh output and cannot resume" >&2
+        exit 1
+    fi
+fi
 if [ "$local_graph_client_enabled" -eq 1 ]; then
     while [[ "$OUTPUT_ROOT" == */ && "$OUTPUT_ROOT" != / ]]; do
         OUTPUT_ROOT="${OUTPUT_ROOT%/}"
@@ -346,6 +367,10 @@ from pathlib import Path
 
 from lightnav.cli.eval_habitat import build_parser, config_from_args
 from lightnav.memory.local_graph_config import LocalGraphConfig
+from lightnav.memory.prompt_modes import (
+    PROMPT_PROTOCOL_VERSION, effective_layer_activation, mode_plan,
+    resolve_prompt_budget,
+)
 from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.v3_config import RGMV3Config
 from lightnav.memory.v4_config import RGMV4Config
@@ -359,7 +384,7 @@ index = 0
 while index < len(tokens):
     token = tokens[index]
     group = memory_tokens if token.startswith((
-        "--memory_", "--rgm_", "--no-rgm_", "--local_graph_",
+        "--memory_", "--rgm_", "--no-rgm_", "--local_graph_", "--prompt_",
     )) else common_tokens
     group.append(token)
     if token.startswith("--") and index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
@@ -443,6 +468,59 @@ for index, token in enumerate(tokens):
 v4_effective = asdict(RGMV4Config(**v4_values))
 if sum((rgm_effective["enabled"], v3_effective["enabled"], v4_effective["enabled"])) > 1:
     raise SystemExit("legacy RGM, RGM V3 and RGM V4 cannot share one run")
+prompt_mode = "legacy"
+prompt_measurement = "--prompt_measurement_enabled" in tokens
+for index, token in enumerate(tokens):
+    if token == "--memory_prompt_mode" and index + 1 < len(tokens):
+        prompt_mode = tokens[index + 1]
+    elif token.startswith("--memory_prompt_mode="):
+        prompt_mode = token.split("=", 1)[1]
+prompt_plan = mode_plan(prompt_mode)
+prompt_effective = None
+if prompt_mode != "legacy" or prompt_measurement:
+    local_graph_prompt_max_chars = 320
+    max_context_chars = 600
+    for index, token in enumerate(tokens):
+        if token == "--local_graph_prompt_max_chars" and index + 1 < len(tokens):
+            local_graph_prompt_max_chars = int(tokens[index + 1])
+        elif token.startswith("--local_graph_prompt_max_chars="):
+            local_graph_prompt_max_chars = int(token.split("=", 1)[1])
+        elif token == "--memory_max_context_chars" and index + 1 < len(tokens):
+            max_context_chars = int(tokens[index + 1])
+        elif token.startswith("--memory_max_context_chars="):
+            max_context_chars = int(token.split("=", 1)[1])
+    original_char_budget = resolve_prompt_budget(
+        max_context_chars=max_context_chars,
+        local_graph_prompt_max_chars=local_graph_prompt_max_chars,
+    )
+    if prompt_mode == "legacy":
+        prompt_effective = {
+            "prompt_mode": prompt_mode,
+            "protocol_version": PROMPT_PROTOCOL_VERSION,
+            "budget_strategy": "original_char_budget",
+            "original_char_budget_chars": original_char_budget,
+            "layer_activation": {
+                "mode": "legacy", "l1_layer": "original",
+                "l3_layer": "original_spatial_when_inject_else_l1",
+                "combination": "legacy", "l1_prompt_enabled": True,
+                "l3_prompt_enabled": "original_inject_mode",
+                "joint_alignment_enabled": False,
+            },
+        }
+    else:
+        prompt_effective = {
+            "prompt_mode": prompt_mode,
+            "protocol_version": PROMPT_PROTOCOL_VERSION,
+            "budget_strategy": "token_aware_context",
+            "original_char_budget_chars": original_char_budget,
+            "token_budget_sources": {
+                "context_limit": "min(bundle.max_seq_len, processor.model_max_length, backend max_model_len)",
+                "base_prompt": "data_processor.process_sample(base_sample)",
+                "generation_reserve": "engine.max_new_tokens",
+                "safety_margin_tokens": 1,
+            },
+            "layer_activation": effective_layer_activation(prompt_plan),
+        }
 local_graph_effective = None
 if "--local_graph_enabled" in tokens:
     client_argv = [
@@ -528,6 +606,13 @@ if local_graph_effective is not None:
     snapshot["protocol_version"] = local_graph_effective["protocol_version"]
     snapshot["local_graph_effective"] = local_graph_effective
     snapshot["memory_effective"]["local_graph_effective"] = local_graph_effective
+if prompt_effective is not None:
+    if prompt_mode != "legacy":
+        snapshot["protocol_version"] = PROMPT_PROTOCOL_VERSION
+    snapshot["prompt_effective"] = prompt_effective
+    snapshot["memory_effective"]["prompt_mode"] = prompt_mode
+    snapshot["memory_effective"]["prompt_measurement_enabled"] = prompt_measurement
+    snapshot["memory_effective"]["prompt_effective"] = prompt_effective
 if env["SNAPSHOT_PILOT_MANIFEST"]:
     pilot_path = Path(env["SNAPSHOT_PILOT_MANIFEST"])
     snapshot["pilot_manifest_path"] = str(pilot_path)
@@ -695,6 +780,17 @@ for ((i = 0; i < N; i++)); do
         && cat "$OUTPUT_ROOT/shard_$i/memory_diagnostics.jsonl" >> "$diagnostics_tmp"
 done
 mv "$diagnostics_tmp" "$OUTPUT_ROOT/memory_diagnostics.jsonl"
+if [ "$prompt_mode" != legacy ] || [ "$prompt_measurement" -eq 1 ]; then
+    if [ "$FAILED" -ne 0 ]; then
+        echo "$TAG ERROR: prompt measurement/mode shard failed; refusing to merge prompt artifacts" >&2
+        exit 1
+    fi
+    shard_dirs=()
+    for ((i = 0; i < N; i++)); do shard_dirs+=("$OUTPUT_ROOT/shard_$i"); done
+    PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+        "$CLIENT_PYTHON" -m lightnav.habitat.prompt_artifacts merge \
+            --root "$OUTPUT_ROOT" "${shard_dirs[@]}"
+fi
 if [ "$STRICT_FULL_EVAL" = 1 ] && [ "$FAILED" -eq 0 ]; then
     verify_args=(verify "$OUTPUT_ROOT")
     [ -n "$EPISODE_MANIFEST_PATH" ] && verify_args+=(--shared "$EPISODE_MANIFEST_PATH")
