@@ -426,6 +426,32 @@ def test_hierarchical_memory_cli_supports_all_layer_ablations():
         MemoryConfig(strategy="hierarchical", layers=("short", "short"))
 
 
+def test_dart_decay_cli_defaults_off_and_maps_paper_parameters():
+    from lightnav.cli.eval_habitat import build_parser, config_from_args
+    from lightnav.memory.dart_decay_config import DartDecayConfig
+
+    defaults = HabitatEvalConfig(model_path="model")
+    assert defaults.memory.dart_decay == DartDecayConfig()
+    assert defaults.memory.dart_decay.mode == "off"
+    parser = build_parser()
+    args = parser.parse_args([
+        "--model_path", "model", "--memory_enabled", "--memory_strategy", "hierarchical",
+        "--memory_layers", "short,mid,long",
+        "--dart_decay_mode", "decay_only", "--dart_decay_rho", "0.6",
+        "--dart_decay_lambda", "0.2", "--dart_decay_alpha", "0.1",
+        "--dart_decay_w_min", "0.4", "--dart_decay_w_max", "0.9",
+    ])
+    cfg = config_from_args(args)
+    assert cfg.memory.dart_decay == DartDecayConfig(
+        mode="decay_only", rho=0.6, decay_lambda=0.2, alpha=0.1,
+        w_min=0.4, w_max=0.9,
+    )
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--model_path", "model", "--dart_decay_mode", "update_only"])
+    with pytest.raises(ValueError, match="requires memory_enabled"):
+        MemoryConfig(dart_decay=DartDecayConfig(mode="decay_only"))
+
+
 def test_place_memory_cli_maps_local_descriptor_settings():
     from lightnav.cli.eval_habitat import build_parser, config_from_args
 

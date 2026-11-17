@@ -16,6 +16,7 @@ import sys
 
 from lightnav.habitat.runner import HabitatEvalConfig, MemoryConfig, run_habitat_eval
 from lightnav.memory.conceptgraphs_lite import GeometryConfig
+from lightnav.memory.dart_decay_config import DartDecayConfig
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.spatial_l3_config import SpatialL3Config
@@ -266,6 +267,32 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(
             f"--spatial_l3_{name}", type=int, default=getattr(geometry_defaults, name),
         )
+    decay_defaults = DartDecayConfig()
+    p.add_argument(
+        "--dart_decay_mode", choices=("off", "decay_only"),
+        default=decay_defaults.mode,
+        help="DART-VLN read-side memory decay: off (default) or decay_only.",
+    )
+    p.add_argument(
+        "--dart_decay_rho", type=float, default=decay_defaults.rho,
+        help="Novelty EMA coefficient (paper: 0.5).",
+    )
+    p.add_argument(
+        "--dart_decay_lambda", type=float, default=decay_defaults.decay_lambda,
+        help="Recency decay rate (paper: 0.12).",
+    )
+    p.add_argument(
+        "--dart_decay_alpha", type=float, default=decay_defaults.alpha,
+        help="Repetition coefficient (paper: 0.15).",
+    )
+    p.add_argument(
+        "--dart_decay_w_min", type=float, default=decay_defaults.w_min,
+        help="Lower slot-weight clamp (paper: 0.35).",
+    )
+    p.add_argument(
+        "--dart_decay_w_max", type=float, default=decay_defaults.w_max,
+        help="Upper slot-weight clamp (paper: 1.0).",
+    )
     for name, default in (
         ("step0_conditional", True), ("write_gate_enabled", True),
         ("retrieval_gate_enabled", True), ("prompt_gate_enabled", True),
@@ -447,6 +474,14 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                         "ambiguity_margin_ratio", "min_travel_distance_m",
                     )
                 }),
+            ),
+            dart_decay=DartDecayConfig(
+                mode=args.dart_decay_mode,
+                rho=args.dart_decay_rho,
+                decay_lambda=args.dart_decay_lambda,
+                alpha=args.dart_decay_alpha,
+                w_min=args.dart_decay_w_min,
+                w_max=args.dart_decay_w_max,
             ),
         ),
         save_video=args.save_video,

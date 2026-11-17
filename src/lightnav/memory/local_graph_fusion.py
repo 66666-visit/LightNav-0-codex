@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from html import escape
-from typing import Iterable
+from typing import Callable, Iterable
 
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.schemas import LayerMemoryItem, MemoryContext, MemoryEvent, ObservationEvidence
@@ -86,18 +86,24 @@ class LocalGraphFusion:
         self._last_signature: tuple[object, ...] | None = None
         self._last_injected_step: int | None = None
         self._pending: tuple[int, tuple[object, ...], frozenset[str]] | None = None
+        self.last_history_ranking: list[dict[str, object]] = []
+        self.last_selected_evidence_ids: list[str] = []
 
     def reset_episode(self, scene_id: str, episode_id: str, rollout_idx: int) -> None:
         self._episode = (scene_id, episode_id, rollout_idx)
         self._last_signature = None
         self._last_injected_step = None
         self._pending = None
+        self.last_history_ranking = []
+        self.last_selected_evidence_ids = []
 
     def close_episode(self) -> None:
         self._episode = None
         self._last_signature = None
         self._last_injected_step = None
         self._pending = None
+        self.last_history_ranking = []
+        self.last_selected_evidence_ids = []
 
     def discard_selection(self) -> None:
         """Release a context that was rejected by prompt or token budgeting."""
@@ -124,8 +130,11 @@ class LocalGraphFusion:
         rollout_idx: int, step: int, instruction: str,
         current_place_id: str | None, rgb_width: int,
         events: list[MemoryEvent],
+        weight_lookup: Callable[[str, int], float | None] | None = None,
     ) -> MemoryContext | None:
         self._pending = None
+        self.last_history_ranking = []
+        self.last_selected_evidence_ids = []
         if not self.config.enabled:
             return None
         identity = (scene_id, episode_id, rollout_idx)
@@ -144,6 +153,17 @@ class LocalGraphFusion:
             store, scene_id, episode_id, rollout_idx, step,
             instruction, current_place_id,
         )
+        history = self._order_history_by_weight(history, step, weight_lookup)
+        if weight_lookup is not None:
+            self.last_history_ranking = [
+                {
+                    "evidence_id": candidate.record.key,
+                    "label": candidate.label,
+                    "decay_weight": weight_lookup(candidate.record.key, step),
+                    "rank": rank,
+                }
+                for rank, candidate in enumerate(history, 1)
+            ]
         # Preserve one historical anchor when both channels have evidence.
         selected: list[_Candidate] = current[:self.config.max_landmarks]
         if history and selected:
@@ -201,11 +221,27 @@ class LocalGraphFusion:
             ))
         if not items:
             return None
+        self.last_selected_evidence_ids = [item.metadata["evidence_ids"][0] for item in items]
         self._pending = (
             step, signature,
             frozenset(ref.event_id for item in items for ref in item.evidence_refs),
         )
         return MemoryContext(text=_HEADER + "\n" + "\n".join(lines), layer_items=items)
+
+    @staticmethod
+    def _order_history_by_weight(
+        candidates: list[_Candidate], step: int,
+        weight_lookup: Callable[[str, int], float | None] | None,
+    ) -> list[_Candidate]:
+        """Read-side decay ordering; abstain unless every candidate is weighted."""
+        if weight_lookup is None or len(candidates) < 2:
+            return candidates
+        weights = [weight_lookup(candidate.record.key, step) for candidate in candidates]
+        if any(weight is None for weight in weights):
+            return candidates
+        indexed = list(enumerate(candidates))
+        indexed.sort(key=lambda pair: (-float(weights[pair[0]]), pair[0]))
+        return [candidate for _, candidate in indexed]
 
     @staticmethod
     def _current_candidates(

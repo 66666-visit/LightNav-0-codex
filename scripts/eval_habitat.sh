@@ -345,6 +345,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from lightnav.cli.eval_habitat import build_parser, config_from_args
+from lightnav.memory.dart_decay_config import DartDecayConfig
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.v3_config import RGMV3Config
@@ -359,7 +360,7 @@ index = 0
 while index < len(tokens):
     token = tokens[index]
     group = memory_tokens if token.startswith((
-        "--memory_", "--rgm_", "--no-rgm_", "--local_graph_",
+        "--memory_", "--rgm_", "--no-rgm_", "--local_graph_", "--dart_decay_",
     )) else common_tokens
     group.append(token)
     if token.startswith("--") and index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
@@ -443,6 +444,25 @@ for index, token in enumerate(tokens):
 v4_effective = asdict(RGMV4Config(**v4_values))
 if sum((rgm_effective["enabled"], v3_effective["enabled"], v4_effective["enabled"])) > 1:
     raise SystemExit("legacy RGM, RGM V3 and RGM V4 cannot share one run")
+dart_values = asdict(DartDecayConfig())
+for index, token in enumerate(tokens):
+    if not token.startswith("--dart_decay_"):
+        continue
+    flag, separator, inline = token.partition("=")
+    name = flag.removeprefix("--dart_decay_")
+    if name == "lambda":
+        name = "decay_lambda"
+    if name not in dart_values:
+        raise SystemExit(f"unknown DART decay setting in snapshot: {token}")
+    default = dart_values[name]
+    if separator:
+        value = inline
+    elif index + 1 < len(tokens):
+        value = tokens[index + 1]
+    else:
+        raise SystemExit(f"missing value for DART decay setting: {token}")
+    dart_values[name] = type(default)(value)
+dart_effective = asdict(DartDecayConfig(**dart_values))
 local_graph_effective = None
 if "--local_graph_enabled" in tokens:
     client_argv = [
@@ -528,6 +548,9 @@ if local_graph_effective is not None:
     snapshot["protocol_version"] = local_graph_effective["protocol_version"]
     snapshot["local_graph_effective"] = local_graph_effective
     snapshot["memory_effective"]["local_graph_effective"] = local_graph_effective
+if dart_effective["mode"] != "off":
+    snapshot["dart_decay_effective"] = dart_effective
+    snapshot["memory_effective"]["dart_decay_effective"] = dart_effective
 if env["SNAPSHOT_PILOT_MANIFEST"]:
     pilot_path = Path(env["SNAPSHOT_PILOT_MANIFEST"])
     snapshot["pilot_manifest_path"] = str(pilot_path)

@@ -46,6 +46,7 @@ from lightnav.habitat.results import (
     print_objectnav_summary,
     print_vlnce_summary,
 )
+from lightnav.memory.dart_decay_config import DART_DECAY_PROTOCOL_VERSION, DartDecayConfig
 from lightnav.memory.local_graph_config import LOCAL_GRAPH_PROTOCOL_VERSION, LocalGraphConfig
 from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.spatial_l3_config import SpatialL3Config
@@ -86,6 +87,7 @@ class MemoryConfig:
     rgm_v4: RGMV4Config = field(default_factory=RGMV4Config)
     local_graph: LocalGraphConfig = field(default_factory=LocalGraphConfig)
     spatial_l3: SpatialL3Config = field(default_factory=SpatialL3Config)
+    dart_decay: DartDecayConfig = field(default_factory=DartDecayConfig)
 
     def __post_init__(self) -> None:
         if self.top_k < 1 or self.max_context_chars < 1:
@@ -135,6 +137,10 @@ class MemoryConfig:
         if (self.spatial_l3.mode != "off" and self.spatial_l3.seg_model_path
                 == self.extractor_model_path):
             raise ValueError("spatial L3 and L1 must use independent model paths")
+        if not isinstance(self.dart_decay, DartDecayConfig):
+            raise ValueError("memory.dart_decay must be a DartDecayConfig")
+        if self.dart_decay.enabled and not self.enabled:
+            raise ValueError("DART memory decay requires memory_enabled")
         if sum((self.rgm.enabled, self.rgm_v3.enabled, self.rgm_v4.enabled,
                 self.local_graph.enabled)) > 1:
             raise ValueError("legacy RGM, RGM V3, RGM V4 and local graph cannot run together")
@@ -457,6 +463,7 @@ def build_velocity_policy(
             local_graph_config=cfg.memory.local_graph,
             spatial_l3_config=cfg.memory.spatial_l3,
             spatial_extractor=spatial_extractor,
+            dart_decay_config=cfg.memory.dart_decay,
         )
     return TrajVocabVLNCEPolicy(
         engine,
@@ -905,6 +912,28 @@ def _write_spatial_l3_protocol(output_dir: str, config: SpatialL3Config) -> None
         stream.write("\n")
 
 
+def _write_dart_decay_protocol(
+    output_dir: str, config: DartDecayConfig, *, resume: bool = False,
+) -> None:
+    """Record the read-side decay configuration without touching backend markers."""
+    if not config.enabled:
+        return
+    marker = Path(output_dir) / "dart_decay_protocol.json"
+    expected = {
+        "protocol_version": DART_DECAY_PROTOCOL_VERSION,
+        "dart_decay": asdict(config),
+    }
+    if marker.is_file():
+        if json.loads(marker.read_text(encoding="utf-8")) != expected:
+            raise ValueError("DART decay resume configuration differs from its protocol marker")
+        return
+    if resume:
+        raise FileNotFoundError("DART decay resume requires dart_decay_protocol.json")
+    with marker.open("x", encoding="utf-8") as stream:
+        json.dump(expected, stream, indent=2)
+        stream.write("\n")
+
+
 def _guard_non_v3_v4_output_dir(output_dir: str) -> None:
     """Prevent Baseline/Legacy runs from reusing reserved V3/V4 results."""
     path = Path(output_dir)
@@ -912,7 +941,7 @@ def _guard_non_v3_v4_output_dir(output_dir: str) -> None:
         raise ValueError("V3/V4 Pilot results require their matching memory backend")
     if any((path / name).is_file() for name in (
         "rgm_v3_protocol.json", "rgm_v4_protocol.json", "local_graph_protocol.json",
-        "conceptgraphs_l3_protocol.json",
+        "conceptgraphs_l3_protocol.json", "dart_decay_protocol.json",
     )):
         raise ValueError("V3/V4 result directory cannot be reused by another backend")
 
@@ -967,6 +996,7 @@ def run_habitat_eval(
     else:
         _guard_non_v3_v4_output_dir(output_dir)
     os.makedirs(output_dir, exist_ok=True)
+    _write_dart_decay_protocol(output_dir, cfg.memory.dart_decay, resume=cfg.resume)
     results_jsonl = os.path.join(output_dir, "results.jsonl")
     diagnostics_jsonl = os.path.join(output_dir, "memory_diagnostics.jsonl")
     trace_jsonl = Path(output_dir) / "step_trace.jsonl"

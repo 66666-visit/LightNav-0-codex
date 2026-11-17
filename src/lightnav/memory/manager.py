@@ -10,6 +10,12 @@ from time import perf_counter
 from uuid import uuid4
 
 from lightnav.memory.conceptgraphs_lite import ObjectMap, RGBDFrame
+from lightnav.memory.dart_decay_config import DartDecayConfig
+from lightnav.memory.dart_memory_decay import (
+    DartMemoryDecay,
+    evidence_slot_id,
+    object_slot_id,
+)
 from lightnav.memory.episodic_memory import EpisodicMemory
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.local_graph_fusion import LocalGraphFusion
@@ -39,7 +45,7 @@ from lightnav.memory.topological_memory import PlaceObservationResult, Topologic
 from lightnav.memory.v3_config import RGMV3Config
 from lightnav.memory.v3_formatter import V3PromptFormatter
 from lightnav.memory.v3_retrieval import V3Retriever
-from lightnav.memory.v3_schemas import EvidenceRecord
+from lightnav.memory.v3_schemas import EvidenceRecord, canonical_evidence_key
 from lightnav.memory.v3_store import V3MemoryStore
 from lightnav.memory.v4_config import RGMV4Config
 from lightnav.memory.v4_context import (
@@ -77,6 +83,7 @@ class MemoryManager:
         local_graph_config: LocalGraphConfig | None = None,
         spatial_l3_config: SpatialL3Config | None = None,
         spatial_extractor: object | None = None,
+        dart_decay_config: DartDecayConfig | None = None,
     ) -> None:
         if top_k < 0:
             raise ValueError("top_k must be nonnegative")
@@ -122,6 +129,17 @@ class MemoryManager:
         )
         self.last_spatial_frame: RGBDFrame | None = None
         self.last_spatial_diagnostic: dict = {}
+        self.dart_decay_config = dart_decay_config or DartDecayConfig()
+        if not isinstance(self.dart_decay_config, DartDecayConfig):
+            raise ValueError("dart_decay_config must be a DartDecayConfig")
+        self.dart_decay = (
+            DartMemoryDecay(self.dart_decay_config)
+            if self.dart_decay_config.enabled else None
+        )
+        self.last_decay_diagnostic: dict | None = None
+        self._last_place_updates: list[
+            tuple[str, tuple[float, ...] | None, tuple[float, ...] | None, int]
+        ] = []
         if sum((self.rgm_config.enabled, self.v3_config.enabled,
                 self.v4_config.enabled, self.local_graph_config.enabled)) > 1:
             raise ValueError("legacy RGM, RGM V3, RGM V4 and local graph cannot run together")
@@ -258,6 +276,12 @@ class MemoryManager:
             assert self.place_extractor is not None
             self.place_extractor.reset_episode(episode_id, instruction)
         self.working.reset(episode_id, instruction)
+        if self.dart_decay is not None:
+            self.dart_decay.reset_episode(
+                self.v3_scene_id or episode_id, episode_id, rollout_idx,
+            )
+        self.last_decay_diagnostic = None
+        self._last_place_updates = []
         self.last_layer_results = {}
         self.last_place_result = None
         self.last_place_error = None
@@ -326,6 +350,8 @@ class MemoryManager:
                 )
         if self.v3_store is not None:
             self._persist_v3_events(events)
+        if self.dart_decay is not None:
+            self._observe_decay_slots(events)
         if self.v4_state_updater is not None:
             self.v4_state_updater.update(packet.step_id)
         self._pending_action = None
@@ -339,6 +365,56 @@ class MemoryManager:
             raise TypeError("action must be a dict")
         self._pending_action = deepcopy(action)
         self._pending_prediction = prediction
+
+    def _observe_decay_slots(self, events: list[MemoryEvent]) -> None:
+        """Refresh decay metadata only; stored Evidence and geometry are untouched."""
+        assert self.dart_decay is not None
+        episode_id = self.working.state.episode_id
+        v3_enabled = self.v3_store is not None and self.v3_scene_id is not None
+        for event in events:
+            self.dart_decay.observe_evidence(event.event_id, event.step_id)
+            if v3_enabled:
+                key = canonical_evidence_key(
+                    self.v3_scene_id, episode_id, self.v3_rollout_idx, event.event_id,
+                )
+                self.dart_decay.observe_evidence(key, event.step_id)
+        for node_id, old_feature, feature, step_id in self._last_place_updates:
+            self.dart_decay.observe_place(
+                node_id, step_id, feature, old_feature=old_feature,
+            )
+        self._last_place_updates = []
+
+    def _read_memory_context(
+        self, context: MemoryContext | None, step: int,
+    ) -> MemoryContext | None:
+        """Apply DART decay exactly once at the prompt-read boundary."""
+        if self.dart_decay is None:
+            self.last_decay_diagnostic = None
+            return context
+        readout = self.dart_decay.reweight_context(context, step)
+        self.last_decay_diagnostic = readout.diagnostic
+        return readout.context
+
+    def _attach_decay_selection(self, selection: dict) -> None:
+        """Attach candidate-level audit data to the current read diagnostic."""
+        if self.last_decay_diagnostic is not None:
+            self.last_decay_diagnostic["candidate_selection"] = selection
+
+    def _evidence_read_weight(self, evidence_key: str, step: int) -> float | None:
+        """Read-side weight for a Local Graph evidence candidate."""
+        if self.dart_decay is None:
+            return None
+        weight = self.dart_decay.weight_for(evidence_slot_id(evidence_key), step)
+        return weight.decay_weight if weight is not None else None
+
+    def _object_read_weight(
+        self, object_id: str, evidence_id: str, step: int,
+    ) -> float | None:
+        """Read-side weight for an L3 object candidate; geometry is unchanged."""
+        if self.dart_decay is None:
+            return None
+        weight = self.dart_decay.weight_for(object_slot_id(object_id), step)
+        return weight.decay_weight if weight is not None else None
 
     def observe_spatial(
         self, obs: dict, info: dict | None, events: list[MemoryEvent], *, step: int,
@@ -388,6 +464,11 @@ class MemoryManager:
                 transition_record=bool((info or {}).get("spatial_transition_record") is True),
             )
             diagnostic["observed_objects"] = len(observed)
+            if self.dart_decay is not None:
+                for node in observed:
+                    self.dart_decay.observe_object(
+                        node.object_id, step, visit_count=node.observation_count,
+                    )
             diagnostic["object_nodes"] = len(self.spatial_map.objects)
             diagnostic["viewpoints"] = len(self.spatial_map.viewpoints)
             diagnostic["observed_from_edges"] = sum(
@@ -411,7 +492,7 @@ class MemoryManager:
             return None
         if self.last_spatial_frame is None or self.v3_store is None:
             return None
-        return self.spatial_adapter.build(
+        context = self.spatial_adapter.build(
             self.v3_store, self.spatial_map, self.last_spatial_frame,
             scene_id=self.v3_scene_id, episode_id=self.working.state.episode_id,
             rollout_idx=self.v3_rollout_idx, step=step,
@@ -422,7 +503,18 @@ class MemoryManager:
                 self.local_graph_config.prompt_max_chars, self.max_context_chars,
             ),
             min_confidence=self.spatial_l3_config.min_injection_confidence,
+            weight_lookup=(
+                self._object_read_weight if self.dart_decay is not None else None
+            ),
         )
+        context = self._read_memory_context(context, step)
+        if self.spatial_adapter is not None:
+            self._attach_decay_selection({
+                "backend": "spatial_l3",
+                "candidates": list(self.spatial_adapter.last_candidate_ranking[:16]),
+                "selected_object_ids": list(self.spatial_adapter.last_selected_object_ids),
+            })
+        return context
 
     def record_v4_frame_id(self, step: int, frame_id: int) -> None:
         """Bind one memory Step to the TrackingAgent frame actually observed."""
@@ -517,7 +609,7 @@ class MemoryManager:
                 "prompt_chars": len(formatted.text) if formatted is not None else 0,
                 "dropped_candidates": list(self._v4_dropped_candidates),
             }
-            return formatted
+            return self._read_memory_context(formatted, query.current_step)
         if self.v3_store is not None:
             assert self.v3_retriever is not None and self.v3_formatter is not None
             result = self.v3_retriever.retrieve(
@@ -572,15 +664,24 @@ class MemoryManager:
                     ref.event_id for item in context.layer_items for ref in item.evidence_refs
                 )),
             })
-            return context
+            return self._read_memory_context(context, query.current_step)
         if self.strategy == "flat":
             self.last_layer_results = {}
-            return self.retriever.retrieve(
-                query, self.episodic.events, self.scene_graph.nodes, self.scene_graph.edges,
+            return self._read_memory_context(
+                self.retriever.retrieve(
+                    query, self.episodic.events, self.scene_graph.nodes,
+                    self.scene_graph.edges,
+                ),
+                query.current_step,
             )
         layers = self.retrieve_layers(query)
         if not self.rgm_config.enabled:
-            return self.fusion.build(query, layers["short"], layers["mid"], layers["long"])
+            return self._read_memory_context(
+                self.fusion.build(
+                    query, layers["short"], layers["mid"], layers["long"],
+                ),
+                query.current_step,
+            )
         accepted_ids = {
             event.event_id for event in self.episodic.events
             if event.metadata.get("rgm_adopted", False)
@@ -598,7 +699,10 @@ class MemoryManager:
             event.event_id: len(set(event.metadata.get("rgm_temporal_support", {}).get("steps", [])))
             for event in self.episodic.events
         }
-        return self.prompt_gate.select(query, fused, accepted_ids, support_by_event_id)
+        return self._read_memory_context(
+            self.prompt_gate.select(query, fused, accepted_ids, support_by_event_id),
+            query.current_step,
+        )
 
     def retrieve_layers(self, query: MemoryQuery | None = None) -> dict[str, list[LayerMemoryItem]]:
         """Run each enabled hierarchy's own query before cross-layer fusion."""
@@ -626,14 +730,27 @@ class MemoryManager:
         """Build a local navigation card from current RGB and scene evidence."""
         if self.local_graph_fusion is None or self.v3_store is None:
             raise RuntimeError("local graph memory is not active")
-        return self.local_graph_fusion.build(
+        context = self.local_graph_fusion.build(
             self.v3_store, scene_id=self.v3_scene_id,
             episode_id=self.working.state.episode_id,
             rollout_idx=self.v3_rollout_idx, step=step,
             instruction=self.working.state.instruction,
             current_place_id=self.v3_place_id,
             rgb_width=rgb_width, events=events,
+            weight_lookup=(
+                self._evidence_read_weight if self.dart_decay is not None else None
+            ),
         )
+        context = self._read_memory_context(context, step)
+        if self.local_graph_fusion is not None:
+            self._attach_decay_selection({
+                "backend": "local_graph",
+                "candidates": list(self.local_graph_fusion.last_history_ranking[:16]),
+                "selected_evidence_ids": list(
+                    self.local_graph_fusion.last_selected_evidence_ids
+                ),
+            })
+        return context
 
     def reformat_v4_context(self, excluded_evidence_ids: frozenset[str]) -> MemoryContext | None:
         """Retry a V4 token overflow with a whole evidence item removed."""
@@ -662,7 +779,12 @@ class MemoryManager:
         if formatted is None:
             assert self.v4_utilization is not None
             self.v4_utilization.discard_uninjected_selection()
-        return formatted
+        step = (
+            self.v4_state_updater.state.last_update_step
+            if self.v4_state_updater is not None and self.v4_state_updater.state is not None
+            else 0
+        )
+        return self._read_memory_context(formatted, step)
 
     def close_episode(self, *, outcome: str = "unknown") -> None:
         """Clear all episode-local records, including staged actions and RGB summary."""
@@ -699,6 +821,10 @@ class MemoryManager:
                 self.spatial_map.evidence.clear()
                 self.last_spatial_frame = None
                 self.last_spatial_diagnostic = {}
+            if self.dart_decay is not None:
+                self.dart_decay.close_episode()
+            self.last_decay_diagnostic = None
+            self._last_place_updates = []
             self._writer = None
             self._pending_action = None
             self._pending_prediction = None
@@ -761,6 +887,18 @@ class MemoryManager:
     def _persist_v3_events(self, events: list[MemoryEvent]) -> None:
         """Write every valid observed event with a Scene/Episode-qualified key."""
         assert self.v3_store is not None and self.v3_scene_id is not None
+        self._last_place_updates = []
+        has_place_observation = any(
+            event.kind == "place_observation" for event in events
+        )
+        prior_places = (
+            {
+                node.node_id: node.visual_descriptor
+                for node in self.v3_store.nodes_for_scene(self.v3_scene_id)
+                if node.node_type == "place"
+            }
+            if self.dart_decay is not None and has_place_observation else {}
+        )
         instruction = self.working.state.instruction
         instruction_words = set(re.findall(r"[a-z0-9]+", instruction.casefold()))
         direct_by_label: dict[str, str] = {}
@@ -817,6 +955,10 @@ class MemoryManager:
                     visible_landmarks.append((landmark.node_id, stored.key))
             elif event.kind == "place_observation" and "long" in self.layers:
                 node = self.v3_store.add_place(stored)
+                self._last_place_updates.append((
+                    node.node_id, prior_places.get(node.node_id),
+                    stored.visual_descriptor, stored.step,
+                ))
                 for landmark_id, landmark_key in visible_landmarks:
                     self.v3_store.add_relation(
                         node.node_id, landmark_id, "inferred_relation",

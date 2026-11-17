@@ -443,6 +443,7 @@ class TrajVocabVLNCEPolicy:
             "step": step,
             "events_written": len(events),
             "v4_diagnostic": v4_diagnostic,
+            "dart_decay": manager.last_decay_diagnostic,
             "model_input_diagnostic": dict(model_input) if checked else None,
         }
         return text, sample, diagnostic
@@ -631,6 +632,7 @@ class TrajVocabVLNCEPolicy:
             "local_graph_config": asdict(manager.local_graph_config),
             "step": step,
             "events_written": len(events),
+            "dart_decay": manager.last_decay_diagnostic,
             "memory_text": memory_text,
             "actual_injection": actual_injection if checked or context is None else None,
             "actual_historical_injection": bool(historical_ids)
@@ -793,6 +795,7 @@ class TrajVocabVLNCEPolicy:
                 diagnostic = {
                     "step": self._memory_step - 1,
                     "extractor": type(extractor).__name__,
+                    "dart_decay": self.memory_manager.last_decay_diagnostic,
                     "extraction_attempted": attempted,
                     "extraction_error": getattr(extractor, "last_error", None) if attempted else None,
                     "yolo_detection_ms": (

@@ -139,6 +139,27 @@ class LocalGraphEvalLauncherTest(unittest.TestCase):
         self.assertNotIn("--local_graph_enabled", snapshot["common"]["client_non_memory_args"])
 
     @unittest.skipUnless(_HAS_RUNTIME, "LightNav runtime dependencies unavailable")
+    def test_snapshot_records_dart_decay_settings(self) -> None:
+        output = self.root / "decay_snapshot"
+        result = self.launch(
+            _LOCAL_ARGS + " --dart_decay_mode decay_only "
+            "--dart_decay_rho=0.6 --dart_decay_lambda 0.2 "
+            "--dart_decay_alpha 0.1 --dart_decay_w_min 0.4 --dart_decay_w_max 0.9",
+            output,
+        )
+        self.assertNotEqual(result.returncode, 0)  # fake server never becomes ready
+        snapshot = json.loads((output / "config_snapshot.yaml").read_text())
+        expected = {
+            "mode": "decay_only", "rho": 0.6, "decay_lambda": 0.2,
+            "alpha": 0.1, "w_min": 0.4, "w_max": 0.9,
+            "protocol_version": "dart_decay_v1",
+        }
+        self.assertEqual(snapshot["dart_decay_effective"], expected)
+        self.assertEqual(snapshot["memory_effective"]["dart_decay_effective"], expected)
+        self.assertIn("--dart_decay_mode", snapshot["memory_args"])
+        self.assertNotIn("--dart_decay_mode", snapshot["common"]["client_non_memory_args"])
+
+    @unittest.skipUnless(_HAS_RUNTIME, "LightNav runtime dependencies unavailable")
     def test_formal_88_two_gpu_snapshot_keeps_pilot_and_shard_order(self) -> None:
         pilot = self.root / "pilot_manifest.json"
         pilot.write_text(json.dumps({"protocol_version": "rgm_pilot_88_v1"}))

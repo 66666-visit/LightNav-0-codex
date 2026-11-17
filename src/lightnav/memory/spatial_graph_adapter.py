@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from html import escape
+from typing import Callable
 
 import numpy as np
 
@@ -165,11 +166,44 @@ class _SpatialCandidate:
 class SpatialGraphAdapter:
     """Select only instruction-related, evidence-linked historical object facts."""
 
+    def __init__(self) -> None:
+        self.last_candidate_ranking: list[dict[str, object]] = []
+        self.last_selected_object_ids: list[str] = []
+
+    @staticmethod
+    def _order_by_read_weight(
+        candidates: list[_SpatialCandidate], *, step: int,
+        weight_lookup: Callable[[str, str, int], float | None] | None,
+    ) -> list[_SpatialCandidate]:
+        """Apply read-side decay without changing stored object geometry.
+
+        Distance remains the primary navigation prior. The division by the
+        decay weight lets a fresh object overtake a stale one only when the
+        staleness penalty is large enough; when all weights are equal the
+        original distance order is preserved exactly.
+        """
+        if weight_lookup is None or len(candidates) < 2:
+            return candidates
+        weights = [
+            weight_lookup(candidate.object_id, candidate.evidence_id, step)
+            for candidate in candidates
+        ]
+        if any(weight is None or weight <= 0.0 for weight in weights):
+            return candidates
+        indexed = list(enumerate(candidates))
+        indexed.sort(key=lambda pair: (
+            pair[1].distance_m / float(weights[pair[0]]),
+            -pair[1].observation_count,
+            pair[1].object_id,
+        ))
+        return [candidate for _, candidate in indexed]
+
     def build(
         self, store: V3MemoryStore, object_map: object, frame: object, *,
         scene_id: str, episode_id: str, rollout_idx: int, step: int,
         instruction: str, scope: str, max_landmarks: int, prompt_max_chars: int,
         min_confidence: float,
+        weight_lookup: Callable[[str, str, int], float | None] | None = None,
     ) -> MemoryContext | None:
         if store.active_episode != (scene_id, episode_id, rollout_idx):
             raise ValueError("spatial selection requires the active Scene/Episode")
@@ -181,6 +215,8 @@ class SpatialGraphAdapter:
             raise ValueError("step must be nonnegative")
         if not isinstance(max_landmarks, int) or max_landmarks < 1 or prompt_max_chars < 1:
             raise ValueError("spatial prompt limits must be positive")
+        self.last_candidate_ranking = []
+        self.last_selected_object_ids = []
 
         objects = object_map.objects
         viewpoints = object_map.viewpoints
@@ -277,6 +313,22 @@ class SpatialGraphAdapter:
                 },
             ))
         candidates.sort(key=lambda item: (item.distance_m, -item.observation_count, item.object_id))
+        candidates = self._order_by_read_weight(
+            candidates, step=step, weight_lookup=weight_lookup,
+        )
+        if weight_lookup is not None:
+            self.last_candidate_ranking = [
+                {
+                    "object_id": candidate.object_id,
+                    "evidence_id": candidate.evidence_id,
+                    "distance_m": candidate.distance_m,
+                    "decay_weight": weight_lookup(
+                        candidate.object_id, candidate.evidence_id, step,
+                    ),
+                    "rank": rank,
+                }
+                for rank, candidate in enumerate(candidates, 1)
+            ]
         lines: list[str] = []
         items: list[LayerMemoryItem] = []
         used = len(_HEADER)
@@ -312,4 +364,7 @@ class SpatialGraphAdapter:
             ))
         if not items:
             return None
+        self.last_selected_object_ids = list(dict.fromkeys(
+            str(item.metadata["object_id"]) for item in items
+        ))
         return MemoryContext(text=_HEADER + "\n" + "\n".join(lines), layer_items=items)

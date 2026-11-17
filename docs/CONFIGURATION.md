@@ -395,6 +395,73 @@ Token audit. A missing geometric candidate falls back to the original Local
 Graph candidate path; an empty/failed final prompt falls back to the original
 LightNav sample.
 
+### DART-VLN read-side memory decay (independent experiment)
+
+`--dart_decay_mode decay_only` adds the DART-VLN test-time decay weight at the
+memory readout. The default `off` keeps the original LightNav prompt, tokens,
+actions and stored memory unchanged. Only the paper's read-side mode is
+implemented; the write-side `update_only` and `full` ablations are rejected.
+
+| Flag | Default | Meaning |
+| --- | ---: | --- |
+| `--dart_decay_mode` | `off` | `off` or `decay_only` |
+| `--dart_decay_rho` | `0.5` | Novelty EMA coefficient |
+| `--dart_decay_lambda` | `0.12` | Recency decay rate |
+| `--dart_decay_alpha` | `0.15` | Repetition coefficient |
+| `--dart_decay_w_min` | `0.35` | Lower weight clamp |
+| `--dart_decay_w_max` | `1.0` | Upper weight clamp |
+
+For every read memory item the manager computes
+`w = clip(exp(-lambda * age) * (1 - alpha * count / (count + 1))
+* (0.5 + 0.5 * novelty), w_min, w_max)`. Candidate selection in the Local Graph
+history and the L3 spatial adapter uses this weight, and the final
+`MemoryContext` lines are ordered by it. Because the existing prompt adapter is
+a bounded text list (not a differentiable softmax), the weight acts as a
+read-side prior over complete facts; under the character budget it can decide
+which trailing fact is dropped. Stored Evidence, point clouds, object geometry,
+semantic labels and Evidence validation rules are never modified.
+
+The decay metadata is kept in a separate Episode-local registry: age is the
+current Step minus the last observation. Visit count is the persistent L3
+object's `observation_count`; DINO place slots use an Episode-local refresh
+count (1, 2, ...) so a scene-persistent node's earlier-Episode count cannot
+suppress its first read in a new Episode. An L1 Evidence record is an immutable
+one-observation slot and therefore keeps count 1. Novelty is the cosine EMA of
+a real DINO place descriptor pair. LightNav's L1/L3 geometry records do not
+contain a learned per-slot visual embedding; their novelty therefore remains
+at the DART initialization prior (`1.0`, reported as
+`novelty_source=initial_prior`) and is never derived from class names, IoU or
+metric distance. A real novelty update requires the existing DINO place
+extractor; without it the recency term still applies (and repetition for L3).
+
+`--dart_decay_mode decay_only` requires `--memory_enabled` and writes
+`dart_decay_protocol.json` into a fresh output directory. Each per-step
+`memory_diagnostics.jsonl` row carries `dart_decay.memory_age`, `visit_count`,
+`novelty`, `decay_weight`, `decay_applied_count`, `decay_skipped_count`,
+`novelty_source`, the prompt order before/after and the selected slots. These
+fields are evaluator diagnostics only; they are not inserted into the model
+prompt. Episode reset clears the registry, so no weight crosses an Episode
+boundary.
+
+```bash
+lightnav-eval-habitat \
+    --model_path /path/to/LightNav-0 --server tcp://127.0.0.1:5555 \
+    --backend vllm_local --episodes 1 --trace_steps \
+    --output_dir output/dart_decay_smoke \
+    --memory_enabled --memory_strategy hierarchical \
+    --memory_layers short,mid,long --local_graph_enabled \
+    --memory_extractor yolo11 \
+    --memory_extractor_model_path /path/to/yolo11n.pt \
+    --memory_place_enabled --memory_place_model_path /path/to/dinov2-small \
+    --spatial_l3_mode inject \
+    --spatial_l3_seg_model_path /path/to/yolo11n-seg.pt \
+    --dart_decay_mode decay_only
+```
+
+The decay weights affect only prompt selection/order. Any SR/SPL effect must be
+measured on AutoDL against an otherwise identical `off` run; CPU tests cannot
+establish a navigation gain.
+
 The underlying `scripts/eval_habitat.sh` also accepts `STRICT_FULL_EVAL=1`
 for the full-split gate, `RESUME=1` to skip existing completed Episodes,
 `EPISODE_MANIFEST_PATH` to create or compare a shared manifest, `SEED` for
