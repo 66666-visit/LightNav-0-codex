@@ -13,7 +13,10 @@ import pytest
 from lightnav.cli.eval_habitat import build_parser, config_from_args
 from lightnav.habitat.runner import HabitatEvalConfig, MemoryConfig
 from lightnav.memory.local_graph_config import LocalGraphConfig
-from lightnav.memory.prompt_modes import MEMORY_PROMPT_MODES
+from lightnav.memory.prompt_modes import (
+    MEMORY_PROMPT_MODES,
+    SUPPLEMENTAL_ABLATION_PROMPT_MODES,
+)
 from lightnav.memory.spatial_l3_config import SpatialL3Config
 
 
@@ -202,3 +205,25 @@ def test_eval_launcher_snapshot_records_legacy_measurement_without_token_budget(
     assert snapshot["protocol_version"] == "local_graph_v1"
     assert snapshot["prompt_protocol_version"] == "l1_l3_prompt_ablation_v1"
     assert "--prompt_measurement_enabled" in snapshot["memory_args"]
+
+
+@pytest.mark.parametrize("mode", SUPPLEMENTAL_ABLATION_PROMPT_MODES)
+def test_eval_launcher_supplemental_snapshot_keeps_protocols_separate(
+    tmp_path: Path, mode: str,
+) -> None:
+    args = _PROMPT_ARGS.replace("l1_l3_joint", mode)
+    result = _launch_eval_snapshot(tmp_path, args)
+    assert result.returncode != 0  # fake servers never become ready
+    snapshot = json.loads((tmp_path / "out" / "config_snapshot.yaml").read_text())
+    effective = snapshot["prompt_effective"]
+    assert effective["prompt_mode"] == mode
+    assert effective["budget_strategy"] == "token_aware_context"
+    assert effective["original_char_budget_chars"] == 320
+    assert snapshot["protocol_version"] == "local_graph_v1"
+    assert snapshot["prompt_protocol_version"] == "l1_l3_prompt_ablation_v1"
+    assert effective["layer_activation"]["l1_layer"] == "original"
+    assert effective["layer_activation"]["l3_layer"] == "organized"
+    if mode.endswith("_joint"):
+        assert effective["layer_activation"]["l1_preservation"] == (
+            "verbatim_original_builder_lines"
+        )

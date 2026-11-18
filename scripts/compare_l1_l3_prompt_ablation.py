@@ -1,10 +1,15 @@
-"""Compare the six L1/L3 prompt-organization conditions and the legacy control.
+"""Compare the L1/L3 prompt-organization conditions and the legacy control.
 
-Every group must share the same manifest, checkpoint, seed, Habitat config,
-memory backends, detector/segmentation weights and prompt budget; only
-``--memory_prompt_mode`` may differ. Missing measurements stay ``null``: this
-script never substitutes an estimate. A partial run is inspectable with
-``--allow-incomplete`` and is not reported as a completed comparison.
+The historical stage has six experimental groups plus legacy; the supplemental
+stage adds original-L1 + organized-L3 concat and joint. A supplemental root can
+load the completed historical groups from ``--historical-root`` without
+rerunning them. Every group must share the same manifest, checkpoint, seed,
+Habitat config, memory backends, detector/segmentation weights and prompt
+budget; only ``--memory_prompt_mode`` may differ. Across the two stages the
+source hash may differ only with ``--allow-source-difference``. Missing
+measurements stay ``null``: this script never substitutes an estimate. A
+partial run is inspectable with ``--allow-incomplete`` and is not reported as
+a completed comparison.
 
 Outputs (under ``--root``):
   comparison.csv               group-level metrics with 95% bootstrap intervals
@@ -27,26 +32,39 @@ from statistics import fmean
 from typing import Any
 
 try:  # Imported when the repository root is on PYTHONPATH (the launcher does this).
-    from lightnav.habitat.experiment_integrity import validate_manifest
+    from lightnav.habitat.experiment_integrity import (
+        check_pilot_selection,
+        validate_manifest,
+    )
     from lightnav.memory.prompt_modes import (
         ABLATION_PROMPT_MODES,
+        CORE_ABLATION_PROMPT_MODES,
         PROMPT_PROTOCOL_VERSION,
+        SUPPLEMENTAL_ABLATION_PROMPT_MODES,
         effective_layer_activation,
         mode_plan,
         resolve_prompt_budget,
     )
 except ImportError:  # pragma: no cover - direct script execution without PYTHONPATH
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-    from lightnav.habitat.experiment_integrity import validate_manifest
+    from lightnav.habitat.experiment_integrity import (
+        check_pilot_selection,
+        validate_manifest,
+    )
     from lightnav.memory.prompt_modes import (
         ABLATION_PROMPT_MODES,
+        CORE_ABLATION_PROMPT_MODES,
         PROMPT_PROTOCOL_VERSION,
+        SUPPLEMENTAL_ABLATION_PROMPT_MODES,
         effective_layer_activation,
         mode_plan,
         resolve_prompt_budget,
     )
 
+CORE_GROUPS = (*CORE_ABLATION_PROMPT_MODES, "legacy")
+SUPPLEMENTAL_GROUPS = SUPPLEMENTAL_ABLATION_PROMPT_MODES
 GROUPS = (*ABLATION_PROMPT_MODES, "legacy")
+STRATA = ("short", "medium", "long")
 _LEGACY_ACTIVATION = {
     "mode": "legacy", "l1_layer": "original",
     "l3_layer": "original_spatial_when_inject_else_l1",
@@ -110,6 +128,19 @@ def _number(value: Any, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError(f"{name} must be a finite measured number, got {value!r}")
     return float(value)
+
+
+def _binary_metric(value: Any, name: str) -> float:
+    """Read a success metric from either its JSON bool or its numeric form.
+
+    ``runner.py`` writes ``success``/``oracle_success`` as JSON booleans while
+    older summaries and fixtures use 0/1. Both are the same measured episode
+    outcome; treating the boolean as 1.0/0.0 is not an estimate or an imputation.
+    Any other type is rejected.
+    """
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    return _number(value, name)
 
 
 def _optional_number(value: Any, name: str) -> float | None:
@@ -183,8 +214,8 @@ def _metric_summary(
 
 
 def _episode_metrics(result: dict[str, Any]) -> dict[str, float | None]:
-    success = _number(result.get("success"), "success")
-    oracle = _number(result.get("oracle_success"), "oracle_success")
+    success = _binary_metric(result.get("success"), "success")
+    oracle = _binary_metric(result.get("oracle_success"), "oracle_success")
     spl = _number(result.get("spl"), "spl")
     ndtw = _number(result.get("ndtw"), "ndtw")
     ne = _number(result.get("final_distance"), "final_distance")
@@ -247,6 +278,140 @@ def _load_manifest(root: Path) -> tuple[dict[str, Any], list[EpisodeKey]]:
     if len(set(keys)) != len(keys) or len(keys) != EXPECTED_EPISODES:
         raise ValueError("the manifest does not contain 88 unique Episodes")
     return manifest, keys
+
+
+_PROVENANCE_IDENTITY_KEYS = (
+    "episode_manifest_canonical_sha256", "checkpoint_sha256",
+    "checkpoint_config_sha256", "checkpoint_eval_config_sha256",
+    "habitat_config_sha256", "pilot_manifest_sha256",
+    "l1_yolo_model_sha256", "l3_seg_model_sha256", "seed", "gpu_ids",
+)
+
+
+def _check_provenance_compatible(
+    primary: dict[str, Any] | None, historical: dict[str, Any] | None,
+) -> None:
+    """Require both roots to describe the same checkpoint / benchmark run."""
+    if primary is None or historical is None:
+        return
+    for key in _PROVENANCE_IDENTITY_KEYS:
+        if primary.get(key) != historical.get(key):
+            raise ValueError(
+                "historical root differs from the supplemental root at "
+                f"provenance.{key}: {historical.get(key)!r} != {primary.get(key)!r}"
+            )
+
+
+def _normalised_episode_key(key: EpisodeKey) -> EpisodeKey:
+    return str(Path(key[0]).resolve(strict=False)), key[1]
+
+
+def _load_strata(
+    pilot_path: str | Path, manifest: dict[str, Any], expected: list[EpisodeKey],
+) -> dict[EpisodeKey, str]:
+    """Read the fixed pilot's short/medium/long route-length groups.
+
+    The groups come from the same 88-Episode pilot manifest used by evaluation;
+    they are never recomputed from model outcomes or from the evaluated results.
+    """
+    checkpoint = Path(pilot_path)
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"pilot manifest is missing: {checkpoint}")
+    check_pilot_selection(manifest, checkpoint)
+    data = _read_json(checkpoint)
+    rows = data.get("episodes")
+    if not isinstance(rows, list):
+        raise ValueError("pilot manifest requires an episodes list")
+    expected_by_normalised = {
+        _normalised_episode_key(key): key for key in expected
+    }
+    mapping: dict[EpisodeKey, str] = {}
+    for row in rows:
+        pilot_key = _episode_key(row)
+        key = expected_by_normalised.get(_normalised_episode_key(pilot_key))
+        group = row.get("distance_group")
+        if group not in STRATA:
+            raise ValueError(
+                f"pilot Episode {pilot_key} has an invalid distance_group: {group!r}"
+            )
+        if key is None:
+            continue  # reported by the coverage check below
+        if key in mapping:
+            raise ValueError(f"duplicate pilot Episode: {key}")
+        mapping[key] = str(group)
+    if set(mapping) != set(expected):
+        missing = sorted(set(expected) - set(mapping))[:5]
+        extra = sorted(set(mapping) - set(expected))[:5]
+        raise ValueError(
+            "pilot strata do not cover the evaluation manifest: "
+            f"missing={missing}, extra={extra}"
+        )
+    return mapping
+
+
+def _resolve_strata(
+    roots: list[Path], manifest: dict[str, Any], expected: list[EpisodeKey],
+    explicit: Path | None, *, expected_sha256: str | None = None,
+) -> tuple[dict[EpisodeKey, str] | None, str | None]:
+    candidates: list[Path] = []
+    if explicit is not None:
+        candidates.append(explicit)
+    for root in roots:
+        provenance_path = root / "provenance.json"
+        if not provenance_path.is_file():
+            continue
+        provenance = _read_json(provenance_path)
+        value = provenance.get("pilot_manifest_path")
+        if isinstance(value, str) and value:
+            candidates.append(Path(value))
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = str(candidate.resolve(strict=False))
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not candidate.is_file():
+            if explicit is not None and candidate == explicit:
+                raise FileNotFoundError(f"pilot manifest is missing: {candidate}")
+            continue
+        if expected_sha256 is not None:
+            actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            if actual != expected_sha256:
+                raise ValueError(
+                    f"pilot manifest SHA256 differs from provenance: {candidate}"
+                )
+        return _load_strata(candidate, manifest, expected), resolved
+    if explicit is not None:
+        raise FileNotFoundError(f"pilot manifest is missing: {explicit}")
+    return None, None
+
+
+def _select_groups(roots: list[Path], groups: tuple[str, ...] | None) -> tuple[str, ...]:
+    if groups:
+        unknown = sorted(set(groups) - set(GROUPS))
+        if unknown:
+            raise ValueError(f"unknown comparison groups: {unknown}")
+        selected = tuple(dict.fromkeys(groups))
+    else:
+        selected = tuple(
+            mode for mode in GROUPS
+            if any((root / mode).is_dir() for root in roots)
+        )
+    if not selected:
+        raise ValueError("no ablation group directory was found in the given roots")
+    return selected
+
+
+def _group_source(roots: list[Path], mode: str) -> Path:
+    found = [root for root in roots if (root / mode).is_dir()]
+    if len(found) > 1:
+        raise ValueError(
+            f"group {mode} exists in multiple roots; refusing to choose one: "
+            f"{[str(root) for root in found]}"
+        )
+    if not found:
+        raise FileNotFoundError(f"ablation group directory missing for {mode}")
+    return found[0]
 
 
 def _arguments_without_prompt_mode(arguments: list[str]) -> list[str]:
@@ -466,6 +631,8 @@ def _validate_group_identity(
 def _validate_common_configuration(
     groups: dict[str, dict[str, Any]],
     provenance: dict[str, Any] | None = None,
+    *,
+    allow_source_difference: bool = False,
 ) -> dict[str, Any]:
     """Reject any difference outside the single experimental variable."""
     if not groups:
@@ -497,10 +664,22 @@ def _validate_common_configuration(
     reference_protocol = reference.get("prompt_effective", {}).get("protocol_version")
     if reference_protocol != PROMPT_PROTOCOL_VERSION:
         raise ValueError("the config snapshot lacks the prompt-ablation protocol version")
+    reference_common = {
+        key: value for key, value in common.items()
+        if key != "source_python_sha256"
+    }
+    source_hashes: dict[str, str | None] = {}
     for mode, group in groups.items():
         config = group["config"]
         _validate_group_identity(mode, config, provenance)
-        if config.get("common") != common:
+        group_common = config.get("common")
+        if not isinstance(group_common, dict):
+            raise ValueError(f"{mode} config snapshot lacks a common block")
+        source_hashes[mode] = group_common.get("source_python_sha256")
+        if {
+            key: value for key, value in group_common.items()
+            if key != "source_python_sha256"
+        } != reference_common:
             raise ValueError(f"{mode} common checkpoint/seed/server settings differ")
         if config.get("server_args") != reference.get("server_args"):
             raise ValueError(f"{mode} server arguments differ")
@@ -549,12 +728,42 @@ def _validate_common_configuration(
         expected = "original_char_budget" if mode == "legacy" else "token_aware_context"
         if groups[mode]["budget_strategy"] != expected:
             raise ValueError(f"{mode} uses the wrong budget strategy")
+
+    distinct_sources = set(source_hashes.values())
+    if len(distinct_sources) > 1:
+        if not allow_source_difference:
+            raise ValueError(
+                "groups were produced by different src/lightnav source versions; "
+                "pass --allow-source-difference only for the historical-core plus "
+                "supplemental comparison"
+            )
+        core_hashes = {
+            source_hashes[mode] for mode in source_hashes
+            if mode in CORE_GROUPS
+        }
+        supplemental_hashes = {
+            source_hashes[mode] for mode in source_hashes
+            if mode in SUPPLEMENTAL_GROUPS
+        }
+        if len(core_hashes) > 1 or len(supplemental_hashes) > 1:
+            raise ValueError(
+                "source versions differ inside one ablation stage; refusing to mix them"
+            )
+        if not core_hashes or not supplemental_hashes:
+            raise ValueError(
+                "source-version differences are only allowed between the historical "
+                "core groups and the supplemental groups"
+            )
     return {
         "common": common,
         "original_char_budget_chars": expected_budget,
         "budget_strategies": {
             mode: groups[mode]["budget_strategy"] for mode in groups
         },
+        "source_python_sha256": source_hashes,
+        "source_version_difference_allowed": bool(
+            len(distinct_sources) > 1 and allow_source_difference
+        ),
         "protocol_version": PROMPT_PROTOCOL_VERSION,
     }
 
@@ -640,88 +849,168 @@ def _prompt_metric_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def _pair_report(
-    first: str, second: str, expected: list[EpisodeKey],
+def _paired_subset(
+    first: str, second: str, keys: list[EpisodeKey],
     metrics: dict[str, dict[EpisodeKey, dict[str, float | None]]],
     *, samples: int, seed: int,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> dict[str, Any]:
     deltas_by_metric: dict[str, list[float]] = {metric: [] for metric in METRICS}
-    csv_rows: list[dict[str, Any]] = []
     success_first: list[bool] = []
     success_second: list[bool] = []
     paired = 0
-    for key in expected:
+    for key in keys:
         left = metrics[first].get(key)
         right = metrics[second].get(key)
         if left is None or right is None:
             continue
         paired += 1
-        delta = {}
         for metric in METRICS:
             lvalue = left.get(metric)
             rvalue = right.get(metric)
-            difference = (
-                float(rvalue) - float(lvalue)
-                if lvalue is not None and rvalue is not None else None
-            )
-            delta[metric] = difference
-            if difference is not None:
-                deltas_by_metric[metric].append(difference)
+            if lvalue is not None and rvalue is not None:
+                deltas_by_metric[metric].append(float(rvalue) - float(lvalue))
         success_first.append(bool(left["SR_pct"] >= 100.0))
         success_second.append(bool(right["SR_pct"] >= 100.0))
+    return {
+        "paired_count": paired,
+        "metrics": {
+            metric: {
+                "mean": fmean(values) if values else None,
+                "ci95": (
+                    paired_bootstrap_ci(values, samples=samples, seed=seed)
+                    if values else None
+                ),
+                "n": len(values),
+            }
+            for metric, values in deltas_by_metric.items()
+        },
+        "success_flips": {
+            "first_only_success": sum(
+                a and not b for a, b in zip(success_first, success_second)
+            ),
+            "second_only_success": sum(
+                b and not a for a, b in zip(success_first, success_second)
+            ),
+        },
+        "mcnemar": mcnemar_exact(success_first, success_second),
+    }
+
+
+def _pair_report(
+    first: str, second: str, expected: list[EpisodeKey],
+    metrics: dict[str, dict[EpisodeKey, dict[str, float | None]]],
+    *, samples: int, seed: int, strata: dict[EpisodeKey, str] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    report = _paired_subset(
+        first, second, expected, metrics, samples=samples, seed=seed,
+    )
+    if strata:
+        report["strata"] = {
+            group: _paired_subset(
+                first, second,
+                [key for key in expected if strata.get(key) == group],
+                metrics, samples=samples, seed=seed,
+            )
+            for group in STRATA
+        }
+    csv_rows: list[dict[str, Any]] = []
+    for key in expected:
+        left = metrics[first].get(key)
+        right = metrics[second].get(key)
+        if left is None or right is None:
+            continue
+        delta = {
+            metric: (
+                float(right[metric]) - float(left[metric])
+                if left.get(metric) is not None and right.get(metric) is not None
+                else None
+            )
+            for metric in METRICS
+        }
         csv_rows.append({
             "pair": f"{second}_minus_{first}",
             **_key_dict(key),
-            "success_first": int(success_first[-1]),
-            "success_second": int(success_second[-1]),
+            "stratum": strata.get(key) if strata else None,
+            "success_first": int(bool(left["SR_pct"] >= 100.0)),
+            "success_second": int(bool(right["SR_pct"] >= 100.0)),
             **{f"delta_{metric}": delta[metric] for metric in METRICS},
         })
-    summary = {
-        metric: {
-            "mean": fmean(values) if values else None,
-            "ci95": paired_bootstrap_ci(values, samples=samples, seed=seed) if values else None,
-            "n": len(values),
-        }
-        for metric, values in deltas_by_metric.items()
-    }
-    return {
-        "paired_count": paired,
-        "metrics": summary,
-        "success_flips": {
-            "first_only_success": sum(a and not b for a, b in zip(success_first, success_second)),
-            "second_only_success": sum(b and not a for a, b in zip(success_first, success_second)),
-        },
-        "mcnemar": mcnemar_exact(success_first, success_second),
-    }, csv_rows
-
+    return report, csv_rows
 
 def compare(
     root: Path, *, allow_incomplete: bool = False, samples: int = 2000, seed: int = 0,
+    historical_root: Path | None = None, groups: tuple[str, ...] | None = None,
+    pilot_manifest: Path | None = None, allow_source_difference: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Compare one stage, optionally loading historical groups from another root."""
     if samples < 1:
         raise ValueError("bootstrap samples must be positive")
     manifest, expected = _load_manifest(root)
+    roots = [root]
+    historical: Path | None = None
+    if historical_root is not None:
+        historical = historical_root
+        if historical.resolve(strict=False) == root.resolve(strict=False):
+            raise ValueError("historical root must differ from the supplemental root")
+        historical_manifest, historical_expected = _load_manifest(historical)
+        if not _same_manifest(historical_manifest, manifest):
+            raise ValueError("historical root uses a different episode manifest")
+        if historical_expected != expected:
+            raise ValueError("historical root episode order differs")
+        roots.append(historical)
     provenance = _read_json(root / "provenance.json") if (
         root / "provenance.json"
     ).is_file() else None
+    historical_provenance = (
+        _read_json(historical / "provenance.json")
+        if historical is not None and (historical / "provenance.json").is_file()
+        else None
+    )
+    _check_provenance_compatible(provenance, historical_provenance)
     if provenance is not None:
         if provenance.get("episode_manifest_canonical_sha256") != _manifest_digest(manifest):
             raise ValueError("provenance manifest digest differs from episode_manifest.json")
 
+    selected = _select_groups(roots, groups)
+    strata, strata_source = _resolve_strata(
+        roots, manifest, expected, pilot_manifest,
+        expected_sha256=(
+            provenance.get("pilot_manifest_sha256")
+            if provenance is not None else None
+        ) or (
+            historical_provenance.get("pilot_manifest_sha256")
+            if historical_provenance is not None else None
+        ),
+    )
     groups: dict[str, dict[str, Any]] = {}
-    for mode in GROUPS:
+    group_sources: dict[str, str] = {}
+    for mode in selected:
+        if not any((candidate / mode).is_dir() for candidate in roots):
+            if allow_incomplete:
+                continue
+            raise FileNotFoundError(f"ablation group directory missing for {mode}")
+        source_root = _group_source(roots, mode)
         group = _load_group(
-            root, mode, manifest, expected, allow_incomplete=allow_incomplete,
+            source_root, mode, manifest, expected, allow_incomplete=allow_incomplete,
             samples=samples, seed=seed,
         )
         if group is not None:
             groups[mode] = group
+            group_sources[mode] = str(source_root)
     if not groups:
         raise ValueError("no ablation group is present")
-    checks = _validate_common_configuration(groups, provenance)
-    if set(groups) != set(GROUPS) and not allow_incomplete:
-        missing = sorted(set(GROUPS) - set(groups))
+    missing = [mode for mode in selected if mode not in groups]
+    if missing and not allow_incomplete:
         raise ValueError(f"ablation groups are missing: {missing}")
+    checks = _validate_common_configuration(
+        groups, provenance, allow_source_difference=allow_source_difference,
+    )
+    checks.update({
+        "requested_groups": list(selected),
+        "group_source_roots": group_sources,
+        "historical_root": str(historical) if historical is not None else None,
+        "strata_source": strata_source,
+    })
 
     episode_metrics: dict[str, dict[EpisodeKey, dict[str, float | None]]] = {}
     group_report: dict[str, Any] = {}
@@ -734,15 +1023,31 @@ def compare(
             list(metrics.values()), samples=samples, seed=seed,
         )
         prompt = _prompt_statistics(mode, group["prompt_rows"])
+        strata_report = None
+        if strata:
+            strata_report = {}
+            for name in STRATA:
+                keys = [key for key in expected if strata.get(key) == name]
+                stratum_metrics = [
+                    metrics[key] for key in keys if key in metrics
+                ]
+                strata_report[name] = {
+                    "episode_count": len(keys),
+                    "metrics": _metric_summary(
+                        stratum_metrics, samples=samples, seed=seed,
+                    ),
+                }
         group_report[mode] = {
             "completed_episodes": len(group["records"]),
             "missing_episode_ids": [_key_dict(key) for key in group["missing"]],
             "complete": bool(group["complete"] and not group["missing"]),
             "metrics": summary,
+            "strata": strata_report,
             "prompt": prompt,
             "budget_chars": group["budget_chars"],
             "budget_strategy": group["budget_strategy"],
             "prompt_protocol": group["protocol"],
+            "source_root": group_sources.get(mode),
             "measurement_gaps": (
                 [] if summary["TL_m"]["n"] == len(metrics)
                 else ["TL_m unavailable for some Episodes: no path_length"]
@@ -751,34 +1056,47 @@ def compare(
 
     paired: dict[str, Any] = {}
     paired_rows: list[dict[str, Any]] = []
-    for index, first in enumerate(GROUPS):
-        if first not in groups:
-            continue
-        for second in GROUPS[index + 1:]:
-            if second not in groups:
-                continue
-            report, rows = _pair_report(
+    ordered_groups = [mode for mode in GROUPS if mode in groups]
+    for index, first in enumerate(ordered_groups):
+        for second in ordered_groups[index + 1:]:
+            pair_report, rows = _pair_report(
                 first, second, expected, episode_metrics,
-                samples=samples, seed=seed,
+                samples=samples, seed=seed, strata=strata,
             )
-            paired[f"{second}_minus_{first}"] = report
+            paired[f"{second}_minus_{first}"] = pair_report
             paired_rows.extend(rows)
 
     navigation = _navigation_analysis(
         group_report, episode_metrics, expected, samples=samples, seed=seed,
     )
-    complete = all(
-        group_report[mode]["complete"] for mode in groups
-    ) and set(groups) == set(GROUPS)
+    complete = (
+        all(group_report[mode]["complete"] for mode in groups)
+        and set(groups) == set(selected)
+    )
     report = {
         "status": "complete" if complete and not allow_incomplete else "incomplete",
         "protocol_version": PROMPT_PROTOCOL_VERSION,
-        "evaluation_mode": "l1_l3_prompt_ablation_88",
+        "evaluation_mode": (
+            "l1_l3_prompt_ablation_88_extended"
+            if any(mode in SUPPLEMENTAL_GROUPS for mode in groups)
+            else "l1_l3_prompt_ablation_88"
+        ),
         "manifest": manifest,
         "manifest_sha256": _manifest_digest(manifest),
         "provenance": provenance,
+        "historical_provenance": historical_provenance,
         "checks": checks,
         "bootstrap": {"samples": samples, "seed": seed, "unit": "episode"},
+        "strata": {
+            "groups": list(STRATA),
+            "source": strata_source,
+            "episode_counts": (
+                {
+                    name: sum(1 for key in expected if strata.get(key) == name)
+                    for name in STRATA
+                } if strata else None
+            ),
+        },
         "groups": group_report,
         "paired_differences": paired,
         "navigation_analysis": navigation,
@@ -788,6 +1106,7 @@ def compare(
             "conflict_total": "sum of preserved L1/L3 conflicts per step (joint only)",
             "duplicates_total": "sum of deduplicated L1 facts plus joint duplicate facts",
             "prompt_truncation_total": "whole-item omissions plus Processor length retries",
+            "success_metrics": "JSON booleans and 0/1 numeric values both mean measured success",
             "original_builder_truncation": (
                 "The original L1/L3 builders do not expose how many candidate lines "
                 "they dropped for the character budget; their reported truncation "
@@ -796,7 +1115,6 @@ def compare(
         },
     }
     return report, paired_rows
-
 
 def _navigation_analysis(
     group_report: dict[str, Any],
@@ -883,8 +1201,8 @@ def _navigation_analysis(
         default=None,
     )
     all_complete = (
-        set(group_report) == set(GROUPS)
-        and all(group_report[mode]["complete"] for mode in GROUPS)
+        "legacy" in group_report
+        and all(detail["complete"] for detail in group_report.values())
     )
     return {
         "status": "complete" if all_complete else "incomplete",
@@ -917,6 +1235,13 @@ def write_reports(
             for metric, value in detail["metrics"].items():
                 ci = value.get("ci95") or (None, None)
                 writer.writerow([group, "benchmark", metric, value.get("mean"), *ci, value.get("n")])
+            for stratum, stratum_detail in (detail.get("strata") or {}).items():
+                for metric, value in stratum_detail["metrics"].items():
+                    ci = value.get("ci95") or (None, None)
+                    writer.writerow([
+                        group, f"stratum_{stratum}", metric,
+                        value.get("mean"), *ci, value.get("n"),
+                    ])
             for value in _prompt_metric_rows(detail["prompt"]):
                 writer.writerow([
                     group, "prompt", value["metric"], value["mean"], None, None, value["n"],
@@ -925,6 +1250,13 @@ def write_reports(
             for metric, value in detail["metrics"].items():
                 ci = value.get("ci95") or (None, None)
                 writer.writerow([pair, "paired_delta", metric, value.get("mean"), *ci, value.get("n")])
+            for stratum, stratum_detail in (detail.get("strata") or {}).items():
+                for metric, value in stratum_detail["metrics"].items():
+                    ci = value.get("ci95") or (None, None)
+                    writer.writerow([
+                        pair, f"paired_delta_{stratum}", metric,
+                        value.get("mean"), *ci, value.get("n"),
+                    ])
     if paired_rows:
         fieldnames = list(paired_rows[0])
         with (root / "paired_episode_deltas.csv").open(
@@ -946,6 +1278,92 @@ def _fmt(value: Any, digits: int = 2) -> str:
     if isinstance(value, float):
         return f"{value:.{digits}f}"
     return str(value)
+
+
+def _stratum_section(report: dict[str, Any]) -> list[str]:
+    strata = report.get("strata") or {}
+    source = strata.get("source")
+    if not source:
+        return [
+            "## 5. 短 / 中 / 长任务分层",
+            "",
+            "未找到带 `distance_group` 的固定 Pilot manifest，因此不做分层统计；"
+            "不会根据评测结果重新定义分层。",
+            "",
+        ]
+    counts = strata.get("episode_counts") or {}
+    lines = [
+        "## 5. 短 / 中 / 长任务分层",
+        "",
+        "分层来自评测使用的固定 88 Episode Pilot manifest 的 `distance_group`"
+        f"（`{source}`），与模型结果无关。各层 Episode 数："
+        + "，".join(f"{name}={counts.get(name, 0)}" for name in STRATA) + "。",
+        "",
+    ]
+    for index, name in enumerate(STRATA, 1):
+        lines += [
+            f"### 5.{index} {name}",
+            "",
+            "| 组 | n | SR (%) | SPL (%) | NE (m) | nDTW (%) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for mode, detail in report["groups"].items():
+            stratum = (detail.get("strata") or {}).get(name)
+            if not stratum:
+                continue
+            metrics = stratum["metrics"]
+            lines.append(
+                "| `{mode}` | {n} | {sr} | {spl} | {ne} | {ndt} |".format(
+                    mode=mode, n=stratum["episode_count"],
+                    sr=_fmt(metrics["SR_pct"]["mean"]),
+                    spl=_fmt(metrics["SPL_pct"]["mean"]),
+                    ne=_fmt(metrics["NE_m"]["mean"], 3),
+                    ndt=_fmt(metrics["nDTW_pct"]["mean"]),
+                )
+            )
+        lines.append("")
+
+    available = []
+    for first in CORE_GROUPS:
+        for second in SUPPLEMENTAL_GROUPS:
+            forward = f"{second}_minus_{first}"
+            reverse = f"{first}_minus_{second}"
+            if forward in report["paired_differences"]:
+                available.append((first, second, 1.0))
+            elif reverse in report["paired_differences"]:
+                available.append((first, second, -1.0))
+    if available:
+        lines += [
+            "### 5.4 补充组 vs 历史七组的分层配对差异",
+            "",
+            "每格为“补充组 − 历史组”的逐 Episode 平均 ΔSR（百分点）及双侧精确 "
+            "McNemar p 值；ΔSPL/ΔNE 与置信区间保存在 `comparison.json`。",
+            "",
+            "| 补充组 | 历史组 | 短 ΔSR | 短 p | 中 ΔSR | 中 p | 长 ΔSR | 长 p |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for first, second, orientation in available:
+            key = (
+                f"{second}_minus_{first}" if orientation > 0
+                else f"{first}_minus_{second}"
+            )
+            detail = report["paired_differences"][key]
+            cells = []
+            for name in STRATA:
+                stratum = (detail.get("strata") or {}).get(name)
+                if not stratum:
+                    cells.extend(["null", "null"])
+                    continue
+                mean = stratum["metrics"]["SR_pct"]["mean"]
+                cells.append(_fmt(None if mean is None else orientation * mean))
+                cells.append(_fmt(
+                    stratum["mcnemar"]["p_value_exact_two_sided"], 4,
+                ))
+            lines.append(
+                "| `{}` | `{}` | {} |".format(second, first, " | ".join(cells))
+            )
+        lines.append("")
+    return lines
 
 
 def _markdown_report(report: dict[str, Any]) -> str:
@@ -1025,7 +1443,7 @@ def _markdown_report(report: dict[str, Any]) -> str:
         "",
         "实体匹配率只统计联合模式；它等于“由 L3 已记录的 `linked_l1_evidence_id` 确认的配对 / "
         "参与比较的 L3 事实数”。冲突数、L3 检索节点数在未启用对应层时为 `null`。"
-        "Token 列为六个实验组的逐步模型派生预算；legacy 使用原 320 字符预算，"
+        "Token 列为非 legacy 实验组的逐步模型派生预算；legacy 使用原 320 字符预算，"
         "其 token 列为 `null`，`token 回退步数` 不计 legacy。",
         "",
         "## 3. 配对差异与 McNemar 检验",
@@ -1064,8 +1482,8 @@ def _markdown_report(report: dict[str, Any]) -> str:
         lines.append("Legacy 对照缺失，无法进行导航效果判定；不得以 concat 代替 legacy。")
     elif navigation.get("status") != "complete":
         lines.append(
-            "本报告不完整（并非七组全部完成），下表的导航判定只是中间结果，"
-            "不得作为最终结论；补齐七组后重新生成。"
+            "本报告不完整（并非所选组全部完成），下表的导航判定只是中间结果，"
+            "不得作为最终结论；补齐所选组后重新生成。"
         )
     else:
         lines += [
@@ -1107,90 +1525,159 @@ def _markdown_report(report: dict[str, Any]) -> str:
             "结论必须同时看 SR/SPL/NE 与配对检验；若没有 McNemar 显著改善，则本数据不能"
             "证明任一 Prompt 组织方式真正改善导航效果，也不能用文本更短或诊断指标更好来替代。",
             "",
-            "注意：这里有 6 个实验组分别与 legacy 比较，p<0.05 未做多重比较校正；"
+            "注意：每个实验组分别与 legacy 比较，p<0.05 未做多重比较校正；"
             "McNemar 结果是探索性的，需结合 SPL/NE 的方向和效应大小解释，不能仅凭单个 p 值"
             "宣称某种 Prompt 组织方式真正更优。",
         ]
     lines += [
         "",
-        "## 5. 一致性检查",
+        *_stratum_section(report),
+        "## 6. 一致性检查",
         "",
     ]
     checks = report.get("checks", {})
     lines += [
         f"- 共同 checkpoint / seed / server 设置：{'一致' if checks else '未验证'}",
         f"- Legacy 原始字符预算：{checks.get('original_char_budget_chars')}（仅 legacy 使用）",
-        "- 六个实验组使用模型派生的 token 预算：上下文上限、基座 Prompt token 与"
+        "- 非 legacy 实验组使用模型派生的 token 预算：上下文上限、基座 Prompt token 与"
         "生成长度逐 Step 实测；若无法测量则回退原 320 字符并记录原因。",
-        "- 七组仅 `--memory_prompt_mode`（以及 legacy 的 `--prompt_measurement_enabled`）"
+        (
+            "- 历史 core 组与补充组来自不同的 `src/lightnav` 源码版本，"
+            "`--allow-source-difference` 只放行这一跨阶段差异；同一阶段内部仍要求"
+            "源码哈希一致，checkpoint/manifest/seed/pilot/Habitat/其他 memory 参数仍须一致。"
+            if checks.get("source_version_difference_allowed") else
+            "- 所有组来自同一 `src/lightnav` 源码版本。"
+        ),
+        "- 各组仅 `--memory_prompt_mode`（以及 legacy 的 `--prompt_measurement_enabled`）"
         "不同；其余 memory 参数逐 token 相同。",
         "- `l1_l3_original_concat` 不是 legacy：前者拼接两层原文，legacy 走原有"
         "L3/L1 二选一注入路径。",
         "",
-        "## 6. 方法与限制",
+        "## 7. 方法与限制",
         "",
-        "1. 七组使用同一 88 Episode manifest、同一 checkpoint、seed=42、500 步、"
+        "1. 所有组使用同一 88 Episode manifest、同一 checkpoint、seed=42、500 步、"
         "`NO_FORCE_STOP=1`、同一 Habitat 配置与动作解码。",
         "2. `legacy` 保留原 Prompt 文本、注入位置、原 320 字符模块预算与执行路径；"
-        "六个实验组复用同一 `inject_memory_context` / `audit_prompt_injection`，"
+        "非 legacy 的实验组复用同一 `inject_memory_context` / `audit_prompt_injection`，"
         "并按同一步骤使用模型派生 token 预算（上下文上限 - 基座 Prompt token - "
         "生成长度 - 1 token 边界余量）。",
         "3. L1-only 组不会运行 L3 分割与建图；L3-only 组不会调用 L1 的 Local Graph "
         "Prompt 构建器。联合组只用 L3 写入时记录的已确认关联做实体对齐。",
         "4. Legacy 组默认只做测量（`--prompt_measurement_enabled`），不改变其 Prompt "
-        "路径；它用于与六个实验组配对，不能由 `l1_l3_original_concat` 替代。",
+        "路径；它用于与实验组配对，不能由 `l1_l3_original_concat` 替代。",
         "5. 本报告只汇总实测导航结果。代码验收（Prompt 一致性、隔离、预算、实体对齐、去重、"
         "冲突保留、未知关系保护）由测试证明，不能替代真实导航效果。",
         "6. 88 Episode 配对检验的统计功效有限；McNemar 只检验成功/失败翻转，"
         "其余指标的区间是按 Episode 重采样的条件区间，不覆盖场景层面的不确定性。",
         "7. 若服务器未返回 `path_length`，TL 记为 `null`；不会用步数或距离替代。",
-        "8. 原始 L1/L3 构建器不暴露字符预算丢弃计数；`l1_original_only` / "
+        "8. 补充 joint 模式为保持 L1 原文，把已确认对齐的 L3 地图事实写成独立的 "
+        "`Map` 行，而不是合并进 L1 行；因此 `joint_item_count=0`，对齐对数由 "
+        "`aligned_pairs`/`alignment.confirmed` 记录。",
+        "9. 原始 L1/L3 构建器不暴露字符预算丢弃计数；`l1_original_only` / "
         "`l3_original_only` 的截断总数只覆盖 Processor 重试，不能与组织模式的 "
-        "`omitted_items` 直接等价。",
+        "`omitted_items` 直接等价；补充 concat/joint 的 L1 侧同样不暴露该计数。",
     ]
     return "\n".join(lines) + "\n"
 
 
-def verify_only(root: Path, *, samples: int = 2000, seed: int = 0) -> int:
+def verify_only(
+    root: Path, *, samples: int = 2000, seed: int = 0,
+    historical_root: Path | None = None,
+    groups: tuple[str, ...] | None = None,
+    allow_source_difference: bool = False,
+    require_complete: bool = False,
+) -> int:
     """Validate manifest/artifacts/config of every group that already exists."""
     manifest, expected = _load_manifest(root)
-    groups: dict[str, dict[str, Any]] = {}
-    for mode in GROUPS:
-        if not (root / mode).is_dir():
+    roots = [root]
+    if historical_root is not None:
+        if historical_root.resolve(strict=False) == root.resolve(strict=False):
+            raise ValueError("historical root must differ from the supplemental root")
+        historical_manifest, _ = _load_manifest(historical_root)
+        if not _same_manifest(historical_manifest, manifest):
+            raise ValueError("historical root uses a different episode manifest")
+        roots.append(historical_root)
+    provenance = _read_json(root / "provenance.json") if (
+        root / "provenance.json"
+    ).is_file() else None
+    historical_provenance = (
+        _read_json(historical_root / "provenance.json")
+        if historical_root is not None and (historical_root / "provenance.json").is_file()
+        else None
+    )
+    _check_provenance_compatible(provenance, historical_provenance)
+    selected = _select_groups(roots, groups)
+    loaded: dict[str, dict[str, Any]] = {}
+    for mode in selected:
+        if not any((candidate / mode).is_dir() for candidate in roots):
             continue
         group = _load_group(
-            root, mode, manifest, expected, allow_incomplete=True,
-            samples=samples, seed=seed,
+            _group_source(roots, mode), mode, manifest, expected,
+            allow_incomplete=not require_complete, samples=samples, seed=seed,
         )
         if group is not None:
-            groups[mode] = group
-    if not groups:
+            loaded[mode] = group
+    if not loaded:
         raise ValueError("no completed group is available to verify")
-    provenance_path = root / "provenance.json"
-    provenance = (
-        _read_json(provenance_path) if provenance_path.is_file() else None
+    _validate_common_configuration(
+        loaded, provenance, allow_source_difference=allow_source_difference,
     )
-    _validate_common_configuration(groups, provenance)
-    print(f"verified {len(groups)} group(s): {', '.join(groups)}")
+    print(f"verified {len(loaded)} group(s): {', '.join(loaded)}")
     return 0
 
+
+def _parse_groups(value: str | None) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    groups = tuple(
+        item for item in value.replace(",", " ").split() if item
+    )
+    if not groups:
+        raise ValueError("--groups must name at least one mode")
+    return groups
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument(
+        "--historical-root", type=Path,
+        help="root holding the already-completed historical groups",
+    )
+    parser.add_argument(
+        "--groups", help="space/comma separated modes to compare; default: present groups",
+    )
+    parser.add_argument(
+        "--pilot-manifest", type=Path,
+        help="fixed 88-Episode pilot manifest with distance_group for stratification",
+    )
     parser.add_argument("--allow-incomplete", action="store_true")
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument(
+        "--require-complete", action="store_true",
+        help="with --verify-only, require summary/per_episode/88 rows/prompt steps",
+    )
+    parser.add_argument(
+        "--allow-source-difference", action="store_true",
+        help="allow historical-core vs supplemental source hashes to differ",
+    )
     parser.add_argument("--bootstrap-samples", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args(argv)
     try:
+        groups = _parse_groups(args.groups)
         if args.verify_only:
             return verify_only(
                 args.root, samples=args.bootstrap_samples, seed=args.seed,
+                historical_root=args.historical_root, groups=groups,
+                allow_source_difference=args.allow_source_difference,
+                require_complete=args.require_complete,
             )
         report, paired_rows = compare(
             args.root, allow_incomplete=args.allow_incomplete,
             samples=args.bootstrap_samples, seed=args.seed,
+            historical_root=args.historical_root, groups=groups,
+            pilot_manifest=args.pilot_manifest,
+            allow_source_difference=args.allow_source_difference,
         )
         write_reports(args.root, report, paired_rows)
     except (OSError, ValueError, KeyError) as exc:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from html import escape
+
 import numpy as np
 import pytest
 
@@ -15,8 +17,13 @@ from lightnav.memory.conceptgraphs_lite import (
 )
 from lightnav.memory.joint_prompt import JointPromptBuilder
 from lightnav.memory.l1_prompt_organizer import L1Fact, L1PromptOrganizer
-from lightnav.memory.l3_prompt_organizer import L3Fact, L3PromptOrganizer
-from lightnav.memory.schemas import MemoryEvent
+from lightnav.memory.l3_prompt_organizer import L3Fact, L3Organization, L3PromptOrganizer
+from lightnav.memory.schemas import (
+    LayerMemoryItem,
+    MemoryContext,
+    MemoryEvent,
+    ObservationEvidence,
+)
 from lightnav.memory.v3_schemas import EvidenceRecord, canonical_evidence_key
 from lightnav.memory.v3_store import V3MemoryStore
 
@@ -476,3 +483,167 @@ def test_joint_rejects_invalid_budget(max_chars: int) -> None:
     l1, l3 = _organizations([], [])
     with pytest.raises(ValueError):
         JointPromptBuilder().build(l1, l3, step=0, max_chars=max_chars)
+
+
+# ---------------------------------------------------------------------------
+# Lossless joint (original L1 + organized L3)
+# ---------------------------------------------------------------------------
+
+
+def _original_l1_context(
+    *, label: str = "chair", role: str = "current",
+    evidence: tuple[str, ...] = ("l1_chair",),
+    line: str | None = None,
+) -> MemoryContext:
+    text = line or (
+        f"Current RGB: instruction landmark {label} in the center of the current "
+        "view (detected; passage unknown)."
+        if role == "current"
+        else f"Local history: {label} was seen near a visually similar area "
+        "(possible revisit; current direction and passage unknown)."
+    )
+    item = LayerMemoryItem(
+        layer="short" if role == "current" else "long",
+        kind=f"local_graph_{role}_landmark",
+        description=text,
+        step_id=3,
+        confidence=0.9,
+        source="local_graph_fusion",
+        evidence_refs=[
+            ObservationEvidence(
+                event_id=evidence_id, step_id=3, label=label,
+                confidence=0.9, source="yolo",
+            )
+            for evidence_id in evidence
+        ],
+        label=label,
+        metadata={
+            "evidence_ids": list(evidence),
+            "serialized_text": escape(text, quote=False),
+            "provenance": [
+                {"evidence_id": evidence_id, "step": 3, "source": "yolo"}
+                for evidence_id in evidence
+            ],
+            "role": role,
+            "traversability_status": "unknown",
+        },
+    )
+    return MemoryContext(text="[Navigation Memory]\n" + text, layer_items=[item])
+
+
+def _l3_organization(facts: list[L3Fact]) -> L3Organization:
+    return L3Organization(
+        context=None, facts=list(facts), selected_facts=list(facts),
+        candidate_count=len(facts),
+        verified_count=sum(fact.geometry_verified for fact in facts),
+        unverified_count=sum(not fact.geometry_verified for fact in facts),
+    )
+
+
+def test_lossless_joint_keeps_the_exact_l1_line_and_links_l3_separately() -> None:
+    original = _original_l1_context()
+    l3 = _l3_organization([
+        _l3_fact(linked=("l1_chair",), evidence=("l3_chair",)),
+    ])
+
+    joint = JointPromptBuilder().build_preserving_l1(
+        original, l3, step=4, max_chars=500,
+    )
+
+    l1_line = original.layer_items[0].description
+    assert l1_line in joint.context.text
+    assert "now visible" not in joint.context.text
+    assert "not a path" in joint.context.text
+    assert joint.merged_entities == 0  # no synthesized L1+L3 line
+    assert joint.aligned_pairs == 1
+    assert joint.l1_item_count == 1 and joint.l3_item_count == 1
+    assert joint.joint_item_count == 0
+    assert joint.alignments[0].status == "confirmed"
+
+    l1_item = next(
+        item for item in joint.context.layer_items
+        if item.metadata.get("l1_prompt_preserved") is True
+    )
+    assert l1_item.description == l1_line
+    assert l1_item.source == "local_graph_fusion"
+    assert l1_item.evidence_refs == original.layer_items[0].evidence_refs
+    assert l1_item.metadata["aligned_l3_object_ids"] == ["obj"]
+    assert l1_item.metadata["layer_contribution"] == {"l1": True, "l3": False}
+
+    linked_l3 = next(
+        item for item in joint.context.layer_items
+        if item.metadata.get("layer_source") == "l3"
+    )
+    assert linked_l3.metadata["aligned"] is True
+    assert linked_l3.metadata["aligned_l1_evidence_ids"] == ["l1_chair"]
+    assert linked_l3.metadata["aligned_l3_object_id"] == "obj"
+
+
+def test_lossless_joint_keeps_both_lines_for_an_identity_conflict() -> None:
+    original = _original_l1_context(label="chair")
+    l3 = _l3_organization([
+        _l3_fact(linked=("l1_chair",), label="table", evidence=("l3_table",)),
+    ])
+
+    joint = JointPromptBuilder().build_preserving_l1(
+        original, l3, step=4, max_chars=500,
+    )
+
+    assert joint.conflicts and joint.conflicts[0]["type"] == "identity_mismatch"
+    assert original.layer_items[0].description in joint.context.text
+    assert "table" in joint.context.text
+    assert "sources kept, not merged" in joint.context.text
+    assert joint.aligned_pairs == 0
+    assert joint.l1_item_count == 1 and joint.l3_item_count == 1
+
+
+def test_lossless_joint_same_label_without_link_keeps_original_and_uncertain() -> None:
+    original = _original_l1_context(label="chair")
+    l3 = _l3_organization([
+        _l3_fact(linked=(), evidence=("l3_chair",), verified=False),
+    ])
+
+    joint = JointPromptBuilder().build_preserving_l1(
+        original, l3, step=4, max_chars=500,
+    )
+
+    assert joint.merged_entities == 0
+    assert joint.alignments[0].status == "uncertain_same_label"
+    assert joint.conflicts and joint.conflicts[0]["type"] == "geometry_unverified"
+    assert original.layer_items[0].description in joint.context.text
+    assert "map evidence unverified" in joint.context.text
+    assert "Uncertain: chair may be the same object" in joint.context.text
+    assert "m line" not in joint.context.text
+
+
+def test_lossless_joint_without_l1_still_emits_the_organized_l3_card() -> None:
+    l3 = _l3_organization([
+        _l3_fact(linked=(), evidence=("l3_chair",)),
+    ])
+
+    joint = JointPromptBuilder().build_preserving_l1(
+        None, l3, step=4, max_chars=500,
+    )
+
+    assert joint.context is not None
+    assert "chair" in joint.context.text
+    assert "not a path" in joint.context.text
+    assert joint.l1_item_count == 0 and joint.l3_item_count == 1
+
+
+def test_lossless_joint_whole_line_budget_does_not_cut_l1_text() -> None:
+    original = _original_l1_context()
+    l3 = _l3_organization([
+        _l3_fact(linked=("l1_chair",), evidence=("l3_chair",)),
+    ])
+
+    joint = JointPromptBuilder(max_items=3).build_preserving_l1(
+        original, l3, step=4, max_chars=120,
+    )
+
+    assert joint.context is None or len(joint.context.text) <= 120
+    if joint.context is not None:
+        for item in joint.context.layer_items:
+            assert item.metadata["serialized_text"] in escape(
+                joint.context.text, quote=False
+            )

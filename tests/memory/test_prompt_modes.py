@@ -8,7 +8,9 @@ from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.manager import MemoryManager
 from lightnav.memory.prompt_modes import (
     ABLATION_PROMPT_MODES,
+    CORE_ABLATION_PROMPT_MODES,
     MEMORY_PROMPT_MODES,
+    SUPPLEMENTAL_ABLATION_PROMPT_MODES,
     effective_layer_activation,
     mode_plan,
     resolve_prompt_budget,
@@ -18,11 +20,14 @@ from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.spatial_l3_config import SpatialL3Config
 
 
-def test_all_seven_modes_are_explicit_and_six_are_ablated() -> None:
+def test_all_nine_modes_are_explicit_and_eight_are_ablated() -> None:
     assert MEMORY_PROMPT_MODES == (
         "legacy", "l1_original_only", "l1_organized_only", "l3_original_only",
         "l3_organized_only", "l1_l3_original_concat", "l1_l3_joint",
+        "l1_original_l3_organized_concat", "l1_original_l3_organized_joint",
     )
+    assert CORE_ABLATION_PROMPT_MODES == MEMORY_PROMPT_MODES[1:7]
+    assert SUPPLEMENTAL_ABLATION_PROMPT_MODES == MEMORY_PROMPT_MODES[7:]
     assert ABLATION_PROMPT_MODES == MEMORY_PROMPT_MODES[1:]
     plans = {mode: mode_plan(mode) for mode in MEMORY_PROMPT_MODES}
     assert plans["l1_original_only"].uses_l1 and not plans["l1_original_only"].uses_l3
@@ -32,6 +37,12 @@ def test_all_seven_modes_are_explicit_and_six_are_ablated() -> None:
     assert plans["l1_l3_original_concat"].concatenated
     assert plans["l1_l3_joint"].joint
     assert plans["l1_l3_joint"].l1_organized and plans["l1_l3_joint"].l3_organized
+    concat = plans["l1_original_l3_organized_concat"]
+    assert concat.concatenated and concat.l1_source == "original"
+    assert concat.l3_source == "organized" and not concat.preserves_l1_verbatim
+    joint = plans["l1_original_l3_organized_joint"]
+    assert joint.joint and joint.l1_source == "original"
+    assert joint.l3_source == "organized" and joint.preserves_l1_verbatim
 
 
 def test_unknown_or_non_string_mode_is_rejected() -> None:
@@ -84,6 +95,13 @@ def test_layer_activation_is_explicit_for_every_mode() -> None:
     joint = effective_layer_activation(mode_plan("l1_l3_joint"))
     assert joint["l1_prompt_enabled"] and joint["l3_prompt_enabled"]
     assert joint["joint_alignment_enabled"] is True
+    assert "l1_preservation" not in joint
+    lossless = effective_layer_activation(mode_plan(
+        "l1_original_l3_organized_joint"
+    ))
+    assert lossless["l1_prompt_enabled"] and lossless["l3_prompt_enabled"]
+    assert lossless["l1_preservation"] == "verbatim_original_builder_lines"
+    assert lossless["aligned_l3_output"] == "separate_map_line"
 
 
 def test_manager_rejects_modes_without_their_backend() -> None:
@@ -112,3 +130,12 @@ def test_manager_rejects_modes_without_their_backend() -> None:
     )
     assert manager.prompt_budget_chars == 320
     assert manager.plan.mode == "l1_l3_joint"
+    for mode in SUPPLEMENTAL_ABLATION_PROMPT_MODES:
+        manager = MemoryManager(
+            strategy="hierarchical",
+            local_graph_config=LocalGraphConfig(enabled=True),
+            spatial_l3_config=spatial, spatial_extractor=object(),
+            prompt_mode=mode,
+        )
+        assert manager.prompt_budget_chars == 320
+        assert manager.plan.mode == mode

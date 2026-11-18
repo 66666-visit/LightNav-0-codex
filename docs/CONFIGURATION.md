@@ -412,6 +412,8 @@ default) keeps the original Local Graph/L3 execution path byte for byte.
 | `l3_organized_only` | Organized L3 card: instruction-relevant objects, observation count, straight-line range/bearing marked "not a path", traversal evidence, unknown passage |
 | `l1_l3_original_concat` | Original L1 card followed by the original L3 card under the same total budget |
 | `l1_l3_joint` | Organized L1 + L3 fusion with trusted entity alignment, deduplication, preserved conflicts and explicit uncertainty |
+| `l1_original_l3_organized_concat` | Original L1 Local Graph card followed by the organized L3 card under the same total budget |
+| `l1_original_l3_organized_joint` | Original L1 card preserved verbatim + organized L3; trusted alignment/dedup/conflict rules are reused, and an aligned L3 fact is emitted as a separate linked map line instead of rewriting the L1 line |
 
 Every non-legacy mode requires `--memory_enabled`, `--memory_strategy
 hierarchical --memory_layers short,mid,long`, `--local_graph_enabled` and an
@@ -419,11 +421,22 @@ explicit `--output_dir`; L3 modes additionally require `--spatial_l3_mode
 inject` and `--spatial_l3_seg_model_path`. `RESUME=1` is rejected for these
 modes.
 
+The two `l1_original_l3_organized_*` modes are the supplemental follow-up
+experiment. `l1_original_l3_organized_joint` never calls the L1 organizer: the
+original `LocalGraphFusion` layer items are copied into the joint card with
+their original description, evidence references and metadata. Because the
+historical joint card synthesizes a merged L1+L3 sentence from L1 metadata,
+using it here would rewrite the L1 text; the supplemental path therefore keeps
+the exact L1 line and emits the linked L3 map fact as a separate line. This is
+the documented lossless limitation, not a new aligner. Run these two groups
+with `scripts/run_l1_original_l3_organized_ablation.sh`; do not rerun the
+historical seven groups.
+
 **Budget policy.** `min(--memory_max_context_chars,
 --local_graph_prompt_max_chars)` (320 with the defaults) is the original Local
 Graph module's character allowance, not the Qwen3-VL context limit. It therefore
-applies unchanged only to `legacy`. The six experimental modes select whole
-lines against a per-step, model-derived token budget:
+applies unchanged only to `legacy`. The eight non-legacy experimental modes
+select whole lines against the same per-step, model-derived token budget:
 
 - context limit = the smallest known serving cap among
   `bundle.max_seq_len`, `processor.model_max_length` and the backend
@@ -453,9 +466,14 @@ diagnostics into the group root. The root `config_snapshot.yaml` keeps
 `protocol_version` for the Local Graph backend and stores the prompt/experiment
 protocol separately as `prompt_protocol_version`; this prevents one field from
 being overwritten by two protocols. `scripts/run_l1_l3_prompt_ablation.sh` runs
-the six experimental modes plus the unchanged `legacy` control on one fixed
-88-Episode manifest and `scripts/compare_l1_l3_prompt_ablation.py` writes the
-paired comparison. See
+the historical six experimental modes plus the unchanged `legacy` control on
+one fixed 88-Episode manifest. `scripts/run_l1_original_l3_organized_ablation.sh`
+runs only the two supplemental modes; with `--historical-root` it loads the
+completed seven groups for the paired comparison without rerunning them.
+`scripts/compare_l1_l3_prompt_ablation.py` also reads the fixed pilot's
+`distance_group` for short/medium/long statistics and accepts
+`--allow-source-difference` only for the historical-core vs supplemental
+source-hash difference. See
 [L1_L3_DUAL_MEMORY_PROMPT_ABLATION.md](research/L1_L3_DUAL_MEMORY_PROMPT_ABLATION.md).
 
 If inference finished but post-processing failed, use the same root and GPU
@@ -472,7 +490,8 @@ A completed group is verified and skipped; a group with complete shards but no
 completion marker is finalized by `scripts/finalize_l1_l3_group.py` without
 rerunning inference; a group with missing/partial shards stops the launcher and
 is preserved. The resume path checks the provenance manifest/checkpoint/L1/L3/
-Habitat/pilot SHA256, seed and GPU order before touching any group.
+Habitat/pilot SHA256, seed, GPU order, ablation stage and any `--historical-root`
+scope before touching any group; it refuses to silently switch historical roots.
 
 The underlying `scripts/eval_habitat.sh` also accepts `STRICT_FULL_EVAL=1`
 for the full-split gate, `RESUME=1` to skip existing completed Episodes,

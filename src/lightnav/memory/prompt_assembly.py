@@ -3,7 +3,9 @@
 This is the only place the experimental modes select data. The original
 ``LocalGraphFusion`` and ``SpatialGraphAdapter`` builders are called unchanged;
 the organized builders are read-only formatters over the same records. The
-character budget is the original Local Graph budget for every mode.
+supplemental concat/joint modes read the original L1 card and the organized L3
+card; the joint path never runs ``L1PromptOrganizer``. The character budget is
+the original Local Graph budget for every mode.
 """
 
 from __future__ import annotations
@@ -159,15 +161,48 @@ def build_prompt_context(
             diagnostics["layers"]["l3"] = l3_org.diagnostics()
 
     if plan.joint:
+        if l3_org is None:
+            l3_org = L3Organization(context=None, empty_reason="l3_map_unavailable")
+        if plan.preserves_l1_verbatim:
+            # The original Local Graph card is passed through verbatim. The
+            # historical joint builder is not used here because it rebuilds L1
+            # lines from L1Fact metadata, which would rewrite the original text.
+            joint: JointOrganization = joint_builder.build_preserving_l1(
+                l1_context, l3_org, step=step, max_chars=builder_chars,
+            )
+            diagnostics["layers"]["joint"] = joint.diagnostics()
+            diagnostics["conflicts"] = list(joint.conflicts)
+            diagnostics["alignment"] = joint.diagnostics()["alignment"]
+            diagnostics["omitted_items"] = joint.omitted_items
+            diagnostics["l1_omitted_items"] = 0
+            diagnostics["l3_omitted_items"] = l3_org.omitted_items
+            diagnostics["joint_omitted_items"] = joint.omitted_items
+            diagnostics["duplicates_removed"] = joint.duplicates_removed
+            diagnostics["unknown_relation_count"] = joint.unverified_relations
+            diagnostics["layer_item_counts"] = {
+                "l1": joint.l1_item_count, "l3": joint.l3_item_count,
+                "joint": joint.joint_item_count,
+                "aligned": joint.aligned_pairs,
+            }
+            l1_ids = tuple(dict.fromkeys(
+                evidence_id
+                for item in (joint.context.layer_items if joint.context else [])
+                if item.metadata.get("layer_source") == "l1_original"
+                for evidence_id in item.metadata.get("l1_evidence_ids", [])
+            ))
+            return _result(
+                plan, joint.context, "joint", budget_chars, diagnostics,
+                token_budget=token_budget, budget_failure=budget_failure,
+                local_graph_pending=local_graph_pending and bool(l1_ids),
+                l1_evidence_ids=l1_ids,
+            )
         if l1_org is None:
             l1_org = L1PromptOrganizer().build(
                 store, scene_id=scene_id, episode_id=episode_id,
                 rollout_idx=rollout_idx, step=step, instruction=instruction,
                 rgb_width=rgb_width, events=events, max_chars=budget_chars,
             )
-        if l3_org is None:
-            l3_org = L3Organization(context=None, empty_reason="l3_map_unavailable")
-        joint: JointOrganization = joint_builder.build(
+        joint = joint_builder.build(
             l1_org, l3_org, step=step, max_chars=builder_chars,
         )
         diagnostics["layers"]["joint"] = joint.diagnostics()
@@ -195,12 +230,17 @@ def build_prompt_context(
             )),
         )
     if plan.concatenated:
-        context, source, omitted, l1_included, l1_ids = _concat_original_contexts(
+        context, source, omitted, l1_included, l1_ids = _concat_contexts(
             l1_context, l3_context, builder_chars,
+            l3_label=(
+                "l3_organized" if plan.l3_source == "organized" else "l3_original"
+            ),
         )
         diagnostics["omitted_items"] = omitted
         diagnostics["l1_omitted_items"] = 0
-        diagnostics["l3_omitted_items"] = 0
+        diagnostics["l3_omitted_items"] = (
+            l3_org.omitted_items if l3_org is not None else 0
+        )
         diagnostics["joint_omitted_items"] = 0
         diagnostics["duplicates_removed"] = 0
         diagnostics["conflicts"] = []
@@ -289,6 +329,16 @@ def _result(
         ref.event_id for item in (context.layer_items if context is not None else [])
         for ref in item.evidence_refs
     ))
+    # Token/character selection can drop whole lines after the branch that
+    # built the context. The supplemental original-L1 modes filter the L1
+    # confirmation set to surviving lines; historical modes keep their old
+    # behavior so completed groups remain reproducible.
+    if plan.l1_source == "original" and plan.l3_source == "organized":
+        surviving = set(evidence_ids)
+        l1_evidence_ids = tuple(
+            evidence_id for evidence_id in l1_evidence_ids
+            if evidence_id in surviving
+        )
     diagnostics.update({
         "source": source if context is not None else None,
         "context_chars": len(context.text) if context is not None else 0,
@@ -299,7 +349,9 @@ def _result(
     return PromptContextResult(
         plan=plan, context=context, source=source if context is not None else "none",
         budget_chars=budget_chars, diagnostics=diagnostics,
-        local_graph_pending=local_graph_pending and context is not None,
+        local_graph_pending=(
+            local_graph_pending and context is not None and bool(l1_evidence_ids)
+        ),
         l1_evidence_ids=l1_evidence_ids if context is not None else (),
         budget=dict(diagnostics["budget"]), block_tokens=block_tokens,
         omitted_lines=omitted_lines, omitted_items=omitted_items,
@@ -309,14 +361,20 @@ def _result(
     )
 
 
-def _concat_original_contexts(
+def _concat_contexts(
     l1: MemoryContext | None, l3: MemoryContext | None, budget_chars: int,
+    *, l3_label: str,
 ) -> tuple[MemoryContext | None, str, int, bool, tuple[str, ...]]:
-    """Concatenate the two original blocks verbatim, then drop whole trailing lines."""
+    """Concatenate the two selected blocks verbatim, then drop whole lines.
+
+    The historical ``l1_l3_original_concat`` passes the original L1 and original
+    L3 cards. The follow-up concat passes the same original L1 card and the
+    organized L3 card; this function is unchanged apart from its generic name.
+    """
     if l1 is None and l3 is None:
         return None, "none", 0, False, ()
     if l1 is None:
-        return l3, "l3_original", 0, False, ()
+        return l3, l3_label, 0, False, ()
     if l3 is None:
         return l1, "l1_original", 0, True, tuple(dict.fromkeys(
             ref.event_id for item in l1.layer_items for ref in item.evidence_refs

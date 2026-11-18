@@ -20,6 +20,7 @@ from lightnav.memory.yolo_seg_extractor import SegmentationInstance
 MODES = (
     "legacy", "l1_original_only", "l1_organized_only", "l3_original_only",
     "l3_organized_only", "l1_l3_original_concat", "l1_l3_joint",
+    "l1_original_l3_organized_concat", "l1_original_l3_organized_joint",
 )
 
 
@@ -118,6 +119,7 @@ def _obs(step: int) -> tuple[dict, dict]:
 def _policy(
     mode: str, *, spatial_mode: str = "inject", labels: tuple[str, ...] = ("chair",),
     seg_explode: bool = False, reject_memory_once: bool = False,
+    reactivation_steps: int = 8,
 ):
     detections = {
         step: SceneExtraction(
@@ -131,7 +133,9 @@ def _policy(
     }
     manager = MemoryManager(
         extractor=MockSceneExtractor(detections), strategy="hierarchical",
-        local_graph_config=LocalGraphConfig(enabled=True),
+        local_graph_config=LocalGraphConfig(
+            enabled=True, reactivation_steps=reactivation_steps,
+        ),
         spatial_l3_config=SpatialL3Config(
             mode=spatial_mode, seg_model_path="/fake/yolo11n-seg.pt",
             seg_every_n_steps=1,
@@ -204,6 +208,83 @@ def test_l3_only_mode_never_calls_the_local_graph_builder_or_injects_l1_text() -
     assert "[Navigation Context - L1" not in prompt
     assert "Spatial history:" in prompt or "[Navigation Context - L3]" in prompt
     assert "l1" not in policy.last_memory_diagnostic["prompt_context"]["layers"]
+
+
+def test_original_l1_organized_l3_concat_keeps_the_original_l1_card() -> None:
+    policy, manager, engine = _policy(
+        "l1_original_l3_organized_concat", reactivation_steps=1,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the new concat mode must not run the L1 organizer")
+
+    manager.l1_prompt_organizer.build = forbidden
+    _run(policy, 3)
+
+    prompt = engine.samples[-1]["conversations"][0]["value"]
+    assert "[Navigation Memory]" in prompt
+    assert "Current RGB:" in prompt
+    assert "[Navigation Context - L3]" in prompt
+    assert "not a path" in prompt
+    diagnostic = policy.last_memory_diagnostic["prompt_context"]
+    assert diagnostic["source"] == "concat"
+    assert diagnostic["layers"]["l1"]["source"] == "local_graph_fusion"
+    assert diagnostic["layers"]["l3"]["source"] == "l3_prompt_organizer"
+
+
+def test_lossless_joint_keeps_original_l1_and_does_not_run_the_l1_organizer() -> None:
+    policy, manager, engine = _policy(
+        "l1_original_l3_organized_joint", reactivation_steps=1,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("lossless joint mode must not run the L1 organizer")
+
+    manager.l1_prompt_organizer.build = forbidden
+    _run(policy, 3)
+
+    prompt = engine.samples[-1]["conversations"][0]["value"]
+    assert "[Navigation Context - L1+L3]" in prompt
+    assert "Current RGB:" in prompt
+    assert "Now:" not in prompt
+    assert "not a path" in prompt
+    diagnostic = policy.last_memory_diagnostic["prompt_context"]
+    assert diagnostic["source"] == "joint"
+    assert diagnostic["layers"]["l1"]["source"] == "local_graph_fusion"
+    assert diagnostic["layers"]["joint"]["source"] == "joint_prompt_builder"
+    assert diagnostic["layer_item_counts"]["l1"] >= 1
+    assert diagnostic["layer_item_counts"]["l3"] >= 1
+
+
+def test_lossless_joint_keeps_the_exact_l1_lines_from_l1_original_only() -> None:
+    l1_policy, l1_manager, _ = _policy(
+        "l1_original_only", reactivation_steps=1,
+    )
+    joint_policy, joint_manager, _ = _policy(
+        "l1_original_l3_organized_joint", reactivation_steps=1,
+    )
+    for step in range(3):
+        obs, info = _obs(step)
+        l1_policy.act(obs, info)
+        joint_policy.act(obs, info)
+        l1_context = l1_manager.last_prompt_context
+        joint_context = joint_manager.last_prompt_context
+        assert l1_context is not None and joint_context is not None
+        l1_lines = [
+            item.metadata["serialized_text"]
+            for item in (l1_context.context.layer_items
+                         if l1_context.context is not None else [])
+        ]
+        joint_lines = [
+            item.metadata["serialized_text"]
+            for item in (joint_context.context.layer_items
+                         if joint_context.context is not None else [])
+            if item.metadata.get("l1_prompt_preserved") is True
+        ]
+        assert joint_lines == l1_lines
+        assert l1_context.diagnostics["layers"]["l1"]["prompt_chars"] == (
+            joint_context.diagnostics["layers"]["l1"]["prompt_chars"]
+        )
 
 
 def test_joint_mode_aligns_and_records_layer_contributions() -> None:

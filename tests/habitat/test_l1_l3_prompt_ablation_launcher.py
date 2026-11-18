@@ -13,13 +13,19 @@ import pytest
 from lightnav.habitat.prompt_artifacts import build_prompt_protocol
 from lightnav.habitat.runner import MemoryConfig
 from lightnav.memory.local_graph_config import LocalGraphConfig
-from lightnav.memory.prompt_modes import ABLATION_PROMPT_MODES
+from lightnav.memory.prompt_modes import (
+    CORE_ABLATION_PROMPT_MODES,
+    SUPPLEMENTAL_ABLATION_PROMPT_MODES,
+)
 from lightnav.memory.spatial_l3_config import SpatialL3Config
 
-_MODES = (*ABLATION_PROMPT_MODES, "legacy")
+_MODES = (*CORE_ABLATION_PROMPT_MODES, "legacy")
 
 _REPO = Path(__file__).resolve().parents[2]
 _LAUNCHER = _REPO / "scripts" / "run_l1_l3_prompt_ablation.sh"
+_SUPPLEMENTAL_LAUNCHER = (
+    _REPO / "scripts" / "run_l1_original_l3_organized_ablation.sh"
+)
 _SCENES = [f"/data/scene{index:03d}" for index in range(11)]
 _GROUPS = ["short"] * 3 + ["medium"] * 3 + ["long"] * 2
 
@@ -94,12 +100,15 @@ def _inputs(tmp_path: Path) -> dict[str, str]:
     }
 
 
-def _run(tmp_path: Path, env_updates: dict[str, str], *args: str):
+def _run(
+    tmp_path: Path, env_updates: dict[str, str], *args: str,
+    launcher: Path = _LAUNCHER,
+):
     env = dict(os.environ)
     env.update(_inputs(tmp_path))
     env.update(env_updates)
     return subprocess.run(
-        ["bash", str(_LAUNCHER), *args], cwd=_REPO, env=env,
+        ["bash", str(launcher), *args], cwd=_REPO, env=env,
         text=True, capture_output=True, check=False, timeout=120,
     )
 
@@ -127,7 +136,7 @@ def test_preflight_writes_provenance_hashes_and_never_creates_a_manifest(
     assert (output / "checkpoint.sha256").read_text().startswith(
         provenance["checkpoint_sha256"]
     )
-    assert not any((output / mode).exists() for mode in ABLATION_PROMPT_MODES)
+    assert not any((output / mode).exists() for mode in CORE_ABLATION_PROMPT_MODES)
 
 
 def test_wrong_episode_count_stops_before_writing_any_manifest(tmp_path: Path) -> None:
@@ -163,7 +172,7 @@ def test_dry_run_writes_nothing_and_still_reports_the_six_modes(tmp_path: Path) 
     result = _run(tmp_path, {}, "--dry-run", "--output-root", str(output))
     assert result.returncode == 0, result.stderr
     assert not output.exists()
-    for mode in ABLATION_PROMPT_MODES:
+    for mode in _MODES:
         assert mode in result.stdout
 
 
@@ -191,7 +200,9 @@ def _memory_config(mode: str) -> MemoryConfig:
     )
 
 
-def _write_provenance(root: Path, manifest: dict) -> None:
+def _write_provenance(
+    root: Path, manifest: dict, *, pilot_sha256: str = "b" * 64,
+) -> None:
     from hashlib import sha256
 
     digest = sha256(
@@ -203,7 +214,7 @@ def _write_provenance(root: Path, manifest: dict) -> None:
         "checkpoint_eval_config_sha256": "d" * 64,
         "habitat_config_sha256": "f" * 64,
         "episode_manifest_canonical_sha256": digest,
-        "pilot_manifest_sha256": "b" * 64,
+        "pilot_manifest_sha256": pilot_sha256,
         "seed": 42,
         "gpu_ids": ["0"],
     }), encoding="utf-8")
@@ -228,6 +239,17 @@ def _group_artifacts(root: Path, mode: str, manifest: dict) -> None:
     group = root / mode
     group.mkdir()
     (group / "episode_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    provenance = (
+        json.loads((root / "provenance.json").read_text(encoding="utf-8"))
+        if (root / "provenance.json").is_file() else {}
+    )
+    model_weights = provenance.get("checkpoint_sha256", "e" * 64)
+    model_config = provenance.get("checkpoint_config_sha256", "c" * 64)
+    eval_config = provenance.get("checkpoint_eval_config_sha256", "d" * 64)
+    habitat_config = provenance.get("habitat_config_sha256", "f" * 64)
+    gpu_ids = provenance.get("gpu_ids", ["0"])
+    pilot_path = provenance.get("pilot_manifest_path", "/data/pilot_manifest.json")
+    pilot_sha = provenance.get("pilot_manifest_sha256", "b" * 64)
     memory = _memory_config(mode)
     protocol = build_prompt_protocol(memory)
     (group / "prompt_protocol.json").write_text(json.dumps(protocol), encoding="utf-8")
@@ -235,11 +257,14 @@ def _group_artifacts(root: Path, mode: str, manifest: dict) -> None:
         "common": {
             "task": "vlnce", "split": "val_unseen", "expected_episodes": 88,
             "max_steps": 500, "force_stop_at_max_steps": False, "seed": 42,
-            "model_weights_sha256": "e" * 64,
-            "model_config_sha256": "c" * 64,
-            "eval_config_sha256": "d" * 64,
-            "habitat_config_sha256": "f" * 64,
-            "gpu_ids": ["0"],
+            "model_weights_sha256": model_weights,
+            "model_config_sha256": model_config,
+            "eval_config_sha256": eval_config,
+            "habitat_config_sha256": habitat_config,
+            "gpu_ids": gpu_ids,
+            "source_python_sha256": (
+                "1" * 64 if mode in SUPPLEMENTAL_ABLATION_PROMPT_MODES else "2" * 64
+            ),
         },
         "memory_args": [
             "--memory_enabled", "--memory_extractor", "yolo11",
@@ -267,8 +292,8 @@ def _group_artifacts(root: Path, mode: str, manifest: dict) -> None:
         "server_args": [],
         "protocol_version": "local_graph_v1",
         "prompt_protocol_version": PROMPT_PROTOCOL_VERSION,
-        "pilot_manifest_path": "/data/pilot_manifest.json",
-        "pilot_manifest_sha256": "b" * 64,
+        "pilot_manifest_path": pilot_path,
+        "pilot_manifest_sha256": pilot_sha,
     }
     (group / "config_snapshot.yaml").write_text(json.dumps(config), encoding="utf-8")
     results = []
@@ -456,3 +481,190 @@ def test_marked_complete_group_with_incomplete_prompt_steps_is_rejected(
     diagnostics.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="lacks complete prompt diagnostics"):
         verify_only(root)
+
+
+def test_oracle_success_json_booleans_are_counted_as_measured_outcomes(
+    tmp_path: Path,
+) -> None:
+    from scripts.compare_l1_l3_prompt_ablation import compare
+
+    root = tmp_path / "ablation"
+    root.mkdir()
+    manifest = _manifest()
+    (root / "episode_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    _write_provenance(root, manifest)
+    for mode in _MODES:
+        _group_artifacts(root, mode, manifest)
+    path = root / "l1_original_only" / "results.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    for row in rows:
+        row["success"] = bool(row["success"])
+        row["oracle_success"] = bool(row["oracle_success"])
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    report, _ = compare(root)
+    assert report["groups"]["l1_original_only"]["metrics"]["OSR_pct"]["mean"] == 50.0
+
+
+def test_supplemental_groups_compare_against_the_historical_seven(
+    tmp_path: Path,
+) -> None:
+    from scripts.compare_l1_l3_prompt_ablation import compare, write_reports
+
+    manifest = _manifest()
+    historical = tmp_path / "historical"
+    supplemental = tmp_path / "supplemental"
+    historical.mkdir()
+    supplemental.mkdir()
+    pilot = tmp_path / "pilot_manifest.json"
+    pilot.write_text(json.dumps(_pilot_manifest()), encoding="utf-8")
+    from hashlib import sha256
+
+    pilot_sha = sha256(pilot.read_bytes()).hexdigest()
+    for root in (historical, supplemental):
+        (root / "episode_manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8",
+        )
+        _write_provenance(root, manifest, pilot_sha256=pilot_sha)
+    for mode in _MODES:
+        _group_artifacts(historical, mode, manifest)
+    for mode in SUPPLEMENTAL_ABLATION_PROMPT_MODES:
+        _group_artifacts(supplemental, mode, manifest)
+
+    with pytest.raises(ValueError, match="different.*source versions|source versions"):
+        compare(supplemental, historical_root=historical)
+    report, paired_rows = compare(
+        supplemental, historical_root=historical,
+        allow_source_difference=True, pilot_manifest=pilot,
+    )
+    assert report["status"] == "complete"
+    assert set(report["groups"]) == set(_MODES) | set(SUPPLEMENTAL_ABLATION_PROMPT_MODES)
+    assert len(report["paired_differences"]) == 36
+    assert report["navigation_analysis"]["status"] == "complete"
+    assert report["checks"]["source_version_difference_allowed"] is True
+    assert report["strata"]["episode_counts"] == {
+        "short": 33, "medium": 33, "long": 22,
+    }
+    for mode in SUPPLEMENTAL_ABLATION_PROMPT_MODES:
+        assert set(report["groups"][mode]["strata"]) == {"short", "medium", "long"}
+        assert report["groups"][mode]["strata"]["short"]["episode_count"] == 33
+    for other in _MODES:
+        for mode in SUPPLEMENTAL_ABLATION_PROMPT_MODES:
+            forward = f"{mode}_minus_{other}"
+            reverse = f"{other}_minus_{mode}"
+            detail = report["paired_differences"][
+                forward if forward in report["paired_differences"] else reverse
+            ]
+            assert set(detail["strata"]) == {"short", "medium", "long"}
+
+    write_reports(supplemental, report, paired_rows)
+    text = (supplemental / "final_report.md").read_text()
+    assert "短 / 中 / 长任务分层" in text
+    assert "补充组 vs 历史七组" in text
+    assert "stratum_short" in (supplemental / "comparison.csv").read_text()
+    assert "stratum" in (supplemental / "paired_episode_deltas.csv").read_text()
+
+
+def test_supplemental_wrapper_only_lists_the_two_new_modes(tmp_path: Path) -> None:
+    output = tmp_path / "supplemental"
+    result = _run(
+        tmp_path, {}, "--dry-run", "--output-root", str(output),
+        launcher=_SUPPLEMENTAL_LAUNCHER,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not output.exists()
+    for mode in SUPPLEMENTAL_ABLATION_PROMPT_MODES:
+        assert mode in result.stdout
+    for mode in ("l1_original_only", "l1_l3_joint", "legacy"):
+        assert f"--memory_prompt_mode {mode}\n" not in result.stdout
+    assert "l1_original_l3_organized_concat" in result.stdout
+    assert "l1_original_l3_organized_joint" in result.stdout
+
+
+def test_supplemental_preflight_reuses_historical_root_without_rerunning_it(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest()
+    probe = tmp_path / "probe"
+    created = _run(
+        tmp_path, {}, "--preflight-only", "--output-root", str(probe),
+    )
+    assert created.returncode == 0, created.stderr
+    historical = tmp_path / "historical"
+    historical.mkdir()
+    (historical / "episode_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8",
+    )
+    (historical / "provenance.json").write_text(
+        (probe / "provenance.json").read_text(), encoding="utf-8",
+    )
+    for mode in _MODES:
+        _group_artifacts(historical, mode, manifest)
+
+    output = tmp_path / "supplemental"
+    result = _run(
+        tmp_path, {},
+        "--preflight-only", "--output-root", str(output),
+        "--historical-root", str(historical),
+        launcher=_SUPPLEMENTAL_LAUNCHER,
+    )
+    assert result.returncode == 0, result.stderr
+    saved = json.loads((output / "provenance.json").read_text())
+    assert saved["ablation_stage"] == "supplemental"
+    assert saved["modes"] == list(SUPPLEMENTAL_ABLATION_PROMPT_MODES)
+    assert saved["legacy_group_required"] is False
+    assert saved["historical_root"] == str(historical.resolve())
+    assert "historical root verified" in result.stdout
+    # Preflight never creates or reruns a historical group.
+    for mode in _MODES:
+        assert not (output / mode).exists()
+
+    # A resume cannot silently point at a different historical root.
+    import shutil
+
+    other_historical = tmp_path / "historical_other"
+    shutil.copytree(historical, other_historical)
+    mismatched = _run(
+        tmp_path, {},
+        "--resume", "--dry-run", "--output-root", str(output),
+        "--historical-root", str(other_historical),
+        launcher=_SUPPLEMENTAL_LAUNCHER,
+    )
+    assert mismatched.returncode != 0
+    assert "resume provenance historical_root differs" in mismatched.stderr
+
+    # Strict preflight rejects a marker-complete group with missing artifacts.
+    (historical / "l1_original_only" / "summary.json").unlink()
+    strict_output = tmp_path / "supplemental_strict"
+    strict = _run(
+        tmp_path, {},
+        "--preflight-only", "--output-root", str(strict_output),
+        "--historical-root", str(historical),
+        launcher=_SUPPLEMENTAL_LAUNCHER,
+    )
+    assert strict.returncode != 0
+    assert "summary.json" in strict.stderr or "required file" in strict.stderr
+
+
+def test_historical_root_requires_the_supplemental_stage(tmp_path: Path) -> None:
+    result = _run(
+        tmp_path, {}, "--preflight-only",
+        "--output-root", str(tmp_path / "out"),
+        "--historical-root", str(tmp_path / "historical"),
+    )
+    assert result.returncode != 0
+    assert "--historical-root is only valid with --supplemental" in result.stderr
+
+
+def test_resume_refuses_to_mix_core_and_supplemental_stages(tmp_path: Path) -> None:
+    output = tmp_path / "supplemental"
+    created = _run(
+        tmp_path, {}, "--preflight-only", "--output-root", str(output),
+        launcher=_SUPPLEMENTAL_LAUNCHER,
+    )
+    assert created.returncode == 0, created.stderr
+    resumed = _run(
+        tmp_path, {}, "--resume", "--dry-run", "--output-root", str(output),
+    )
+    assert resumed.returncode != 0
+    assert "resume provenance modes differ" in resumed.stderr

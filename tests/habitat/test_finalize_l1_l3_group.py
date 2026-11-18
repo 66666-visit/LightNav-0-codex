@@ -13,6 +13,7 @@ from lightnav.habitat.runner import MemoryConfig
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.prompt_modes import (
     PROMPT_PROTOCOL_VERSION,
+    SUPPLEMENTAL_ABLATION_PROMPT_MODES,
     effective_layer_activation,
     mode_plan,
 )
@@ -38,8 +39,11 @@ def _episode_rows(count: int = 4) -> list[dict[str, str]]:
     ]
 
 
-def _group(tmp_path: Path, *, old_conflict_shape: bool = False) -> Path:
-    root = tmp_path / "l1_original_only"
+def _group(
+    tmp_path: Path, *, old_conflict_shape: bool = False,
+    mode: str = "l1_organized_only",
+) -> Path:
+    root = tmp_path / mode
     root.mkdir(parents=True)
     episodes = _episode_rows()
     manifest = {"split": "val_unseen", "expected_count": 4, "episodes": episodes}
@@ -62,11 +66,11 @@ def _group(tmp_path: Path, *, old_conflict_shape: bool = False) -> Path:
         "protocol_version": "local_graph_v1",
     }
     prompt_effective = {
-        "prompt_mode": "l1_organized_only",
+        "prompt_mode": mode,
         "protocol_version": PROMPT_PROTOCOL_VERSION,
         "budget_strategy": "token_aware_context",
         "original_char_budget_chars": 320,
-        "layer_activation": effective_layer_activation(mode_plan("l1_organized_only")),
+        "layer_activation": effective_layer_activation(mode_plan(mode)),
     }
     snapshot = {
         "protocol_version": (
@@ -89,7 +93,7 @@ def _group(tmp_path: Path, *, old_conflict_shape: bool = False) -> Path:
     if not old_conflict_shape:
         snapshot["prompt_protocol_version"] = PROMPT_PROTOCOL_VERSION
     (root / "config_snapshot.yaml").write_text(json.dumps(snapshot), encoding="utf-8")
-    protocol = build_prompt_protocol(_memory())
+    protocol = build_prompt_protocol(_memory(mode))
     marker = {key: value for key, value in effective.items() if key != "enabled"}
     for shard_index in range(2):
         shard = root / f"shard_{shard_index}"
@@ -136,7 +140,7 @@ def _group(tmp_path: Path, *, old_conflict_shape: bool = False) -> Path:
                 "episode_id": episode_id,
                 "habitat_episode_id": row["episode_id"],
                 "scene_id": row["scene_id"],
-                "step": 0, "mode": "l1_organized_only",
+                "step": 0, "mode": mode,
                 "prompt_chars": 500, "injected_memory_chars": 200,
                 "prompt_tokens": 700, "budget_chars": None,
                 "budget_source": "token_aware_context",
@@ -249,3 +253,17 @@ def test_finalize_rejects_provenance_mismatch(tmp_path: Path) -> None:
             episode_manifest=group / "episode_manifest.json", expected_episodes=4,
         )
     assert not (group / "formal_complete.json").exists()
+
+
+@pytest.mark.parametrize("mode", SUPPLEMENTAL_ABLATION_PROMPT_MODES)
+def test_finalize_supplemental_modes_without_inference(
+    tmp_path: Path, mode: str,
+) -> None:
+    group = _group(tmp_path, mode=mode)
+    result = finalize_group(
+        group, gpu_ids=["0", "1"], episode_manifest=group / "episode_manifest.json",
+        expected_episodes=4,
+    )
+    assert result["status"] == "complete"
+    assert (group / "formal_complete.json").is_file()
+    assert json.loads((group / "prompt_protocol.json").read_text())["mode"] == mode

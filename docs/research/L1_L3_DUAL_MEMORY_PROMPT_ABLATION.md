@@ -792,3 +792,94 @@ L1 当前/历史区分与去重；L3 指令检索、关系分层、未知关系�
 检验。代码验收不能替代导航实验；即使七组代码全部通过，也不能预先声称
 organized/joint 更好。正式运行请使用第 10 节命令；launcher 必须先运行、且默认会
 运行第七组 legacy。实验结束后以 `final_report.md` 与 `comparison.json` 为准。
+
+---
+
+## 14. 补充两组：Original L1 + Organized L3（本轮）
+
+历史七组（六个实验模式 + legacy）已经完成，本轮只补充两个遗漏的组合，不重跑前七组：
+
+| 模式 | L1 来源 | L3 来源 | 组合 |
+| --- | --- | --- | --- |
+| `l1_original_l3_organized_concat` | `LocalGraphFusion` 原始卡，逐字保留 | `L3PromptOrganizer` 组织卡 | 与原 concat 相同的整行预算拼接 |
+| `l1_original_l3_organized_joint` | `LocalGraphFusion` 原始卡，逐字保留 | `L3PromptOrganizer` 组织卡 | 复用实体对齐、去重、冲突规则；L3 事实以独立 Map 行输出 |
+
+### 14.1 实现边界
+
+- L1 不经过 `L1PromptOrganizer`。Concat 直接复用 `LocalGraphFusion` 的
+  `MemoryContext`；Joint 从同一 context 的 `LayerMemoryItem` 复制原始
+  `description`、`evidence_refs` 和 metadata，新增字段只标记
+  `l1_prompt_preserved=True` 与对齐到的 L3 object id，不改原文。
+- L3 复用现有 `L3PromptOrganizer`，没有修改其选择、关系分层或序列化算法。
+- Concat 只把 L3 输入从 `SpatialGraphAdapter` 换成 `L3PromptOrganizer`；拼接、
+  HTML 转义、整行预算截断和注入适配器均与原 `l1_l3_original_concat` 相同。
+- Joint 复用 `JointPromptBuilder` 的可信链接对齐、同标签 uncertain、identity /
+  geometry 冲突保留和逐行去重规则。**技术限制**：历史 joint 的 confirmed 行由
+  L1Fact metadata 重新合成，直接用于原始 L1 会改写原文；因此补充 joint 保留原始
+  L1 行，并把已确认对齐的 L3 地图事实写成独立的 linked map 行。`joint_item_count`
+  和 `merged_entities` 均为 0（没有合成合并行），真实对齐对数由 `aligned_pairs` /
+  `alignment.confirmed` 记录。联合卡的 `[Navigation Context - L1+L3]` header 与
+  `Step ...` 状态行是联合框架；L1 事实行逐字保留，但不复制原卡的
+  `[Navigation Memory]` header。
+- 两组使用与历史六个非 legacy 组完全相同的 token-aware 预算、checkpoint、seed、
+  88 Episode manifest、pilot manifest、YOLO/seg 权重、动作接口和评测协议。
+- 未修改地图构建、对象关联、模型权重、动作解码；未引入新算法、模型、外部 API、
+  DART、DWA 或 L2。
+
+### 14.2 独立启动入口
+
+```bash
+MODEL_PATH=/path/to/LightNav-0 \
+YOLO_MODEL_PATH=/path/to/yolo11n.pt \
+SEG_MODEL_PATH=/path/to/yolo11n-seg.pt \
+EPISODE_MANIFEST_PATH=/path/to/existing/episode_manifest.json \
+PILOT_MANIFEST_PATH=/path/to/existing/pilot_manifest.json \
+bash scripts/run_l1_original_l3_organized_ablation.sh \
+  --output-root output/l1_original_l3_organized \
+  --historical-root output/l1_l3_prompt_ablation
+```
+
+`--historical-root` 只读取已完成的七组，绝不重新推理；preflight 会先核对两个
+root 的 manifest、checkpoint、seed、pilot、Habitat 配置、L1/L3 权重和 GPU 顺序，
+并要求历史七组都带完成标记且 `summary.json`、`per_episode.csv`、88 条结果和逐 Step
+prompt 诊断齐全（`--verify-only --require-complete`），避免 GPU 跑完才发现历史
+artifact 不完整。resume 还会核对 historical root 路径与 `allow_source_difference`
+标志，不能悄悄换 root 或把补充运行降级成只比较两组。没有
+`--historical-root` 时只输出两个补充组的完整组内结果，仍不会重跑历史组。
+`--resume`、`--dry-run`、`--preflight-only` 与历史 launcher 语义相同；完整 shard
+但后处理失败时仍走 `finalize_l1_l3_group.py`，不重跑推理。
+
+### 14.3 配对比较与分层
+
+```bash
+python3 scripts/compare_l1_l3_prompt_ablation.py \
+  --root output/l1_original_l3_organized \
+  --historical-root output/l1_l3_prompt_ablation \
+  --groups "l1_original_only l1_organized_only l3_original_only l3_organized_only l1_l3_original_concat l1_l3_joint l1_original_l3_organized_concat l1_original_l3_organized_joint legacy" \
+  --pilot-manifest /path/to/existing/pilot_manifest.json \
+  --allow-source-difference
+```
+
+- `--allow-source-difference` 只允许“历史 core 组”和“补充组”之间的
+  `source_python_sha256` 不同；同一 stage 内部仍要求源码哈希一致，且两个 stage
+  的 checkpoint / manifest / seed / pilot / Habitat / 其他 memory 参数必须完全一致。
+  这是必要的：补充模式改了 Prompt 代码，历史组不可能有相同源码哈希。
+- 分层直接读取固定 88 Episode pilot manifest 的 `distance_group`（`short` /
+  `medium` / `long`），不从模型结果重新定义分层。报告输出每组分层 SR/SPL/NE/nDTW，
+  以及补充组对历史七组的逐层 ΔSR 与 McNemar p；完整数值在
+  `comparison.json` / `comparison.csv`。
+- `results.jsonl` 中 `success` / `oracle_success` 是 JSON 布尔值；比较器现在把
+  `true/false` 和 `1/0` 都视为已测得的 1.0/0.0，不再因类型拒绝真实 runner 结果。
+  该转换只改变读取方式，不插补或重算任何 Episode。
+- 根级 `protocol_version` 仍只表示 Local Graph 协议；Prompt 协议单独写在
+  `prompt_protocol_version` / `prompt_effective`，补充组不会重新引入覆盖问题。
+- `prompt_artifacts.py` 的 `aligned_pairs` 记录新增 joint 的对齐条数；历史 joint
+  的 `joint_item_count` 语义不变。
+
+### 14.4 结果状态
+
+本轮本地没有 GPU、checkpoint、88 Episode manifest 或 Habitat 环境，因此**没有**
+真实运行这两组，也没有伪造 SR/SPL/NE。`output/` 在本工作区不存在；历史七组结果
+需要由实验机上的 artifact 提供。上面的启动入口和比较器会在 artifact 到位后生成
+两组完整结果、与历史七组的配对表以及短/中/长分层表；最终数字必须以
+`final_report.md` 和 `comparison.json` 为准。

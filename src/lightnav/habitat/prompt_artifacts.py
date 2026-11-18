@@ -205,6 +205,10 @@ def prompt_diagnostic_row(
         "joint_item_count": context.get("layer_item_counts", {}).get("joint", 0)
         if isinstance(context.get("layer_item_counts"), dict) else 0,
         "joint_omitted_items": joint.get("omitted_items", 0),
+        "aligned_pairs": (
+            context.get("layer_item_counts", {}).get("aligned", 0)
+            if isinstance(context.get("layer_item_counts"), dict) else 0
+        ),
         "merged_entities": joint.get("merged_entities", 0),
         "duplicates_removed": context.get(
             "duplicates_removed", l1.get("duplicates_removed", 0),

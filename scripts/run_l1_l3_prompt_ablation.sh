@@ -21,7 +21,12 @@ set -euo pipefail
 
 TAG='[l1_l3_prompt_ablation]'
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODES=(l1_original_only l1_organized_only l3_original_only l3_organized_only l1_l3_original_concat l1_l3_joint legacy)
+CORE_MODES=(l1_original_only l1_organized_only l3_original_only l3_organized_only l1_l3_original_concat l1_l3_joint)
+SUPPLEMENTAL_MODES=(l1_original_l3_organized_concat l1_original_l3_organized_joint)
+MODES=("${CORE_MODES[@]}" legacy)
+ABLATION_STAGE=core
+HISTORICAL_ROOT=""
+ALLOW_SOURCE_DIFFERENCE=0
 ABLATION_ROOT="${ABLATION_ROOT:-$REPO_ROOT/output/l1_l3_prompt_ablation_$(date +%Y%m%d_%H%M%S)}"
 PREFLIGHT_ONLY=0
 DRY_RUN=0
@@ -36,13 +41,23 @@ Usage:
     bash scripts/run_l1_l3_prompt_ablation.sh [--output-root DIR] \
       [--preflight-only] [--dry-run] [--resume]
 
-Always runs the six experimental conditions and the unchanged legacy control:
+Runs the six historical experimental conditions and the unchanged legacy
+control:
   l1_original_only l1_organized_only l3_original_only l3_organized_only
   l1_l3_original_concat l1_l3_joint legacy
 
+Supplemental follow-up (two groups only; never reruns the historical seven):
+  bash scripts/run_l1_original_l3_organized_ablation.sh \
+      [--historical-root HISTORICAL_ROOT] --output-root DIR
+  --supplemental runs only:
+    l1_original_l3_organized_concat l1_original_l3_organized_joint
+  --historical-root DIR loads the completed seven groups from DIR for the final
+  paired comparison instead of rerunning them. The two roots must share the
+  manifest, checkpoint, seed, pilot selection and Habitat config.
+
 --preflight-only validates the manifest/checkpoint/config, writes the run
 snapshot and exits. --dry-run performs the same read-only checks and prints the
-seven commands without writing anything or starting Habitat.
+selected group commands without writing anything or starting Habitat.
 
 --resume DIR (with --output-root DIR) continues an existing root:
   * a group with pilot_complete.json is verified and skipped;
@@ -57,6 +72,9 @@ EOF
 while (($#)); do
     case "$1" in
         --output-root) [ "$#" -ge 2 ] || die '--output-root needs a directory'; ABLATION_ROOT=$2; shift 2 ;;
+        --historical-root) [ "$#" -ge 2 ] || die '--historical-root needs a directory'; HISTORICAL_ROOT=$2; shift 2 ;;
+        --supplemental) ABLATION_STAGE=supplemental; MODES=("${SUPPLEMENTAL_MODES[@]}"); shift ;;
+        --allow-source-difference) ALLOW_SOURCE_DIFFERENCE=1; shift ;;
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --resume) RESUME=1; shift ;;
@@ -67,6 +85,21 @@ done
 
 [ "$DRY_RUN" -eq 0 ] || [ "$PREFLIGHT_ONLY" -eq 0 ] || \
     die 'choose --dry-run or --preflight-only, not both'
+if [ "$ABLATION_STAGE" = supplemental ]; then
+    [ "$HISTORICAL_ROOT" != "" ] && [ "$ALLOW_SOURCE_DIFFERENCE" -eq 0 ] && \
+        ALLOW_SOURCE_DIFFERENCE=1
+elif [ "$HISTORICAL_ROOT" != "" ]; then
+    die '--historical-root is only valid with --supplemental'
+fi
+if [ "$HISTORICAL_ROOT" != "" ]; then
+    [ -d "$HISTORICAL_ROOT" ] || die "historical root not found: $HISTORICAL_ROOT"
+    [ -f "$HISTORICAL_ROOT/provenance.json" ] || die "historical root lacks provenance.json: $HISTORICAL_ROOT"
+    HISTORICAL_ROOT="$(cd "$HISTORICAL_ROOT" && pwd -P)"
+    for mode in "${CORE_MODES[@]}" legacy; do
+        [ -f "$HISTORICAL_ROOT/$mode/pilot_complete.json" ] || \
+            die "historical root lacks a completed $mode group: $HISTORICAL_ROOT/$mode"
+    done
+fi
 [ "${TASK:-vlnce}" = vlnce ] || die 'TASK must be vlnce'
 [ "${SPLIT:-val_unseen}" = val_unseen ] || die 'SPLIT must be val_unseen'
 [ "${EPISODES:--1}" = -1 ] || die 'EPISODES is controlled by this protocol'
@@ -141,7 +174,9 @@ if [ "$DRY_RUN" -eq 0 ] || [ "$PREFLIGHT_ONLY" -eq 1 ]; then
 fi
 
 export MODEL_PATH YOLO_MODEL_PATH SEG_MODEL_PATH EPISODE_MANIFEST_PATH \
-       PILOT_MANIFEST_PATH HABITAT_CONFIG ABLATION_ROOT MANIFEST_SEARCH_ROOT
+       PILOT_MANIFEST_PATH HABITAT_CONFIG ABLATION_ROOT MANIFEST_SEARCH_ROOT \
+       HISTORICAL_ROOT ALLOW_SOURCE_DIFFERENCE
+export ABLATION_STAGE ABLATION_MODES="${MODES[*]}"
 export CLIENT_PYTHON="$INFERENCE_PYTHON"
 export SEED=42 BACKEND=vllm_local EXPECTED_EPISODES=88
 export GPU_IDS GPU_MEM_UTIL BASE_PORT
@@ -396,12 +431,14 @@ if search_root.is_dir():
             "reasons": reasons,
         })
 
+modes = os.environ["ABLATION_MODES"].split()
+legacy_in_modes = "legacy" in modes
 provenance = {
     "protocol_version": "l1_l3_prompt_ablation_v1",
-    "modes": [
-        "l1_original_only", "l1_organized_only", "l3_original_only",
-        "l3_organized_only", "l1_l3_original_concat", "l1_l3_joint",
-    ],
+    "ablation_stage": os.environ["ABLATION_STAGE"],
+    "modes": [mode for mode in modes if mode != "legacy"],
+    "historical_root": os.environ["HISTORICAL_ROOT"] or None,
+    "allow_source_difference": os.environ["ALLOW_SOURCE_DIFFERENCE"] == "1",
     "episode_manifest_path": str(manifest_path),
     "episode_manifest_sha256": manifest_sha256,
     "episode_manifest_canonical_sha256": canonical_sha256,
@@ -428,13 +465,18 @@ provenance = {
     "base_port": int(os.environ["BASE_PORT"]),
     "legacy_history_candidates": legacy_candidates,
     "legacy_reuse": "not_applied_by_launcher",
-    "legacy_group_required": True,
+    "legacy_group_required": legacy_in_modes,
     "legacy_reuse_note": (
-        "The launcher runs the seventh legacy group. A historical candidate is "
-        "reported only; exact reuse requires manual confirmation so a mismatched "
-        "control can never enter the paired comparison."
-        if legacy_candidates else
-        "No historical 88-Episode result was found; the seventh legacy group must run."
+        (
+            "The launcher runs the seventh legacy group. A historical candidate is "
+            "reported only; exact reuse requires manual confirmation so a mismatched "
+            "control can never enter the paired comparison."
+            if legacy_candidates else
+            "No historical 88-Episode result was found; the seventh legacy group must run."
+        )
+        if legacy_in_modes else
+        "Supplemental stage: the historical seven groups are loaded from "
+        "--historical-root for comparison and are never rerun by this launcher."
     ),
 }
 print(json.dumps(provenance, indent=2, ensure_ascii=False))
@@ -461,6 +503,39 @@ if resume:
     for key, expected in checks.items():
         if existing.get(key) != expected:
             die(f"resume provenance differs at {key}: {existing.get(key)!r} != {expected!r}")
+    expected_modes = [mode for mode in modes if mode != "legacy"]
+    if existing.get("modes") != expected_modes:
+        die(
+            "resume provenance modes differ: "
+            f"{existing.get('modes')!r} != {expected_modes!r}"
+        )
+    if (
+        "ablation_stage" in existing
+        and existing["ablation_stage"] != os.environ["ABLATION_STAGE"]
+    ):
+        die(
+            "resume provenance stage differs: "
+            f"{existing.get('ablation_stage')!r} != "
+            f"{os.environ['ABLATION_STAGE']!r}"
+        )
+    expected_historical = os.environ["HISTORICAL_ROOT"] or None
+    if (
+        "historical_root" in existing
+        and existing["historical_root"] != expected_historical
+    ):
+        die(
+            "resume provenance historical_root differs: "
+            f"{existing.get('historical_root')!r} != {expected_historical!r}"
+        )
+    expected_allow_source = os.environ["ALLOW_SOURCE_DIFFERENCE"] == "1"
+    if (
+        "allow_source_difference" in existing
+        and bool(existing["allow_source_difference"]) != expected_allow_source
+    ):
+        die(
+            "resume provenance allow_source_difference differs: "
+            f"{existing.get('allow_source_difference')!r} != {expected_allow_source!r}"
+        )
     root_manifest = validate_manifest(
         json.loads((root / "episode_manifest.json").read_text(encoding="utf-8"))
     )
@@ -494,12 +569,21 @@ if [ "$DRY_RUN" -eq 1 ]; then
     exit 0
 fi
 if [ "$PREFLIGHT_ONLY" -eq 1 ]; then
+    if [ "$HISTORICAL_ROOT" != "" ]; then
+        PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+            "$INFERENCE_PYTHON" "$REPO_ROOT/scripts/compare_l1_l3_prompt_ablation.py" \
+                --verify-only --require-complete --root "$ABLATION_ROOT" \
+                --historical-root "$HISTORICAL_ROOT" \
+                --allow-source-difference >/dev/null \
+            || die 'historical root is not compatible with this supplemental run'
+        echo "$TAG historical root verified: $HISTORICAL_ROOT"
+    fi
     echo "$TAG preflight complete: $ABLATION_ROOT/provenance.json"
     exit 0
 fi
 
-# The seven arms share every setting except --memory_prompt_mode (and the
-# legacy measurement switch).
+# The arms share every setting except --memory_prompt_mode (and the legacy
+# measurement switch).
 common_args=(
     --no_force_stop --verbose
     --memory_enabled --memory_extractor yolo11
@@ -519,7 +603,11 @@ common_args=(
     --prompt_measurement_enabled
 )
 printf -v shared_client_args '%s ' "${common_args[@]}"
-echo "$TAG preflight passed; starting six experimental conditions + legacy"
+if [ "$ABLATION_STAGE" = supplemental ]; then
+    echo "$TAG preflight passed; starting the two supplemental conditions"
+else
+    echo "$TAG preflight passed; starting six experimental conditions + legacy"
+fi
 
 for mode in "${MODES[@]}"; do
     group_dir="$ABLATION_ROOT/$mode"
@@ -528,6 +616,9 @@ for mode in "${MODES[@]}"; do
         PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
             "$INFERENCE_PYTHON" -m lightnav.habitat.prompt_artifacts verify \
                 --group "$group_dir" --mode "$mode"
+        "$INFERENCE_PYTHON" "$REPO_ROOT/scripts/compare_l1_l3_prompt_ablation.py" \
+            --verify-only --require-complete --groups "$mode" \
+            --root "$ABLATION_ROOT" >/dev/null
         continue
     fi
     if [ -d "$group_dir" ]; then
@@ -547,7 +638,8 @@ for mode in "${MODES[@]}"; do
             "$INFERENCE_PYTHON" -m lightnav.habitat.prompt_artifacts verify \
                 --group "$group_dir" --mode "$mode"
         "$INFERENCE_PYTHON" "$REPO_ROOT/scripts/compare_l1_l3_prompt_ablation.py" \
-            --verify-only --root "$ABLATION_ROOT" >/dev/null
+            --verify-only --require-complete --groups "$mode" \
+            --root "$ABLATION_ROOT" >/dev/null
         echo "$TAG $mode recovered from complete shards without rerunning inference"
         continue
     fi
@@ -569,7 +661,8 @@ for mode in "${MODES[@]}"; do
         "$INFERENCE_PYTHON" -m lightnav.habitat.prompt_artifacts verify \
             --group "$group_dir" --mode "$mode"
     "$INFERENCE_PYTHON" "$REPO_ROOT/scripts/compare_l1_l3_prompt_ablation.py" \
-        --verify-only --root "$ABLATION_ROOT" >/dev/null
+        --verify-only --require-complete --groups "$mode" \
+        --root "$ABLATION_ROOT" >/dev/null
     python3 - "$group_dir/run_timing.json" "$mode" "$((SECONDS - started))" <<'PY'
 import json
 import sys
@@ -582,7 +675,17 @@ path.write_text(json.dumps(prior, indent=2) + "\n")
 PY
 done
 
+compare_args=(--root "$ABLATION_ROOT" --pilot-manifest "$PILOT_MANIFEST_PATH")
+if [ "$HISTORICAL_ROOT" != "" ]; then
+    compare_args+=(
+        --historical-root "$HISTORICAL_ROOT"
+        --groups "${CORE_MODES[*]} ${SUPPLEMENTAL_MODES[*]} legacy"
+    )
+    [ "$ALLOW_SOURCE_DIFFERENCE" -eq 1 ] && compare_args+=(--allow-source-difference)
+else
+    compare_args+=(--groups "${MODES[*]}")
+fi
 PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
     "$INFERENCE_PYTHON" "$REPO_ROOT/scripts/compare_l1_l3_prompt_ablation.py" \
-        --root "$ABLATION_ROOT"
+        "${compare_args[@]}"
 echo "$TAG complete: $ABLATION_ROOT/final_report.md"
