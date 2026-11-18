@@ -13,6 +13,7 @@ _PROMPT_MODES = (
     "l1_original_only", "l1_organized_only", "l3_original_only",
     "l3_organized_only", "l1_l3_original_concat", "l1_l3_joint",
     "l1_original_l3_organized_concat", "l1_original_l3_organized_joint",
+    "l3_official_style_only",
 )
 _PROMPT_PROTOCOL = "l1_l3_prompt_ablation_v1"
 

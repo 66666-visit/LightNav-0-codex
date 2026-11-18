@@ -39,6 +39,7 @@ try:  # Imported when the repository root is on PYTHONPATH (the launcher does th
     from lightnav.memory.prompt_modes import (
         ABLATION_PROMPT_MODES,
         CORE_ABLATION_PROMPT_MODES,
+        OFFICIAL_STYLE_PROMPT_MODE,
         PROMPT_PROTOCOL_VERSION,
         SUPPLEMENTAL_ABLATION_PROMPT_MODES,
         effective_layer_activation,
@@ -54,6 +55,7 @@ except ImportError:  # pragma: no cover - direct script execution without PYTHON
     from lightnav.memory.prompt_modes import (
         ABLATION_PROMPT_MODES,
         CORE_ABLATION_PROMPT_MODES,
+        OFFICIAL_STYLE_PROMPT_MODE,
         PROMPT_PROTOCOL_VERSION,
         SUPPLEMENTAL_ABLATION_PROMPT_MODES,
         effective_layer_activation,
@@ -63,7 +65,8 @@ except ImportError:  # pragma: no cover - direct script execution without PYTHON
 
 CORE_GROUPS = (*CORE_ABLATION_PROMPT_MODES, "legacy")
 SUPPLEMENTAL_GROUPS = SUPPLEMENTAL_ABLATION_PROMPT_MODES
-GROUPS = (*ABLATION_PROMPT_MODES, "legacy")
+OFFICIAL_GROUPS = (OFFICIAL_STYLE_PROMPT_MODE,)
+GROUPS = (*ABLATION_PROMPT_MODES, *OFFICIAL_GROUPS, "legacy")
 STRATA = ("short", "medium", "long")
 _LEGACY_ACTIVATION = {
     "mode": "legacy", "l1_layer": "original",
@@ -297,7 +300,7 @@ def _check_provenance_compatible(
     for key in _PROVENANCE_IDENTITY_KEYS:
         if primary.get(key) != historical.get(key):
             raise ValueError(
-                "historical root differs from the supplemental root at "
+                "historical root differs from the primary comparison root at "
                 f"provenance.{key}: {historical.get(key)!r} != {primary.get(key)!r}"
             )
 
@@ -734,25 +737,30 @@ def _validate_common_configuration(
         if not allow_source_difference:
             raise ValueError(
                 "groups were produced by different src/lightnav source versions; "
-                "pass --allow-source-difference only for the historical-core plus "
-                "supplemental comparison"
+                "pass --allow-source-difference only for a cross-stage comparison "
+                "(historical core, supplemental, official-style)"
             )
-        core_hashes = {
-            source_hashes[mode] for mode in source_hashes
-            if mode in CORE_GROUPS
+        stage_hashes = {
+            stage: {
+                source_hashes[mode] for mode in source_hashes if mode in members
+            }
+            for stage, members in (
+                ("core", CORE_GROUPS),
+                ("supplemental", SUPPLEMENTAL_GROUPS),
+                ("official", OFFICIAL_GROUPS),
+            )
         }
-        supplemental_hashes = {
-            source_hashes[mode] for mode in source_hashes
-            if mode in SUPPLEMENTAL_GROUPS
+        stage_hashes = {
+            stage: hashes for stage, hashes in stage_hashes.items() if hashes
         }
-        if len(core_hashes) > 1 or len(supplemental_hashes) > 1:
+        if any(len(hashes) > 1 for hashes in stage_hashes.values()):
             raise ValueError(
                 "source versions differ inside one ablation stage; refusing to mix them"
             )
-        if not core_hashes or not supplemental_hashes:
+        if len(stage_hashes) < 2:
             raise ValueError(
-                "source-version differences are only allowed between the historical "
-                "core groups and the supplemental groups"
+                "source-version differences are only allowed between distinct "
+                "ablation stages (historical core, supplemental, official-style)"
             )
     return {
         "common": common,
@@ -1077,7 +1085,9 @@ def compare(
         "status": "complete" if complete and not allow_incomplete else "incomplete",
         "protocol_version": PROMPT_PROTOCOL_VERSION,
         "evaluation_mode": (
-            "l1_l3_prompt_ablation_88_extended"
+            "l1_l3_prompt_ablation_88_official_style"
+            if any(mode in OFFICIAL_GROUPS for mode in groups)
+            else "l1_l3_prompt_ablation_88_extended"
             if any(mode in SUPPLEMENTAL_GROUPS for mode in groups)
             else "l1_l3_prompt_ablation_88"
         ),
@@ -1542,9 +1552,10 @@ def _markdown_report(report: dict[str, Any]) -> str:
         "- 非 legacy 实验组使用模型派生的 token 预算：上下文上限、基座 Prompt token 与"
         "生成长度逐 Step 实测；若无法测量则回退原 320 字符并记录原因。",
         (
-            "- 历史 core 组与补充组来自不同的 `src/lightnav` 源码版本，"
-            "`--allow-source-difference` 只放行这一跨阶段差异；同一阶段内部仍要求"
-            "源码哈希一致，checkpoint/manifest/seed/pilot/Habitat/其他 memory 参数仍须一致。"
+            "- 不同实验阶段（历史 core / supplemental / official-style）来自不同的 "
+            "`src/lightnav` 源码版本，`--allow-source-difference` 只放行跨阶段差异；"
+            "同一阶段内部仍要求源码哈希一致，checkpoint/manifest/seed/pilot/Habitat/"
+            "其他 memory 参数仍须一致。"
             if checks.get("source_version_difference_allowed") else
             "- 所有组来自同一 `src/lightnav` 源码版本。"
         ),

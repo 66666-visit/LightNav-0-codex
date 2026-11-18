@@ -12,6 +12,12 @@ Relation classes are kept explicit:
 * ``spatial``  -- the current straight-line range/bearing to its stored centre;
 * ``traversal``-- a real viewpoint-to-viewpoint ``traversed_to`` record exists;
 * ``unknown``  -- objects passability is never proven by observation.
+
+The candidate set is produced once by :meth:`L3PromptOrganizer.collect`.  The
+``organized`` serializer below and the official-style serializer in
+``l3_official_prompt`` both read that exact candidate list, so an experiment
+that changes only the prompt wording cannot change which map facts and Evidence
+were retrieved.
 """
 
 from __future__ import annotations
@@ -84,6 +90,9 @@ class L3Fact:
     past_episode: bool
     match_score: float
     traversal_steps: tuple[int, ...] = ()
+    #: Step of the newest History record (not ``max(steps)``).  It is kept out
+    #: of ``to_dict`` so the historical organized diagnostics stay unchanged.
+    latest_step: int = 0
 
     def line(self) -> str:
         if not self.geometry_verified:
@@ -137,11 +146,15 @@ class L3Organization:
     omitted_items: int = 0
     prompt_chars: int = 0
     empty_reason: str | None = None
+    source: str = "l3_prompt_organizer"
+    #: Expression-only bookkeeping (strategies, anchors, dropped forms).  Empty
+    #: for the historical organized serializer so its artifacts stay unchanged.
+    expression: dict[str, Any] = field(default_factory=dict)
 
     def diagnostics(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "layer": "l3",
-            "source": "l3_prompt_organizer" if self.context is not None else None,
+            "source": self.source if self.context is not None else None,
             "candidate_count": self.candidate_count,
             "verified_count": self.verified_count,
             "unverified_count": self.unverified_count,
@@ -152,6 +165,9 @@ class L3Organization:
             "items": [fact.to_dict() for fact in self.selected_facts],
             "empty_reason": self.empty_reason,
         }
+        if self.expression:
+            result["expression"] = dict(self.expression)
+        return result
 
 
 class L3PromptOrganizer:
@@ -179,6 +195,36 @@ class L3PromptOrganizer:
         max_chars: int,
         min_confidence: float,
     ) -> L3Organization:
+        if type(max_chars) is not int or max_chars < 1:
+            raise ValueError("max_chars must be a positive integer")
+        organization = self.collect(
+            store, object_map, scene_id=scene_id, episode_id=episode_id,
+            rollout_idx=rollout_idx, step=step, instruction=instruction,
+            frame=frame, scope=scope, min_confidence=min_confidence,
+        )
+        self._serialize(organization, step=step, max_chars=max_chars)
+        return organization
+
+    def collect(
+        self,
+        store: V3MemoryStore,
+        object_map: Any,
+        *,
+        scene_id: str,
+        episode_id: str,
+        rollout_idx: int,
+        step: int,
+        instruction: str,
+        frame: Any | None,
+        scope: str,
+        min_confidence: float,
+    ) -> L3Organization:
+        """Return the mode-independent candidate facts and their Evidence.
+
+        This is the only retrieval path for an organized or official-style
+        L3 card.  A serializer may drop a fact it cannot express, but it may
+        not re-score, recompute or extend this list.
+        """
         if store.active_episode != (scene_id, episode_id, rollout_idx):
             raise ValueError("L3 organization requires the active Scene/Episode")
         if store.scope != scope:
@@ -187,8 +233,6 @@ class L3PromptOrganizer:
             raise ValueError("invalid spatial scope")
         if type(step) is not int or step < 0:
             raise ValueError("step must be a nonnegative integer")
-        if type(max_chars) is not int or max_chars < 1:
-            raise ValueError("max_chars must be a positive integer")
         if not isinstance(min_confidence, (int, float)) or not 0 <= min_confidence <= 1:
             raise ValueError("min_confidence must lie in [0, 1]")
 
@@ -217,7 +261,7 @@ class L3PromptOrganizer:
                 and record.confidence >= min_confidence
                 for record in evidence
             )
-            history = self._valid_history(
+            history = self.valid_history(
                 store, obj, observed_edges, object_map, scene_id, episode_id,
                 rollout_idx, step, scope, min_confidence,
             )
@@ -313,14 +357,14 @@ class L3PromptOrganizer:
             fact.object_id,
         ))
         organization.facts = facts
-        self._serialize(organization, step=step, max_chars=max_chars)
         return organization
 
-    def _valid_history(
+    def valid_history(
         self, store: V3MemoryStore, obj: Any, observed_edges: list[Any], object_map: Any,
         scene_id: str, episode_id: str, rollout_idx: int, step: int, scope: str,
         min_confidence: float,
     ) -> list[dict[str, Any]]:
+        """Return the historical observations that may support an object fact."""
         history: list[dict[str, Any]] = []
         for edge in observed_edges:
             if edge.object_id != obj.object_id or edge.evidence_id not in obj.evidence_ids:
@@ -388,8 +432,10 @@ class L3PromptOrganizer:
             steps = [payload["fallback_step"]]
             provenance = (fallback,)
             latest_confidence = payload["fallback_confidence"]
+            latest_step = int(payload["fallback_step"])
         else:
             latest_confidence = float(latest.confidence)
+            latest_step = int(latest.step_id)
         return L3Fact(
             object_id=obj.object_id,
             label=payload["label"],
@@ -409,6 +455,7 @@ class L3PromptOrganizer:
             past_episode=payload["past_episode"],
             match_score=payload["score"],
             traversal_steps=payload["traversal"],
+            latest_step=latest_step,
         )
 
     def _serialize(self, organization: L3Organization, *, step: int, max_chars: int) -> None:

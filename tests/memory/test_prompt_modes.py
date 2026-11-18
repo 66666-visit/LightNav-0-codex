@@ -20,20 +20,26 @@ from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.spatial_l3_config import SpatialL3Config
 
 
-def test_all_nine_modes_are_explicit_and_eight_are_ablated() -> None:
+def test_all_ten_modes_are_explicit_and_nine_are_experimental() -> None:
     assert MEMORY_PROMPT_MODES == (
         "legacy", "l1_original_only", "l1_organized_only", "l3_original_only",
         "l3_organized_only", "l1_l3_original_concat", "l1_l3_joint",
         "l1_original_l3_organized_concat", "l1_original_l3_organized_joint",
+        "l3_official_style_only",
     )
     assert CORE_ABLATION_PROMPT_MODES == MEMORY_PROMPT_MODES[1:7]
-    assert SUPPLEMENTAL_ABLATION_PROMPT_MODES == MEMORY_PROMPT_MODES[7:]
-    assert ABLATION_PROMPT_MODES == MEMORY_PROMPT_MODES[1:]
+    assert SUPPLEMENTAL_ABLATION_PROMPT_MODES == MEMORY_PROMPT_MODES[7:9]
+    assert ABLATION_PROMPT_MODES == MEMORY_PROMPT_MODES[1:9]
+    assert MEMORY_PROMPT_MODES[9:] == ("l3_official_style_only",)
     plans = {mode: mode_plan(mode) for mode in MEMORY_PROMPT_MODES}
     assert plans["l1_original_only"].uses_l1 and not plans["l1_original_only"].uses_l3
     assert plans["l1_organized_only"].l1_organized
     assert plans["l3_original_only"].uses_l3 and not plans["l3_original_only"].uses_l1
     assert plans["l3_organized_only"].l3_organized
+    official = plans["l3_official_style_only"]
+    assert official.uses_l3 and not official.uses_l1
+    assert official.l3_official and not official.l3_organized
+    assert official.combination == "single"
     assert plans["l1_l3_original_concat"].concatenated
     assert plans["l1_l3_joint"].joint
     assert plans["l1_l3_joint"].l1_organized and plans["l1_l3_joint"].l3_organized
@@ -81,6 +87,15 @@ def test_mode_backing_requires_the_selected_layer_sources() -> None:
         mode_plan("l3_organized_only"),
         local_graph_enabled=True, spatial_l3_mode="inject",
     )
+    validate_mode_backing(
+        mode_plan("l3_official_style_only"),
+        local_graph_enabled=True, spatial_l3_mode="inject",
+    )
+    with pytest.raises(ValueError):
+        validate_mode_backing(
+            mode_plan("l3_official_style_only"),
+            local_graph_enabled=True, spatial_l3_mode="shadow",
+        )
     # Legacy keeps whatever backend the original run configured.
     validate_mode_backing(
         mode_plan("legacy"), local_graph_enabled=False, spatial_l3_mode="off",
@@ -130,7 +145,7 @@ def test_manager_rejects_modes_without_their_backend() -> None:
     )
     assert manager.prompt_budget_chars == 320
     assert manager.plan.mode == "l1_l3_joint"
-    for mode in SUPPLEMENTAL_ABLATION_PROMPT_MODES:
+    for mode in (*SUPPLEMENTAL_ABLATION_PROMPT_MODES, "l3_official_style_only"):
         manager = MemoryManager(
             strategy="hierarchical",
             local_graph_config=LocalGraphConfig(enabled=True),

@@ -23,6 +23,7 @@ TAG='[l1_l3_prompt_ablation]'
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CORE_MODES=(l1_original_only l1_organized_only l3_original_only l3_organized_only l1_l3_original_concat l1_l3_joint)
 SUPPLEMENTAL_MODES=(l1_original_l3_organized_concat l1_original_l3_organized_joint)
+OFFICIAL_MODES=(l3_official_style_only)
 MODES=("${CORE_MODES[@]}" legacy)
 ABLATION_STAGE=core
 HISTORICAL_ROOT=""
@@ -55,6 +56,16 @@ Supplemental follow-up (two groups only; never reruns the historical seven):
   paired comparison instead of rerunning them. The two roots must share the
   manifest, checkpoint, seed, pilot selection and Habitat config.
 
+Official-style L3 expression follow-up (one group; never reruns any historical
+group):
+  bash scripts/run_l3_official_style_ablation.sh \
+      --historical-root HISTORICAL_ROOT --output-root DIR
+  --official-style runs only l3_official_style_only and requires a historical
+  root containing the completed l3_original_only and l3_organized_only groups.
+  Those two groups are loaded for the paired comparison; they are never rerun.
+  --allow-source-difference is implied because the new serializer is a newer
+  source revision than the historical groups.
+
 --preflight-only validates the manifest/checkpoint/config, writes the run
 snapshot and exits. --dry-run performs the same read-only checks and prints the
 selected group commands without writing anything or starting Habitat.
@@ -74,6 +85,7 @@ while (($#)); do
         --output-root) [ "$#" -ge 2 ] || die '--output-root needs a directory'; ABLATION_ROOT=$2; shift 2 ;;
         --historical-root) [ "$#" -ge 2 ] || die '--historical-root needs a directory'; HISTORICAL_ROOT=$2; shift 2 ;;
         --supplemental) ABLATION_STAGE=supplemental; MODES=("${SUPPLEMENTAL_MODES[@]}"); shift ;;
+        --official-style) ABLATION_STAGE=official; MODES=("${OFFICIAL_MODES[@]}"); shift ;;
         --allow-source-difference) ALLOW_SOURCE_DIFFERENCE=1; shift ;;
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -88,14 +100,23 @@ done
 if [ "$ABLATION_STAGE" = supplemental ]; then
     [ "$HISTORICAL_ROOT" != "" ] && [ "$ALLOW_SOURCE_DIFFERENCE" -eq 0 ] && \
         ALLOW_SOURCE_DIFFERENCE=1
+elif [ "$ABLATION_STAGE" = official ]; then
+    [ -n "$HISTORICAL_ROOT" ] || \
+        die '--official-style requires --historical-root with the completed l3_original_only and l3_organized_only groups'
+    [ "$ALLOW_SOURCE_DIFFERENCE" -eq 0 ] && ALLOW_SOURCE_DIFFERENCE=1
 elif [ "$HISTORICAL_ROOT" != "" ]; then
-    die '--historical-root is only valid with --supplemental'
+    die '--historical-root is only valid with --supplemental or --official-style'
 fi
 if [ "$HISTORICAL_ROOT" != "" ]; then
     [ -d "$HISTORICAL_ROOT" ] || die "historical root not found: $HISTORICAL_ROOT"
     [ -f "$HISTORICAL_ROOT/provenance.json" ] || die "historical root lacks provenance.json: $HISTORICAL_ROOT"
     HISTORICAL_ROOT="$(cd "$HISTORICAL_ROOT" && pwd -P)"
-    for mode in "${CORE_MODES[@]}" legacy; do
+    if [ "$ABLATION_STAGE" = official ]; then
+        HISTORICAL_REQUIRED=(l3_original_only l3_organized_only)
+    else
+        HISTORICAL_REQUIRED=("${CORE_MODES[@]}" legacy)
+    fi
+    for mode in "${HISTORICAL_REQUIRED[@]}"; do
         [ -f "$HISTORICAL_ROOT/$mode/pilot_complete.json" ] || \
             die "historical root lacks a completed $mode group: $HISTORICAL_ROOT/$mode"
     done
@@ -475,8 +496,14 @@ provenance = {
             "No historical 88-Episode result was found; the seventh legacy group must run."
         )
         if legacy_in_modes else
-        "Supplemental stage: the historical seven groups are loaded from "
-        "--historical-root for comparison and are never rerun by this launcher."
+        (
+            "Supplemental stage: the historical seven groups are loaded from "
+            "--historical-root for comparison and are never rerun by this launcher."
+            if os.environ["ABLATION_STAGE"] == "supplemental" else
+            "Official-style stage: the historical l3_original_only and "
+            "l3_organized_only groups are loaded from --historical-root for "
+            "comparison and are never rerun by this launcher."
+        )
     ),
 }
 print(json.dumps(provenance, indent=2, ensure_ascii=False))
@@ -575,7 +602,7 @@ if [ "$PREFLIGHT_ONLY" -eq 1 ]; then
                 --verify-only --require-complete --root "$ABLATION_ROOT" \
                 --historical-root "$HISTORICAL_ROOT" \
                 --allow-source-difference >/dev/null \
-            || die 'historical root is not compatible with this supplemental run'
+            || die 'historical root is not compatible with this run'
         echo "$TAG historical root verified: $HISTORICAL_ROOT"
     fi
     echo "$TAG preflight complete: $ABLATION_ROOT/provenance.json"
@@ -605,6 +632,8 @@ common_args=(
 printf -v shared_client_args '%s ' "${common_args[@]}"
 if [ "$ABLATION_STAGE" = supplemental ]; then
     echo "$TAG preflight passed; starting the two supplemental conditions"
+elif [ "$ABLATION_STAGE" = official ]; then
+    echo "$TAG preflight passed; starting the official-style L3 expression condition"
 else
     echo "$TAG preflight passed; starting six experimental conditions + legacy"
 fi
@@ -676,7 +705,27 @@ PY
 done
 
 compare_args=(--root "$ABLATION_ROOT" --pilot-manifest "$PILOT_MANIFEST_PATH")
-if [ "$HISTORICAL_ROOT" != "" ]; then
+if [ "$ABLATION_STAGE" = official ]; then
+    official_compare_groups=(
+        l3_original_only l3_organized_only "${OFFICIAL_MODES[@]}"
+    )
+    if [ -f "$HISTORICAL_ROOT/legacy/pilot_complete.json" ]; then
+        # The historical root includes the unchanged legacy control. Include it
+        # so the report also carries the legacy-relative navigation analysis.
+        # Nothing is rerun.
+        official_compare_groups+=(legacy)
+    else
+        # A three-way L3 comparison does not need legacy: the complete marker is
+        # about all requested groups, while the legacy-relative navigation
+        # analysis is reported as incomplete. The paired L3 deltas are valid.
+        echo "$TAG historical root has no legacy group; navigation_analysis will be incomplete, paired L3 deltas remain valid"
+    fi
+    compare_args+=(
+        --historical-root "$HISTORICAL_ROOT"
+        --groups "${official_compare_groups[*]}"
+        --allow-source-difference
+    )
+elif [ "$HISTORICAL_ROOT" != "" ]; then
     compare_args+=(
         --historical-root "$HISTORICAL_ROOT"
         --groups "${CORE_MODES[*]} ${SUPPLEMENTAL_MODES[*]} legacy"

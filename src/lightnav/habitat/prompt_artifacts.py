@@ -83,6 +83,19 @@ def build_prompt_protocol(memory: Any) -> dict[str, Any]:
             "whole_lines_only": True,
             "max_landmarks": memory.local_graph.max_landmarks,
         }
+    builders = {
+        "l1_original": "lightnav.memory.local_graph_fusion.LocalGraphFusion",
+        "l1_organized": "lightnav.memory.l1_prompt_organizer.L1PromptOrganizer",
+        "l3_original": "lightnav.memory.spatial_graph_adapter.SpatialGraphAdapter",
+        "l3_organized": "lightnav.memory.l3_prompt_organizer.L3PromptOrganizer",
+        "joint": "lightnav.memory.joint_prompt.JointPromptBuilder",
+    }
+    if plan.l3_official:
+        # Historical protocols stay byte-identical; only the new condition
+        # declares the serializer it actually uses.
+        builders["l3_official"] = (
+            "lightnav.memory.l3_official_prompt.L3OfficialPromptOrganizer"
+        )
     return {
         "protocol_version": PROMPT_PROTOCOL_VERSION,
         "mode": plan.mode,
@@ -94,13 +107,7 @@ def build_prompt_protocol(memory: Any) -> dict[str, Any]:
             "audit": "lightnav.memory.memory_context_builder.audit_prompt_injection",
             "whole_lines_only": True,
         },
-        "builders": {
-            "l1_original": "lightnav.memory.local_graph_fusion.LocalGraphFusion",
-            "l1_organized": "lightnav.memory.l1_prompt_organizer.L1PromptOrganizer",
-            "l3_original": "lightnav.memory.spatial_graph_adapter.SpatialGraphAdapter",
-            "l3_organized": "lightnav.memory.l3_prompt_organizer.L3PromptOrganizer",
-            "joint": "lightnav.memory.joint_prompt.JointPromptBuilder",
-        },
+        "builders": builders,
         "invariants": {
             "original_prompt_text_preserved": True,
             "video_and_action_interface_unchanged": True,
@@ -232,6 +239,8 @@ def prompt_diagnostic_row(
             "processor_length_rejections", row["processor_length_rejections"],
         ),
     })
+    if isinstance(l3.get("expression"), dict):
+        row["l3_expression"] = l3["expression"]
     if isinstance(context.get("spatial_l3"), dict):
         row["spatial_l3"] = context["spatial_l3"]
     return row

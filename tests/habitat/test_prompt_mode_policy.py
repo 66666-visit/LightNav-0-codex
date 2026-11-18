@@ -21,6 +21,7 @@ MODES = (
     "legacy", "l1_original_only", "l1_organized_only", "l3_original_only",
     "l3_organized_only", "l1_l3_original_concat", "l1_l3_joint",
     "l1_original_l3_organized_concat", "l1_original_l3_organized_joint",
+    "l3_official_style_only",
 )
 
 
@@ -67,9 +68,10 @@ class Engine:
 
 
 class SegExtractor:
-    def __init__(self, *, explode: bool = False) -> None:
+    def __init__(self, *, explode: bool = False, label: str = "chair") -> None:
         self.calls = 0
         self.explode = explode
+        self.label = label
 
     def reset_episode(self, episode_id: str, instruction: str) -> None:
         pass
@@ -83,7 +85,7 @@ class SegExtractor:
             raise AssertionError("L3 segmentation must not run in an L1-only mode")
         mask = np.ones(rgb.shape[:2], dtype=bool)
         return [SegmentationInstance(
-            "chair", 0.95, mask,
+            self.label, 0.95, mask,
             (0.0, 0.0, float(rgb.shape[1]), float(rgb.shape[0])),
         )]
 
@@ -467,3 +469,75 @@ def test_prompt_builder_failure_falls_back_to_the_original_sample() -> None:
         "prompt_context: RuntimeError"
     )
     assert diagnostic["prompt_context"]["item_count"] == 0
+
+
+def test_official_style_mode_isolates_l1_and_injects_map_history() -> None:
+    policy, manager, engine = _policy("l3_official_style_only")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "official-style L3 mode must not build L1 or joint prompts"
+        )
+
+    manager.local_graph_fusion.build = forbidden
+    manager.l1_prompt_organizer.build = forbidden
+    manager.joint_prompt_builder.build = forbidden
+    _run(policy, 2)
+
+    prompt = engine.samples[-1]["conversations"][0]["value"]
+    assert "[Navigation Map Memory - L3;" in prompt
+    assert "history, not current view" in prompt
+    assert "Map record (step 0" in prompt
+    assert "straight-line" in prompt
+    assert "Current RGB:" not in prompt
+    assert "[Navigation Context - L1" not in prompt
+    assert "[Navigation Memory]" not in prompt
+    diagnostic = policy.last_memory_diagnostic["prompt_context"]
+    assert diagnostic["source"] == "l3_official"
+    assert diagnostic["layers"]["l3"]["source"] == "l3_official_prompt"
+    assert "l1" not in diagnostic["layers"]
+    assert manager.spatial_extractor.calls >= 2
+
+
+def test_official_style_does_not_replace_the_historical_l3_cards() -> None:
+    organized_policy, _, organized_engine = _policy("l3_organized_only")
+    _run(organized_policy, 2)
+    organized_prompt = organized_engine.samples[-1]["conversations"][0]["value"]
+    assert "[Navigation Context - L3]" in organized_prompt
+    assert "last step 0" in organized_prompt
+    assert "not a path" in organized_prompt
+    assert "passage unknown" in organized_prompt
+    assert "[Navigation Map Memory" not in organized_prompt
+
+    original_policy, _, original_engine = _policy("l3_original_only")
+    _run(original_policy, 2)
+    original_prompt = original_engine.samples[-1]["conversations"][0]["value"]
+    assert "Spatial history: chair" in original_prompt
+    assert "[Navigation Map Memory" not in original_prompt
+
+
+def test_official_style_episode_reset_removes_previous_map_facts() -> None:
+    policy, manager, engine = _policy("l3_official_style_only", labels=("chair",))
+    _run(policy, 2)
+    assert "chair" in engine.samples[-1]["conversations"][0]["value"]
+    assert manager.spatial_map is not None and manager.spatial_map.objects
+
+    manager.extractor.by_step = {
+        0: SceneExtraction(
+            objects=["table"],
+            detections=[DetectedObject("table", 0.95, (0.0, 0.0, 8.0, 8.0))],
+            confidence=0.95, source="fake_l1",
+        ),
+    }
+    manager.spatial_extractor.label = "table"
+    policy.reset(
+        {"instruction": {"text": "find the table"}},
+        memory_episode_id="episode_2", memory_scene_id="scene",
+    )
+    assert manager.spatial_map is not None and manager.spatial_map.objects == {}
+    _run(policy, 2)
+
+    prompt = engine.samples[-1]["conversations"][0]["value"]
+    assert "chair" not in prompt
+    assert "table" in prompt
+    assert "[Navigation Map Memory - L3;" in prompt

@@ -410,6 +410,7 @@ default) keeps the original Local Graph/L3 execution path byte for byte.
 | `l1_organized_only` | Organized L1 card: current vs earlier detections, confidence, image sector, sightings; L3 does not run |
 | `l3_original_only` | Original L3 `Spatial history` line; no L1 prompt builder and no Local Graph fallback |
 | `l3_organized_only` | Organized L3 card: instruction-relevant objects, observation count, straight-line range/bearing marked "not a path", traversal evidence, unknown passage |
+| `l3_official_style_only` | Same L3 candidate facts as `l3_organized_only`, rendered as robot-relative map history in the official Prompt Guide's language (direction + object, then a relational anchor / extreme / ordinal only when the map supports it); no L1 layer and no old L3 line template |
 | `l1_l3_original_concat` | Original L1 card followed by the original L3 card under the same total budget |
 | `l1_l3_joint` | Organized L1 + L3 fusion with trusted entity alignment, deduplication, preserved conflicts and explicit uncertainty |
 | `l1_original_l3_organized_concat` | Original L1 Local Graph card followed by the organized L3 card under the same total budget |
@@ -420,6 +421,22 @@ hierarchical --memory_layers short,mid,long`, `--local_graph_enabled` and an
 explicit `--output_dir`; L3 modes additionally require `--spatial_l3_mode
 inject` and `--spatial_l3_seg_model_path`. `RESUME=1` is rejected for these
 modes.
+
+`l3_official_style_only` is an expression-only follow-up, not part of the
+historical eight. It calls the same `L3PromptOrganizer.collect` retrieval as
+`l3_organized_only`, so the candidate facts, their Evidence links and their
+priority order are identical; only `L3OfficialPromptOrganizer` serialization
+differs. It never calls `L1PromptOrganizer`, `LocalGraphFusion.build` or
+`JointPromptBuilder`. Every line starts with `Map record (step N, V views)`,
+keeps the current robot-relative direction and straight-line range, and the
+atomic header states that the block is history rather than a current view and
+that passage is unverified. `l3_organized_only` may additionally emit one
+`map evidence unverified` warning line; the official mode drops that line
+rather than inventing a position, so the verified selected subset is identical
+and the only removed fact is the unverified warning. See
+[`docs/research/L3_OFFICIAL_STYLE_PROMPT.md`](research/L3_OFFICIAL_STYLE_PROMPT.md)
+for the expression rules, the evidence thresholds, the preserved/dropped
+information and the exact experiment command.
 
 The two `l1_original_l3_organized_*` modes are the supplemental follow-up
 experiment. `l1_original_l3_organized_joint` never calls the L1 organizer: the

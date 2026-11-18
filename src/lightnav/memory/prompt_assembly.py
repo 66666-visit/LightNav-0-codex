@@ -2,7 +2,9 @@
 
 This is the only place the experimental modes select data. The original
 ``LocalGraphFusion`` and ``SpatialGraphAdapter`` builders are called unchanged;
-the organized builders are read-only formatters over the same records. The
+the organized and official-style builders are read-only formatters over the
+same records (the official-style L3 builder shares ``collect`` with the
+organized L3 builder, so the candidate set cannot drift). The
 supplemental concat/joint modes read the original L1 card and the organized L3
 card; the joint path never runs ``L1PromptOrganizer``. The character budget is
 the original Local Graph budget for every mode.
@@ -16,6 +18,7 @@ from typing import Any
 
 from lightnav.memory.joint_prompt import JointOrganization, JointPromptBuilder
 from lightnav.memory.l1_prompt_organizer import L1Organization, L1PromptOrganizer
+from lightnav.memory.l3_official_prompt import L3OfficialPromptOrganizer
 from lightnav.memory.l3_prompt_organizer import L3Organization, L3PromptOrganizer
 from lightnav.memory.prompt_modes import PromptModePlan
 from lightnav.memory.schemas import LayerMemoryItem, MemoryContext
@@ -64,6 +67,7 @@ def build_prompt_context(
     spatial_adapter: Any,
     l1_organizer: L1PromptOrganizer,
     l3_organizer: L3PromptOrganizer,
+    official_l3_organizer: L3OfficialPromptOrganizer,
     joint_builder: JointPromptBuilder,
     scene_id: str,
     episode_id: str,
@@ -149,9 +153,18 @@ def build_prompt_context(
                     "no_frame" if frame is None else "no_trusted_spatial_candidate"
                 ),
             }
-        else:
-            assert plan.l3_source == "organized"
+        elif plan.l3_source == "organized":
             l3_org = l3_organizer.build(
+                store, object_map, scene_id=scene_id, episode_id=episode_id,
+                rollout_idx=rollout_idx, step=step, instruction=instruction,
+                frame=frame, scope=scope, max_chars=builder_chars,
+                min_confidence=min_confidence,
+            )
+            l3_context = l3_org.context
+            diagnostics["layers"]["l3"] = l3_org.diagnostics()
+        else:
+            assert plan.l3_source == "official"
+            l3_org = official_l3_organizer.build(
                 store, object_map, scene_id=scene_id, episode_id=episode_id,
                 rollout_idx=rollout_idx, step=step, instruction=instruction,
                 frame=frame, scope=scope, max_chars=builder_chars,
@@ -265,7 +278,11 @@ def build_prompt_context(
         source = "l1_original" if plan.l1_source == "original" else "l1_organized"
     else:
         context = l3_context
-        source = "l3_original" if plan.l3_source == "original" else "l3_organized"
+        source = {
+            "original": "l3_original",
+            "organized": "l3_organized",
+            "official": "l3_official",
+        }[plan.l3_source]
     diagnostics["omitted_items"] = (
         (l1_org.omitted_items if l1_org is not None else 0)
         + (l3_org.omitted_items if l3_org is not None else 0)

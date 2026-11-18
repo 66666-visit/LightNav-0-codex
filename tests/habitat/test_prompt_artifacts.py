@@ -347,3 +347,37 @@ def test_runner_writes_measurement_artifacts_for_legacy_without_changing_path(
     assert rows and all(row["mode"] == "legacy" for row in rows)
     assert all(row["budget_source"] == "original_char_budget" for row in rows)
     assert (output / "per_episode.csv").is_file()
+
+
+def test_official_builder_is_declared_only_for_the_official_mode() -> None:
+    organized = build_prompt_protocol(_memory("l3_organized_only"))
+    assert "l3_official" not in organized["builders"]
+    assert organized["layer_activation"]["l3_layer"] == "organized"
+
+    official = build_prompt_protocol(_memory("l3_official_style_only"))
+    assert official["builders"]["l3_official"] == (
+        "lightnav.memory.l3_official_prompt.L3OfficialPromptOrganizer"
+    )
+    assert official["layer_activation"]["l3_layer"] == "official"
+    assert official["layer_activation"]["l1_prompt_enabled"] is False
+
+
+def test_diagnostic_row_records_the_official_expression() -> None:
+    expression = {
+        "expression_version": "l3_official_style_v1",
+        "strategy_counts": {"relational_anchor": 1},
+        "anchors_used": [{"label": "dining table", "relation": "next to"}],
+    }
+    row = prompt_diagnostic_row(
+        {
+            "step": 3,
+            "prompt_mode": "l3_official_style_only",
+            "prompt_context": {
+                "layers": {"l3": {"expression": expression}},
+                "source": "l3_official",
+            },
+        },
+        episode_id="episode", habitat_episode_id="habitat", scene_id="scene",
+    )
+    assert row["l3_expression"] == expression
+    assert row["source"] == "l3_official"

@@ -790,11 +790,21 @@ class TrajVocabVLNCEPolicy:
                             if delta > token_budget.available_tokens:
                                 new_context, dropped = trim_context_for_overflow(context)
                                 token_overflow_drops += dropped
-                                if new_context is None or dropped == 0:
+                                if (
+                                    new_context is None
+                                    or dropped == 0
+                                    or not new_context.layer_items
+                                ):
+                                    # A block that carried facts but lost every
+                                    # item to trimming is only a caveat header;
+                                    # do not inject that as a pseudo-memory.
                                     context = None
                                     fallback_reason = (
                                         "token budget overflow: no lower-priority "
                                         "item could be dropped"
+                                        if dropped == 0 else
+                                        "token budget overflow: no fact item "
+                                        "survived trimming"
                                     )
                                     manager.discard_prompt_context()
                                 else:

@@ -220,7 +220,9 @@ def _write_provenance(
     }), encoding="utf-8")
 
 
-def _group_artifacts(root: Path, mode: str, manifest: dict) -> None:
+def _group_artifacts(
+    root: Path, mode: str, manifest: dict, *, source_sha256: str | None = None,
+) -> None:
     from hashlib import sha256
 
     from lightnav.memory.prompt_modes import (
@@ -262,7 +264,7 @@ def _group_artifacts(root: Path, mode: str, manifest: dict) -> None:
             "eval_config_sha256": eval_config,
             "habitat_config_sha256": habitat_config,
             "gpu_ids": gpu_ids,
-            "source_python_sha256": (
+            "source_python_sha256": source_sha256 or (
                 "1" * 64 if mode in SUPPLEMENTAL_ABLATION_PROMPT_MODES else "2" * 64
             ),
         },
@@ -668,3 +670,92 @@ def test_resume_refuses_to_mix_core_and_supplemental_stages(tmp_path: Path) -> N
     )
     assert resumed.returncode != 0
     assert "resume provenance modes differ" in resumed.stderr
+
+
+def test_official_style_stage_requires_the_two_historical_l3_groups(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "out"
+    missing = _run(
+        tmp_path, {}, "--official-style", "--preflight-only",
+        "--output-root", str(output),
+    )
+    assert missing.returncode != 0
+    assert "requires --historical-root" in missing.stderr
+
+    historical = tmp_path / "historical"
+    historical.mkdir()
+    (historical / "provenance.json").write_text("{}", encoding="utf-8")
+    for mode in ("l3_original_only", "l3_organized_only"):
+        group = historical / mode
+        group.mkdir()
+        (group / "pilot_complete.json").write_text("{}", encoding="utf-8")
+
+    result = _run(
+        tmp_path, {}, "--dry-run", "--official-style",
+        "--historical-root", str(historical), "--output-root", str(output),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "l3_official_style_only" in result.stdout
+    assert "Official-style stage" in result.stdout
+
+
+def test_official_style_stage_rejects_a_historical_root_missing_one_group(
+    tmp_path: Path,
+) -> None:
+    historical = tmp_path / "historical"
+    historical.mkdir()
+    (historical / "provenance.json").write_text("{}", encoding="utf-8")
+    group = historical / "l3_original_only"
+    group.mkdir()
+    (group / "pilot_complete.json").write_text("{}", encoding="utf-8")
+
+    result = _run(
+        tmp_path, {}, "--dry-run", "--official-style",
+        "--historical-root", str(historical), "--output-root", str(tmp_path / "out"),
+    )
+    assert result.returncode != 0
+    assert "l3_organized_only" in result.stderr
+
+
+def test_official_style_group_with_a_new_source_is_a_valid_cross_stage_comparison(
+    tmp_path: Path,
+) -> None:
+    from hashlib import sha256
+
+    from lightnav.memory.prompt_modes import OFFICIAL_STYLE_PROMPT_MODE
+    from scripts.compare_l1_l3_prompt_ablation import compare
+
+    manifest = _manifest()
+    historical = tmp_path / "historical"
+    official = tmp_path / "official"
+    historical.mkdir()
+    official.mkdir()
+    pilot = tmp_path / "pilot_manifest.json"
+    pilot.write_text(json.dumps(_pilot_manifest()), encoding="utf-8")
+    pilot_sha = sha256(pilot.read_bytes()).hexdigest()
+    for root in (historical, official):
+        (root / "episode_manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8",
+        )
+        _write_provenance(root, manifest, pilot_sha256=pilot_sha)
+    _group_artifacts(
+        historical, "l3_original_only", manifest, source_sha256="2" * 64,
+    )
+    _group_artifacts(
+        historical, "l3_organized_only", manifest, source_sha256="2" * 64,
+    )
+    _group_artifacts(
+        official, OFFICIAL_STYLE_PROMPT_MODE, manifest, source_sha256="3" * 64,
+    )
+    groups = ("l3_original_only", "l3_organized_only", OFFICIAL_STYLE_PROMPT_MODE)
+    with pytest.raises(ValueError, match="source versions"):
+        compare(official, historical_root=historical, groups=groups)
+    report, _ = compare(
+        official, historical_root=historical, groups=groups,
+        allow_source_difference=True, pilot_manifest=pilot,
+    )
+    assert report["status"] == "complete"
+    assert report["checks"]["source_version_difference_allowed"] is True
+    assert "l3_official_style_only_minus_l3_original_only" in report["paired_differences"]
+    assert "l3_official_style_only_minus_l3_organized_only" in report["paired_differences"]

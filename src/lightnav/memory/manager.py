@@ -13,6 +13,7 @@ from lightnav.memory.conceptgraphs_lite import ObjectMap, RGBDFrame
 from lightnav.memory.episodic_memory import EpisodicMemory
 from lightnav.memory.joint_prompt import JointPromptBuilder
 from lightnav.memory.l1_prompt_organizer import L1PromptOrganizer
+from lightnav.memory.l3_official_prompt import L3OfficialPromptOrganizer
 from lightnav.memory.l3_prompt_organizer import L3PromptOrganizer
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.local_graph_fusion import LocalGraphFusion
@@ -139,6 +140,12 @@ class MemoryManager:
         )
         self.l3_prompt_organizer = L3PromptOrganizer(
             max_items=self.local_graph_config.max_landmarks,
+        )
+        # The official-style condition shares candidate retrieval with the
+        # organized organizer and differs only in serialization.
+        self.l3_official_prompt_organizer = L3OfficialPromptOrganizer(
+            max_items=self.local_graph_config.max_landmarks,
+            collector=self.l3_prompt_organizer,
         )
         self.joint_prompt_builder = JointPromptBuilder(
             max_items=self.local_graph_config.max_landmarks + 1,
@@ -516,6 +523,7 @@ class MemoryManager:
             spatial_adapter=self.spatial_adapter,
             l1_organizer=self.l1_prompt_organizer,
             l3_organizer=self.l3_prompt_organizer,
+            official_l3_organizer=self.l3_official_prompt_organizer,
             joint_builder=self.joint_prompt_builder,
             scene_id=self.v3_scene_id,
             episode_id=self.working.state.episode_id,

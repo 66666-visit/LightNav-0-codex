@@ -1,11 +1,16 @@
 """Prompt-organization modes for the L1 + L3 navigation-context ablation.
 
-The nine modes (legacy + eight experimental conditions) select which existing
-memory layers contribute text and whether the original or the organized form
+The ten modes (legacy + eight historical conditions + the official-style L3
+condition) select which existing memory layers contribute text and which form
 of a layer is serialized. They never change model weights, action decoding, the
 video input, or the original prompt text: every mode injects one bounded block
 after ``</navigation_task>`` using the same adapter and the same budget policy
 as the original Local Graph path.
+
+``l3_official_style_only`` is the follow-up expression-only condition. It keeps
+the L3 candidate retrieval of ``l3_organized_only`` but renders the selected
+map facts as robot-relative statements in the language of the official Prompt
+Guide. L1 prompt construction is disabled exactly as in the other L3-only mode.
 """
 
 from __future__ import annotations
@@ -30,15 +35,21 @@ SUPPLEMENTAL_ABLATION_PROMPT_MODES: tuple[str, ...] = (
     "l1_original_l3_organized_joint",
 )
 
-#: All eight non-legacy conditions; the first six are the historical groups.
+#: All eight historical non-legacy conditions.
 ABLATION_PROMPT_MODES: tuple[str, ...] = (
     *CORE_ABLATION_PROMPT_MODES,
     *SUPPLEMENTAL_ABLATION_PROMPT_MODES,
 )
 
-MEMORY_PROMPT_MODES: tuple[str, ...] = ("legacy", *ABLATION_PROMPT_MODES)
+#: Follow-up expression-only condition (not part of the 88-Episode historical
+#: seven). It reuses the organized-L3 candidate retrieval.
+OFFICIAL_STYLE_PROMPT_MODE = "l3_official_style_only"
 
-_LAYER_SOURCES = {"original", "organized"}
+MEMORY_PROMPT_MODES: tuple[str, ...] = (
+    "legacy", *ABLATION_PROMPT_MODES, OFFICIAL_STYLE_PROMPT_MODE,
+)
+
+_LAYER_SOURCES = {"original", "organized", "official"}
 
 
 @dataclass(frozen=True)
@@ -92,6 +103,10 @@ class PromptModePlan:
         return self.l3_source == "organized"
 
     @property
+    def l3_official(self) -> bool:
+        return self.l3_source == "official"
+
+    @property
     def joint(self) -> bool:
         return self.combination == "joint"
 
@@ -137,6 +152,9 @@ _PLANS: dict[str, PromptModePlan] = {
     ),
     "l1_original_l3_organized_joint": PromptModePlan(
         "l1_original_l3_organized_joint", "original", "organized", "joint",
+    ),
+    OFFICIAL_STYLE_PROMPT_MODE: PromptModePlan(
+        OFFICIAL_STYLE_PROMPT_MODE, None, "official", "single",
     ),
 }
 
