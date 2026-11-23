@@ -71,6 +71,10 @@ habitat = ["pyzmq>=25"]
 # Local YOLO11n RGB object detection for the optional Habitat MemoryManager extractor.
 # Only installed when explicitly requested; the default null extractor needs no YOLO package.
 yolo11 = ["ultralytics>=8.3,<9"]
+# Local OpenCLIP encoder for the optional on-demand L3 text query.  This is the
+# same encoder family ConceptGraphs uses (ViT-H-14 / laion2b_s32b_b79k); the
+# checkpoint is supplied as a local file and is never downloaded by LightNav.
+clip = ["open_clip_torch>=2.24"]
 # CPU-only unit tests (scheduler, decode parsing, protocol, sample builders).
 test = ["pytest>=8", "pytest-asyncio>=0.24"]
 

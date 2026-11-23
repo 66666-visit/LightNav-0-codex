@@ -10,10 +10,11 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from lightnav.memory.clip_features import fuse_clip_feature
 from lightnav.memory.v3_schemas import parse_evidence_key
 
 
@@ -334,6 +335,12 @@ class ObjectNode:
     evidence_ids: list[str]
     geometry_status: str = "observed"
     points_world: np.ndarray = field(default_factory=lambda: np.empty((0, 3)))
+    # Fused, L2-normalized visual feature and its observation count. Both are
+    # populated after ``ObjectMap.observe`` has finished its geometry pass; the
+    # geometry, identity and evidence fields above are never derived from them.
+    clip_feature: np.ndarray | None = None
+    clip_feature_observations: int = 0
+    clip_feature_evidence_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -534,3 +541,31 @@ class ObjectMap:
             self.edges.append(ObservedFromEdge(node.object_id, viewpoint_id, instance.evidence_id))
             observed.append(node)
         return observed
+
+    def attach_clip_features(self, features: Mapping[str, Any]) -> int:
+        """Fuse per-observation CLIP features into existing object nodes.
+
+        ``features`` maps an L3 Evidence ID from this frame to one normalized
+        visual feature. Only nodes that already contain that Evidence are
+        updated, so object identity, point clouds, boxes, centers, observation
+        counts and graph edges are untouched. Fusing is idempotent per Evidence
+        ID and follows ConceptGraphs ``merge_obj2_into_obj1``: detection-count
+        weighted average followed by L2 normalization.
+
+        Returns the number of newly fused observations.
+        """
+        if not features:
+            return 0
+        attached = 0
+        for node in self.objects.values():
+            for evidence_id in node.evidence_ids:
+                if evidence_id not in features or evidence_id in node.clip_feature_evidence_ids:
+                    continue
+                node.clip_feature, node.clip_feature_observations = fuse_clip_feature(
+                    node.clip_feature,
+                    node.clip_feature_observations,
+                    features[evidence_id],
+                )
+                node.clip_feature_evidence_ids.append(evidence_id)
+                attached += 1
+        return attached

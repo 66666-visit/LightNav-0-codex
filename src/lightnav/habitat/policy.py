@@ -474,11 +474,19 @@ class TrajVocabVLNCEPolicy:
         spatial_diagnostic = None
         spatial_context = None
         spatial_fallback_reason = None
+        l1_status: str | None = None
+        l3_query_diagnostic: dict[str, Any] = {}
         if spatial_mode != "off":
-            with _preserve_global_rng() if spatial_mode == "shadow" else nullcontext():
+            with _preserve_global_rng() if spatial_mode in {
+                "shadow", "on_demand",
+            } else nullcontext():
                 try:
                     spatial_diagnostic = manager.observe_spatial(obs, info, events, step=step)
-                    spatial_context = manager.get_spatial_context(step=step)
+                    # ``inject`` keeps the original L3-replaces-L1 ablation and
+                    # ``shadow`` needs the candidate count for diagnostics.  The
+                    # new ``on_demand`` mode must not read L3 before L1.
+                    if spatial_mode in {"shadow", "inject"}:
+                        spatial_context = manager.get_spatial_context(step=step)
                 except Exception as exc:  # noqa: BLE001
                     # Shadow must remain observational even if the L3 sidecar
                     # fails unexpectedly. Injection falls back to Local Graph.
@@ -505,6 +513,30 @@ class TrajVocabVLNCEPolicy:
             context = manager.get_local_graph_context(
                 step=step, rgb_width=int(obs["rgb"].shape[1]), events=events,
             )
+            l1_status = manager.last_local_graph_status
+            # L1 Original is primary: only an explicit empty L1 candidate set
+            # (or an L1 card fully dropped by its own budget) can reach L3.
+            if context is None and spatial_mode == "on_demand":
+                pose = (
+                    manager.last_spatial_frame.agent_pose
+                    if manager.last_spatial_frame is not None else None
+                )
+                context = manager.get_on_demand_l3_context(
+                    step=step, instruction=self.instruction, agent_pose=pose,
+                    l1_status=l1_status or "no_candidates",
+                    max_chars=budget,
+                )
+                l3_query_diagnostic = dict(manager.last_l3_query_diagnostic)
+                if context is not None:
+                    context_source = "l3_on_demand"
+                    if spatial_diagnostic is not None:
+                        spatial_diagnostic["candidate_count"] = len(context.layer_items)
+                elif spatial_diagnostic is not None:
+                    spatial_diagnostic["candidate_count"] = 0
+                    spatial_fallback_reason = (
+                        l3_query_diagnostic.get("skipped_reason")
+                        or "no_on_demand_l3_match"
+                    )
         sample = base_sample
         memory_text = ""
         prompt_audit = None
@@ -537,6 +569,7 @@ class TrajVocabVLNCEPolicy:
                             "scene_id": manager.v3_scene_id,
                             "rollout_idx": manager.v3_rollout_idx,
                             "memory_backend": "local_graph",
+                            "context_source": context_source,
                             "step_id": step,
                             "original_instruction": self.instruction,
                             "memory_text": memory_text,
@@ -566,6 +599,8 @@ class TrajVocabVLNCEPolicy:
                         )
                         context_source = "local_graph"
                         continue
+                    if context_source == "l3_on_demand":
+                        spatial_fallback_reason = fallback_reason
             try:
                 text, _ = self.engine.generate(sample)
                 break
@@ -591,6 +626,8 @@ class TrajVocabVLNCEPolicy:
                             step=step, rgb_width=int(obs["rgb"].shape[1]), events=events,
                         )
                         context_source = "local_graph"
+                    elif context_source == "l3_on_demand":
+                        spatial_fallback_reason = fallback_reason
                     else:
                         manager.local_graph_fusion.discard_selection()
                 sample = base_sample
@@ -660,7 +697,13 @@ class TrajVocabVLNCEPolicy:
                 "context_source": context_source,
                 "fallback_reason": spatial_fallback_reason,
                 "shadow_no_spatial_injection": spatial_mode == "shadow",
+                "l1_status": l1_status,
+                "l3_query": l3_query_diagnostic,
             }
+            if spatial_mode == "on_demand":
+                stats = manager.l3_query_stats_summary()
+                diagnostic["spatial_l3"]["l3_query_stats"] = stats
+                diagnostic["l3_query_stats"] = stats
         return text, sample, diagnostic
 
     def _generate_with_prompt_mode(
@@ -692,16 +735,22 @@ class TrajVocabVLNCEPolicy:
         frame = None
         spatial_diagnostic = None
         spatial_fallback_reason = None
-        if plan.uses_l3:
-            try:
-                spatial_diagnostic = manager.observe_spatial(obs, info, events, step=step)
-                frame = manager.last_spatial_frame
-            except Exception as exc:  # noqa: BLE001
-                spatial_fallback_reason = f"spatial_candidate: {exc}"
-                spatial_diagnostic = {
-                    "mode": "inject", "step": step,
-                    "rejection_reason": f"{type(exc).__name__}: {exc}",
-                }
+        spatial_mode = manager.spatial_l3_config.mode
+        if plan.uses_l3 or spatial_mode == "on_demand":
+            with _preserve_global_rng() if spatial_mode in {
+                "shadow", "on_demand",
+            } else nullcontext():
+                try:
+                    spatial_diagnostic = manager.observe_spatial(
+                        obs, info, events, step=step,
+                    )
+                    frame = manager.last_spatial_frame
+                except Exception as exc:  # noqa: BLE001
+                    spatial_fallback_reason = f"spatial_candidate: {exc}"
+                    spatial_diagnostic = {
+                        "mode": spatial_mode, "step": step,
+                        "rejection_reason": f"{type(exc).__name__}: {exc}",
+                    }
         base_sample = build_vln_traj_sample(
             self.agent._get_video_tensor(), self.agent.instruction,
             list(self.agent._history_frame_ids), self.engine.bundle,
@@ -825,6 +874,9 @@ class TrajVocabVLNCEPolicy:
                             "rollout_idx": manager.v3_rollout_idx,
                             "memory_backend": f"l1_l3_prompt:{plan.mode}",
                             "memory_use_mode": plan.mode,
+                            "context_source": (
+                                result.source if result is not None else "none"
+                            ),
                             "step_id": step,
                             "original_instruction": self.instruction,
                             "memory_text": memory_text,
@@ -974,6 +1026,12 @@ class TrajVocabVLNCEPolicy:
                 "context_source": result.source if result is not None else "none",
                 "fallback_reason": spatial_fallback_reason,
             }
+            on_demand = prompt_context.get("on_demand_l3")
+            if isinstance(on_demand, dict):
+                prompt_context["spatial_l3"]["l3_query"] = on_demand
+                prompt_context["spatial_l3"]["l3_query_stats"] = (
+                    prompt_context.get("l3_query_stats")
+                )
         diagnostic = {
             "episode_id": manager.working.state.episode_id,
             "memory_backend": f"l1_l3_prompt:{plan.mode}",
@@ -995,6 +1053,8 @@ class TrajVocabVLNCEPolicy:
             "prompt_context": prompt_context,
             "model_input_diagnostic": dict(model_input) if checked else None,
         }
+        if "l3_query_stats" in prompt_context:
+            diagnostic["l3_query_stats"] = prompt_context["l3_query_stats"]
         return text, sample, diagnostic
 
     def act(self, obs: dict[str, Any], info: dict[str, Any] | None = None) -> dict:

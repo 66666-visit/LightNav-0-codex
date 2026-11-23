@@ -294,8 +294,12 @@ does not infer a route or change the action decoder.
 
 ### ConceptGraphs-Lite L3 (Habitat Local Graph extension)
 
-`--spatial_l3_mode {off,shadow,inject}` adds the independent three-dimensional
+`--spatial_l3_mode {off,shadow,inject,on_demand}` adds the independent three-dimensional
 object map described in [CONCEPTGRAPHS_LITE_L3.md](research/CONCEPTGRAPHS_LITE_L3.md).
+`on_demand` is documented in
+[L3_ON_DEMAND_CLIP_QUERY.md](research/L3_ON_DEMAND_CLIP_QUERY.md): it keeps the
+L1 Original path primary and runs a local CLIP text query only after L1 returns an
+empty candidate set.
 It requires `--memory_enabled --memory_strategy hierarchical --memory_layers
 short,mid,long --local_graph_enabled`. The default `off` preserves the existing
 Local Graph behavior. It runs only in the Habitat evaluation client when that
@@ -304,14 +308,39 @@ the WebSocket inference server has no RGB-D map interface.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--spatial_l3_mode` | `off` | `shadow` builds/searches the graph for diagnostics without modifying the original model input; `inject` allows audited, trustworthy spatial candidates |
-| `--spatial_l3_seg_model_path FILE` | empty | Existing local `yolo11n-seg.pt`; required for `shadow` or `inject`; never downloaded or overwritten |
+| `--spatial_l3_mode` | `off` | `shadow` builds/searches the graph for diagnostics without modifying the original model input; `inject` allows audited, trustworthy spatial candidates; `on_demand` keeps L1 primary and queries L3 only after an empty L1 result |
+| `--spatial_l3_seg_model_path FILE` | empty | Existing local `yolo11n-seg.pt`; required for `shadow`, `inject` or `on_demand`; never downloaded or overwritten |
 | `--spatial_l3_seg_device` | `cpu` | Independent segmentation inference device |
 | `--spatial_l3_seg_confidence` | `0.25` | Raw YOLO segmentation score floor, not a calibrated probability |
 | `--spatial_l3_seg_every_n_steps` | `5` | L3 Mask extraction cadence (step 0, 5, 10, …), independent of L1 |
 | `--spatial_l3_evidence_min_iou` | `0.5` | Minimum same-class segmentation-box/L1-box IoU for an optional cross-reference |
 | `--spatial_l3_evidence_ambiguity_margin` | `0.1` | Reject an L1 cross-reference when the best and second-best IoU differ by less |
 | `--spatial_l3_min_injection_confidence` | `0.5` | Minimum raw L3 segmentation confidence for a historical object to enter Prompt |
+| `--spatial_l3_clip_model_path FILE` | empty | Local OpenCLIP checkpoint for `on_demand`; required by that mode, never downloaded |
+| `--spatial_l3_clip_model_name` | `ViT-H-14` | OpenCLIP architecture name; matches the official ConceptGraphs encoder |
+| `--spatial_l3_clip_device` | `cpu` | Local CLIP image/text inference device |
+| `--spatial_l3_clip_precision` | `fp32` | OpenCLIP precision (`fp32`, `fp16`, `bf16`); `fp16` requires a CUDA `clip_device` and is the recommended 24 GB-GPU setting |
+| `--spatial_l3_clip_batch_size` | `8` | Maximum image crops per CLIP forward pass; bounds activation memory |
+| `--spatial_l3_clip_top_k` | `3` | Maximum matched objects appended to an L1-empty Prompt |
+| `--spatial_l3_clip_min_similarity` | `0.0` | Cosine floor for a valid match; `0.0` is the sign boundary, not a tuned confidence threshold |
+
+`on_demand` is valid with `--memory_prompt_mode legacy` or
+`--memory_prompt_mode l1_original_only`; the latter is the preserved 75 % SR
+L1 Original arm. It is rejected with the other prompt-ablation modes. It also
+requires `--memory_extractor yolo11` and the optional `clip` extra
+(`pip install -e ".[clip]"`) for `open_clip_torch`. The L3 CLIP checkpoint is
+loaded from the local file path passed to OpenCLIP; LightNav never downloads
+weights.
+
+The prompt-mode path uses the existing token-aware budget (base prompt and
+Processor/tokenizer measurement) and falls back to the original 320-character
+allowance only when measurement is unavailable. The legacy path keeps its
+original 320-character allowance. Three compact on-demand lines fit inside 320
+characters; the L3 block is still whole-line truncated by the unchanged budget
+logic. `L3 CLIP cos` in the prompt is the raw cosine score, not a probability.
+Per-step `memory_diagnostics.jsonl`/`prompt_diagnostics.jsonl` records the raw
+similarity, rank, Object ID, Evidence IDs, rejection decision, query trigger
+reason and cumulative `l3_query_stats` (trigger/match/injection rates).
 
 The original L1 `--memory_extractor yolo11 --memory_extractor_model_path
 /local/yolo11n.pt` still runs separately. The L3 model must produce a real
@@ -323,8 +352,10 @@ cross-reference. A missing or ambiguous L1 match never changes the L3 Mask or
 blocks a geometrically valid object. The original L1 Evidence contract remains
 unchanged. Use separate local paths for the two model weights.
 
-Each `shadow` or `inject` run also writes `conceptgraphs_l3_protocol.json` with
-its mode and geometry settings beside the unchanged `local_graph_protocol.json`.
+Each non-`off` L3 run also writes `conceptgraphs_l3_protocol.json` with its
+mode and geometry/CLIP settings beside the unchanged `local_graph_protocol.json`.
+For `l1_original_only` + `on_demand`, `prompt_protocol.json` records the
+`on_demand_when_l1_empty` fallback and the unchanged L1 token budget.
 The output directory must be fresh, so these settings cannot overwrite an
 earlier Local Graph result.
 
@@ -406,7 +437,7 @@ default) keeps the original Local Graph/L3 execution path byte for byte.
 | Mode | Injected context |
 | --- | --- |
 | `legacy` | Original path: L3 spatial candidate when `inject`, otherwise the original Local Graph card |
-| `l1_original_only` | Original L1 Local Graph card; the L3 sidecar does not run |
+| `l1_original_only` | Original L1 Local Graph card; L3 is off by default, or an on-demand CLIP fallback when `--spatial_l3_mode on_demand` is set |
 | `l1_organized_only` | Organized L1 card: current vs earlier detections, confidence, image sector, sightings; L3 does not run |
 | `l3_original_only` | Original L3 `Spatial history` line; no L1 prompt builder and no Local Graph fallback |
 | `l3_organized_only` | Organized L3 card: instruction-relevant objects, observation count, straight-line range/bearing marked "not a path", traversal evidence, unknown passage |
@@ -415,9 +446,10 @@ default) keeps the original Local Graph/L3 execution path byte for byte.
 
 Every non-legacy mode requires `--memory_enabled`, `--memory_strategy
 hierarchical --memory_layers short,mid,long`, `--local_graph_enabled` and an
-explicit `--output_dir`; L3 modes additionally require `--spatial_l3_mode
-inject` and `--spatial_l3_seg_model_path`. `RESUME=1` is rejected for these
-modes.
+explicit `--output_dir`; the six ablation L3 modes additionally require
+`--spatial_l3_mode inject` and `--spatial_l3_seg_model_path`. The separate
+`l1_original_only` + `on_demand` arm uses the same L1 builder and budget but is
+not one of the six ablation conditions. `RESUME=1` is rejected for these modes.
 
 **Budget policy.** `min(--memory_max_context_chars,
 --local_graph_prompt_max_chars)` (320 with the defaults) is the original Local

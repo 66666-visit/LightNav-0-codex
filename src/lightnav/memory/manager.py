@@ -9,10 +9,15 @@ from dataclasses import asdict, replace
 from time import perf_counter
 from uuid import uuid4
 
+import numpy as np
+
+from lightnav.memory.clip_features import clip_crop_boxes
 from lightnav.memory.conceptgraphs_lite import ObjectMap, RGBDFrame
 from lightnav.memory.episodic_memory import EpisodicMemory
 from lightnav.memory.joint_prompt import JointPromptBuilder
 from lightnav.memory.l1_prompt_organizer import L1PromptOrganizer
+from lightnav.memory.l3_clip_query import L3ClipQuery, L3QueryResult
+from lightnav.memory.l3_on_demand import L3QueryController, build_l3_query_context
 from lightnav.memory.l3_prompt_organizer import L3PromptOrganizer
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.local_graph_fusion import LocalGraphFusion
@@ -71,6 +76,23 @@ _LAYERS = frozenset({"short", "mid", "long"})
 logger = logging.getLogger(__name__)
 
 
+def _empty_l3_query_stats() -> dict:
+    return {
+        "steps": 0,
+        "l1_built": 0,
+        "l1_no_candidates": 0,
+        "l1_budget_excluded": 0,
+        "l1_reactivation_suppressed": 0,
+        "l1_other": 0,
+        "queries_attempted": 0,
+        "queries_with_match": 0,
+        "queries_without_match": 0,
+        "query_errors": 0,
+        "prompt_budget_excluded": 0,
+        "skipped_reasons": {},
+    }
+
+
 class MemoryManager:
     """Select one memory backend; V3/V4 scopes control Scene retention."""
 
@@ -92,6 +114,7 @@ class MemoryManager:
         local_graph_config: LocalGraphConfig | None = None,
         spatial_l3_config: SpatialL3Config | None = None,
         spatial_extractor: object | None = None,
+        clip_encoder: object | None = None,
         prompt_mode: str = "legacy",
     ) -> None:
         if top_k < 0:
@@ -150,7 +173,20 @@ class MemoryManager:
             raise ValueError("spatial L3 requires Local Graph to be enabled")
         if self.spatial_l3_config.mode != "off" and spatial_extractor is None:
             raise ValueError("spatial L3 requires an independent segmentation extractor")
+        if self.spatial_l3_config.mode == "on_demand" and self.plan.mode not in (
+            "legacy", "l1_original_only",
+        ):
+            raise ValueError(
+                "on_demand L3 requires legacy or l1_original_only L1 prompt path"
+            )
+        if self.spatial_l3_config.mode == "on_demand" and clip_encoder is None:
+            raise ValueError("on_demand L3 requires a local CLIP encoder")
+        if clip_encoder is not None:
+            for method in ("encode_image", "encode_text"):
+                if not callable(getattr(clip_encoder, method, None)):
+                    raise ValueError(f"CLIP encoder is missing {method}()")
         self.spatial_extractor = spatial_extractor
+        self.clip_encoder = clip_encoder
         self.spatial_map = (
             ObjectMap(self.spatial_l3_config.geometry)
             if self.spatial_l3_config.mode != "off" else None
@@ -158,6 +194,19 @@ class MemoryManager:
         self.spatial_adapter = (
             SpatialGraphAdapter() if self.spatial_map is not None else None
         )
+        self.l3_query_controller = (
+            L3QueryController(
+                clip_encoder,
+                top_k=self.spatial_l3_config.clip_top_k,
+                min_similarity=self.spatial_l3_config.clip_min_similarity,
+            )
+            if self.spatial_l3_config.mode == "on_demand" else None
+        )
+        self.last_local_graph_status = "not_attempted"
+        self.last_l3_query_diagnostic: dict = {}
+        self.l3_query_stats = _empty_l3_query_stats()
+        self.last_episode_l3_query_stats: dict = {}
+        self._l3_stats_step: int | None = None
         self.last_spatial_frame: RGBDFrame | None = None
         self.last_spatial_diagnostic: dict = {}
         if sum((self.rgm_config.enabled, self.v3_config.enabled,
@@ -311,6 +360,15 @@ class MemoryManager:
             self.last_spatial_frame = None
             self.last_spatial_diagnostic = {}
             self.spatial_extractor.reset_episode(episode_id, instruction)
+        if self.l3_query_controller is not None:
+            self.l3_query_controller.reset_episode(
+                self.v3_scene_id, episode_id, rollout_idx,
+            )
+        self.last_local_graph_status = "not_attempted"
+        self.last_l3_query_diagnostic = {}
+        self.l3_query_stats = _empty_l3_query_stats()
+        self.last_episode_l3_query_stats = {}
+        self._l3_stats_step = None
         self.extractor.reset_episode(episode_id, instruction)
         if self.topology_active:
             assert self.place_extractor is not None
@@ -422,6 +480,9 @@ class MemoryManager:
             "traversed_to_edges": sum(
                 edge.relation_type == "traversed_to" for edge in self.spatial_map.edges
             ),
+            "clip_feature_observations": 0,
+            "clip_feature_ms": None,
+            "clip_feature_error": None,
             "rejection_reason": None,
         }
         self.last_spatial_frame = None
@@ -451,6 +512,7 @@ class MemoryManager:
             )
             diagnostic["observed_objects"] = len(observed)
             diagnostic["object_nodes"] = len(self.spatial_map.objects)
+            self._attach_clip_features(frame, masks, observed, diagnostic)
             diagnostic["viewpoints"] = len(self.spatial_map.viewpoints)
             diagnostic["observed_from_edges"] = sum(
                 edge.relation_type == "observed_from" for edge in self.spatial_map.edges
@@ -466,6 +528,60 @@ class MemoryManager:
             logger.warning("spatial L3 rejected step=%s: %s", step, exc)
         self.last_spatial_diagnostic = diagnostic
         return dict(diagnostic)
+
+    def _attach_clip_features(
+        self, frame: RGBDFrame, masks: list, observed: list, diagnostic: dict,
+    ) -> None:
+        """Extract one local CLIP feature per accepted mask, after geometry.
+
+        This never participates in object association: the map is already
+        updated, and only Evidence IDs that belong to a returned node receive a
+        feature.  Failure is recorded and cannot break the L3 geometry pass or
+        the frozen policy.
+        """
+        if (self.clip_encoder is None or self.spatial_map is None
+                or self.spatial_l3_config.mode != "on_demand"):
+            return
+        if not masks:
+            return
+        current_ids = {mask.evidence_id for mask in masks}
+        linked_ids = {
+            evidence_id
+            for node in observed
+            for evidence_id in node.evidence_ids
+            if evidence_id in current_ids
+        }
+        selected = [mask for mask in masks if mask.evidence_id in linked_ids]
+        if not selected:
+            return
+        started = perf_counter()
+        try:
+            boxes = clip_crop_boxes(
+                [mask.mask for mask in selected], frame.rgb.shape[:2],
+            )
+            pairs = [
+                (mask, box) for mask, box in zip(selected, boxes)
+                if box is not None
+            ]
+            if not pairs:
+                return
+            features = self.clip_encoder.encode_image(
+                frame.rgb, [box for _, box in pairs],
+            )
+            values = np.asarray(features, dtype=np.float32)
+            if values.ndim != 2 or values.shape[0] != len(pairs) or not np.isfinite(values).all():
+                raise ValueError("CLIP encoder returned features with an invalid shape")
+            attached = self.spatial_map.attach_clip_features({
+                mask.evidence_id: values[index]
+                for index, (mask, _) in enumerate(pairs)
+            })
+            diagnostic["clip_feature_observations"] = attached
+        except Exception as exc:  # noqa: BLE001 - optional visual sidecar
+            diagnostic["clip_feature_error"] = f"{type(exc).__name__}: {exc}"
+            logger.warning("L3 CLIP feature extraction failed step=%s: %s",
+                           diagnostic.get("step"), exc)
+        finally:
+            diagnostic["clip_feature_ms"] = (perf_counter() - started) * 1000.0
 
     def get_spatial_context(self, *, step: int) -> MemoryContext | None:
         """Adapt reliable historical 3D objects to the existing prompt contract."""
@@ -507,6 +623,24 @@ class MemoryManager:
         char_limit = (
             UNBOUNDED_CHAR_LIMIT if token_limited else self.prompt_budget_chars
         )
+        l3_diag: dict = {}
+        on_demand_builder = None
+        if (
+            self.plan.mode == "l1_original_only"
+            and self.spatial_l3_config.mode == "on_demand"
+            and self.l3_query_controller is not None
+        ):
+            def _on_demand(l1_status: str) -> MemoryContext | None:
+                nonlocal l3_diag
+                pose = getattr(frame, "agent_pose", None) if frame is not None else None
+                context = self.get_on_demand_l3_context(
+                    step=step, instruction=instruction, agent_pose=pose,
+                    l1_status=l1_status, max_chars=char_limit,
+                )
+                l3_diag = dict(self.last_l3_query_diagnostic)
+                return context
+
+            on_demand_builder = _on_demand
         result = build_prompt_context(
             self.plan,
             store=self.v3_store,
@@ -532,7 +666,34 @@ class MemoryManager:
             char_limit=char_limit,
             token_budget=token_budget,
             budget_failure=budget_failure,
+            on_demand_l3=on_demand_builder,
         )
+        l1_status = (
+            result.diagnostics.get("layers", {}).get("l1", {}).get("build_status")
+        )
+        if isinstance(l1_status, str):
+            self.last_local_graph_status = l1_status
+            self._record_l1_status(l1_status, step)
+        if on_demand_builder is not None:
+            if not l3_diag:
+                l3_diag = {
+                    "trigger": l1_status or "not_attempted",
+                    "query_executed": False,
+                    "candidate_count": 0,
+                    "skipped_reason": (
+                        "l1_satisfied" if result.context is not None else "not_invoked"
+                    ),
+                }
+            if (
+                int(l3_diag.get("candidate_count", 0) or 0) > 0
+                and result.context is None
+                and not l3_diag.get("prompt_budget_excluded")
+            ):
+                l3_diag["skipped_reason"] = "prompt_budget_excluded"
+                l3_diag["prompt_budget_excluded"] = True
+                self.l3_query_stats["prompt_budget_excluded"] += 1
+            result.diagnostics["on_demand_l3"] = l3_diag
+            result.diagnostics["l3_query_stats"] = self.l3_query_stats_summary()
         if self.plan.l1_source == "original" and not result.local_graph_pending:
             # The original builder created a pending selection that the mode
             # did not serialize (for example its block was dropped by budget).
@@ -769,13 +930,122 @@ class MemoryManager:
         """Build a local navigation card from current RGB and scene evidence."""
         if self.local_graph_fusion is None or self.v3_store is None:
             raise RuntimeError("local graph memory is not active")
-        return self.local_graph_fusion.build(
+        context = self.local_graph_fusion.build(
             self.v3_store, scene_id=self.v3_scene_id,
             episode_id=self.working.state.episode_id,
             rollout_idx=self.v3_rollout_idx, step=step,
             instruction=self.working.state.instruction,
             current_place_id=self.v3_place_id,
             rgb_width=rgb_width, events=events,
+        )
+        self.last_local_graph_status = self.local_graph_fusion.last_build_status
+        self._record_l1_status(self.last_local_graph_status, step)
+        return context
+
+    def _record_l1_status(self, status: str, step: int) -> None:
+        """Count one L1 retrieval outcome per step for the on-demand audit."""
+        if self.spatial_l3_config.mode != "on_demand":
+            return
+        if self._l3_stats_step == step:
+            return
+        self._l3_stats_step = step
+        self.l3_query_stats["steps"] += 1
+        if status == "built":
+            self.l3_query_stats["l1_built"] += 1
+        elif status == "no_candidates":
+            self.l3_query_stats["l1_no_candidates"] += 1
+        elif status == "budget_excluded":
+            self.l3_query_stats["l1_budget_excluded"] += 1
+        elif status == "reactivation_suppressed":
+            self.l3_query_stats["l1_reactivation_suppressed"] += 1
+        else:
+            self.l3_query_stats["l1_other"] += 1
+
+    def _record_l3_query(self, diagnostic: dict | None) -> None:
+        if self.spatial_l3_config.mode != "on_demand" or not diagnostic:
+            return
+        if diagnostic.get("query_executed"):
+            self.l3_query_stats["queries_attempted"] += 1
+            if int(diagnostic.get("candidate_count", 0) or 0) > 0:
+                self.l3_query_stats["queries_with_match"] += 1
+            else:
+                self.l3_query_stats["queries_without_match"] += 1
+        if diagnostic.get("prompt_budget_excluded"):
+            self.l3_query_stats["prompt_budget_excluded"] += 1
+        reason = diagnostic.get("skipped_reason")
+        if reason == "query_error":
+            self.l3_query_stats["query_errors"] += 1
+        if reason and not diagnostic.get("query_executed"):
+            reasons = self.l3_query_stats["skipped_reasons"]
+            reasons[reason] = reasons.get(reason, 0) + 1
+
+    def l3_query_stats_summary(self) -> dict:
+        """Return cumulative L1/query/injection counts and explicit rates."""
+        stats = {
+            **self.l3_query_stats,
+            "skipped_reasons": dict(self.l3_query_stats["skipped_reasons"]),
+        }
+        empty_steps = stats["l1_no_candidates"] + stats["l1_budget_excluded"]
+        attempted = stats["queries_attempted"]
+        matched = stats["queries_with_match"]
+        injected = max(0, matched - stats["prompt_budget_excluded"])
+        stats["l1_empty_steps"] = empty_steps
+        stats["queries_injected"] = injected
+        stats["query_trigger_rate"] = (
+            attempted / empty_steps if empty_steps else None
+        )
+        stats["match_rate_of_queries"] = (
+            matched / attempted if attempted else None
+        )
+        stats["injection_rate_of_l1_empty"] = (
+            injected / empty_steps if empty_steps else None
+        )
+        return stats
+
+    def get_on_demand_l3_context(
+        self, *, step: int, instruction: str, agent_pose: object | None,
+        l1_status: str, max_chars: int, query_text: str | None = None,
+    ) -> MemoryContext | None:
+        """Query L3 only after L1 reported an empty candidate set.
+
+        The controller suppresses repeat queries for an unchanged object map,
+        so a failed or empty query never becomes a per-step CLIP call.
+        """
+        if self.l3_query_controller is None or self.spatial_map is None:
+            return None
+        if agent_pose is None:
+            self.last_l3_query_diagnostic = {
+                "trigger": l1_status, "step": step,
+                "skipped_reason": "no_current_pose", "candidate_count": 0,
+                "query_executed": False,
+            }
+            self._record_l3_query(self.last_l3_query_diagnostic)
+            return None
+        result = self.l3_query_controller.maybe_query(
+            self.spatial_map, step=step, instruction=instruction,
+            l1_status=l1_status, query_text=query_text,
+        )
+        self.last_l3_query_diagnostic = dict(
+            self.l3_query_controller.last_diagnostic or {},
+        )
+        context = None
+        if result is not None:
+            context = build_l3_query_context(
+                result, self.spatial_map, agent_pose=agent_pose, max_chars=max_chars,
+            )
+            if context is None:
+                self.last_l3_query_diagnostic["skipped_reason"] = "prompt_budget_excluded"
+                self.last_l3_query_diagnostic["prompt_budget_excluded"] = True
+        self._record_l3_query(self.last_l3_query_diagnostic)
+        return context
+
+    def query_l3_objects(self, text: str, top_k: int) -> L3QueryResult:
+        """Local, non-mutating text query over the current L3 object map."""
+        if self.spatial_map is None or self.clip_encoder is None:
+            raise RuntimeError("on-demand L3 CLIP query is not active")
+        return L3ClipQuery(self.spatial_map, self.clip_encoder).query(
+            text, top_k,
+            min_similarity=self.spatial_l3_config.clip_min_similarity,
         )
 
     def reformat_v4_context(self, excluded_evidence_ids: frozenset[str]) -> MemoryContext | None:
@@ -845,6 +1115,16 @@ class MemoryManager:
                 self.spatial_map.evidence.clear()
                 self.last_spatial_frame = None
                 self.last_spatial_diagnostic = {}
+            if self.l3_query_controller is not None:
+                self.l3_query_controller.close_episode()
+            self.last_local_graph_status = "not_attempted"
+            self.last_l3_query_diagnostic = {}
+            self.last_episode_l3_query_stats = (
+                self.l3_query_stats_summary()
+                if self.spatial_l3_config.mode == "on_demand" else {}
+            )
+            self.l3_query_stats = _empty_l3_query_stats()
+            self._l3_stats_step = None
             self._writer = None
             self._pending_action = None
             self._pending_prediction = None

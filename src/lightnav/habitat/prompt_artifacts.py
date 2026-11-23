@@ -83,6 +83,17 @@ def build_prompt_protocol(memory: Any) -> dict[str, Any]:
             "whole_lines_only": True,
             "max_landmarks": memory.local_graph.max_landmarks,
         }
+        if (
+            plan.mode == "l1_original_only"
+            and getattr(memory.spatial_l3, "mode", "off") == "on_demand"
+        ):
+            layer_activation["l3_layer"] = "on_demand_clip_when_l1_empty"
+            layer_activation["l3_prompt_enabled"] = "on_demand_when_l1_empty"
+            budget["on_demand_l3"] = {
+                "trigger": "l1 no_candidates or budget_excluded",
+                "budget": "same token-aware budget; original char budget fallback",
+                "raw_similarity_is_not_confidence": True,
+            }
     return {
         "protocol_version": PROMPT_PROTOCOL_VERSION,
         "mode": plan.mode,
@@ -158,6 +169,9 @@ def prompt_diagnostic_row(
     layers = context.get("layers", {})
     l1 = layers.get("l1", {}) if isinstance(layers, dict) else {}
     l3 = layers.get("l3", {}) if isinstance(layers, dict) else {}
+    l3_on_demand = (
+        layers.get("l3_on_demand", {}) if isinstance(layers, dict) else {}
+    )
     joint = layers.get("joint", {}) if isinstance(layers, dict) else {}
     alignment = context.get("alignment", {}) or {}
     conflicts = context.get("conflicts", []) or []
@@ -169,6 +183,8 @@ def prompt_diagnostic_row(
     else:
         l1_items = int(l1.get("item_count", 0) or 0)
         l3_items = int(l3.get("item_count", 0) or 0)
+    l3_on_demand_items = int(l3_on_demand.get("item_count", 0) or 0)
+    l3_items += l3_on_demand_items
     budget = context.get("budget", {})
     if not isinstance(budget, dict):
         budget = {}
@@ -199,6 +215,8 @@ def prompt_diagnostic_row(
         "l1_duplicates_removed": l1.get("duplicates_removed", 0),
         "l1_omitted_items": l1.get("omitted_items", 0),
         "l3_candidate_count": l3.get("candidate_count", 0),
+        "l3_on_demand_item_count": l3_on_demand_items,
+        "l3_on_demand_trigger": l3_on_demand.get("trigger"),
         "l3_item_count": l3_items,
         "l3_unverified_count": l3.get("unverified_count", 0),
         "l3_omitted_items": l3.get("omitted_items", 0),

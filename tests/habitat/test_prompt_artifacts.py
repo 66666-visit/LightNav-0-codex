@@ -347,3 +347,59 @@ def test_runner_writes_measurement_artifacts_for_legacy_without_changing_path(
     assert rows and all(row["mode"] == "legacy" for row in rows)
     assert all(row["budget_source"] == "original_char_budget" for row in rows)
     assert (output / "per_episode.csv").is_file()
+
+
+def test_l1_original_only_on_demand_protocol_records_the_fallback() -> None:
+    memory = MemoryConfig(
+        enabled=True, extractor="yolo11", extractor_model_path="/tmp/yolo11n.pt",
+        strategy="hierarchical", layers=("short", "mid", "long"),
+        local_graph=LocalGraphConfig(enabled=True),
+        spatial_l3=SpatialL3Config(
+            mode="on_demand", seg_model_path="/tmp/seg.pt",
+            clip_model_path="/tmp/clip.bin",
+        ),
+        prompt_mode="l1_original_only",
+    )
+    protocol = build_prompt_protocol(memory)
+    assert protocol["mode"] == "l1_original_only"
+    assert protocol["layer_activation"]["l1_prompt_enabled"] is True
+    assert protocol["layer_activation"]["l3_prompt_enabled"] == (
+        "on_demand_when_l1_empty"
+    )
+    assert protocol["budget"]["on_demand_l3"]["trigger"] == (
+        "l1 no_candidates or budget_excluded"
+    )
+
+
+def test_prompt_diagnostic_row_counts_on_demand_l3_items_and_query_stats() -> None:
+    row = prompt_diagnostic_row(
+        {
+            "step": 3,
+            "prompt_mode": "l1_original_only",
+            "prompt_protocol_version": "l1_l3_prompt_ablation_v1",
+            "prompt_context": {
+                "source": "l3_on_demand",
+                "layers": {
+                    "l1": {"item_count": 0, "build_status": "no_candidates"},
+                    "l3_on_demand": {
+                        "item_count": 2, "trigger": "no_candidates",
+                    },
+                },
+                "spatial_l3": {
+                    "context_source": "l3_on_demand",
+                    "l3_query": {
+                        "query_executed": True,
+                        "candidate_count": 2,
+                        "candidates": [{"rank": 1, "object_id": "o1"}],
+                    },
+                    "l3_query_stats": {"query_trigger_rate": 1.0},
+                },
+            },
+        },
+        episode_id="ep", habitat_episode_id="h", scene_id="s",
+    )
+    assert row["l3_on_demand_item_count"] == 2
+    assert row["l3_on_demand_trigger"] == "no_candidates"
+    assert row["l3_item_count"] == 2
+    assert row["spatial_l3"]["l3_query"]["candidates"][0]["object_id"] == "o1"
+    assert row["spatial_l3"]["l3_query_stats"]["query_trigger_rate"] == 1.0

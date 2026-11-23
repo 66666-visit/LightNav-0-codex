@@ -86,18 +86,23 @@ class LocalGraphFusion:
         self._last_signature: tuple[object, ...] | None = None
         self._last_injected_step: int | None = None
         self._pending: tuple[int, tuple[object, ...], frozenset[str]] | None = None
+        # Diagnostic only: lets the on-demand L3 controller distinguish an
+        # empty L1 candidate set from an intentionally suppressed repeat.
+        self.last_build_status = "not_attempted"
 
     def reset_episode(self, scene_id: str, episode_id: str, rollout_idx: int) -> None:
         self._episode = (scene_id, episode_id, rollout_idx)
         self._last_signature = None
         self._last_injected_step = None
         self._pending = None
+        self.last_build_status = "not_attempted"
 
     def close_episode(self) -> None:
         self._episode = None
         self._last_signature = None
         self._last_injected_step = None
         self._pending = None
+        self.last_build_status = "not_attempted"
 
     def discard_selection(self) -> None:
         """Release a context that was rejected by prompt or token budgeting."""
@@ -126,7 +131,9 @@ class LocalGraphFusion:
         events: list[MemoryEvent],
     ) -> MemoryContext | None:
         self._pending = None
+        self.last_build_status = "not_attempted"
         if not self.config.enabled:
+            self.last_build_status = "disabled"
             return None
         identity = (scene_id, episode_id, rollout_idx)
         if self._episode != identity or store.active_episode != identity:
@@ -157,6 +164,7 @@ class LocalGraphFusion:
         elif history:
             selected = history[:self.config.max_landmarks]
         if not selected:
+            self.last_build_status = "no_candidates"
             return None
 
         signature: tuple[object, ...] = (
@@ -164,6 +172,7 @@ class LocalGraphFusion:
         )
         if (signature == self._last_signature and self._last_injected_step is not None
                 and step - self._last_injected_step < self.config.reactivation_steps):
+            self.last_build_status = "reactivation_suppressed"
             return None
 
         lines: list[str] = []
@@ -200,11 +209,13 @@ class LocalGraphFusion:
                 },
             ))
         if not items:
+            self.last_build_status = "budget_excluded"
             return None
         self._pending = (
             step, signature,
             frozenset(ref.event_id for item in items for ref in item.evidence_refs),
         )
+        self.last_build_status = "built"
         return MemoryContext(text=_HEADER + "\n" + "\n".join(lines), layer_items=items)
 
     @staticmethod

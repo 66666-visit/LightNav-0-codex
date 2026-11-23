@@ -8,6 +8,7 @@ character budget is the original Local Graph budget for every mode.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from html import escape
 from typing import Any
@@ -78,6 +79,7 @@ def build_prompt_context(
     char_limit: int | None = None,
     token_budget: MemoryTokenBudget | None = None,
     budget_failure: TokenBudgetFailure | None = None,
+    on_demand_l3: Callable[[str], MemoryContext | None] | None = None,
 ) -> PromptContextResult:
     """Build the mode's context without changing any underlying memory record."""
     if plan.require_legacy():
@@ -110,6 +112,9 @@ def build_prompt_context(
             "layer": "l1", "source": "local_graph_fusion",
             "item_count": len(l1_context.layer_items) if l1_context is not None else 0,
             "prompt_chars": len(l1_context.text) if l1_context is not None else 0,
+            "build_status": getattr(
+                local_graph_fusion, "last_build_status", "not_attempted",
+            ),
             "empty_reason": None if l1_context is not None else "original_builder_empty",
         }
     elif plan.l1_source == "organized":
@@ -223,6 +228,30 @@ def build_prompt_context(
     if plan.l1_source is not None:
         context = l1_context
         source = "l1_original" if plan.l1_source == "original" else "l1_organized"
+        if (
+            context is None
+            and plan.mode == "l1_original_only"
+            and on_demand_l3 is not None
+        ):
+            l1_status = getattr(local_graph_fusion, "last_build_status", "not_attempted")
+            context = on_demand_l3(l1_status)
+            if context is not None:
+                source = "l3_on_demand"
+                local_graph_pending = False
+                diagnostics["layers"]["l3_on_demand"] = {
+                    "layer": "l3_on_demand", "source": "l3_clip_query",
+                    "item_count": len(context.layer_items),
+                    "prompt_chars": len(context.text),
+                    "trigger": l1_status,
+                    "empty_reason": None,
+                }
+            else:
+                diagnostics["layers"]["l3_on_demand"] = {
+                    "layer": "l3_on_demand", "source": "l3_clip_query",
+                    "item_count": 0, "prompt_chars": 0,
+                    "trigger": l1_status,
+                    "empty_reason": "no_valid_on_demand_match",
+                }
     else:
         context = l3_context
         source = "l3_original" if plan.l3_source == "original" else "l3_organized"
@@ -238,7 +267,7 @@ def build_prompt_context(
             ref.event_id for item in (context.layer_items if context is not None else [])
             for ref in item.evidence_refs
         ))
-        if plan.uses_l1 else ()
+        if plan.uses_l1 and source != "l3_on_demand" else ()
     )
     return _result(
         plan, context, source, budget_chars, diagnostics,

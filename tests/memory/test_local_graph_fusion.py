@@ -230,3 +230,35 @@ def test_persistent_local_history_keeps_episode_provenance() -> None:
 def test_invalid_config_is_rejected(kwargs: dict) -> None:
     with pytest.raises(ValueError):
         LocalGraphConfig(**kwargs)
+
+
+def test_build_status_records_no_candidates_budget_excluded_and_built() -> None:
+    store = V3MemoryStore()
+    store.begin_episode("scene", "episode", "find the table")
+    table = store.add(_record("table_0", label="dining table"))
+    fusion = _fusion(prompt_max_chars=1)
+    fusion.reset_episode("scene", "episode", 0)
+    assert fusion.build(
+        store, scene_id="scene", episode_id="episode", rollout_idx=0,
+        step=0, instruction="find the table", current_place_id=None,
+        rgb_width=300, events=[_event(table, [10, 1, 90, 80])],
+    ) is None
+    assert fusion.last_build_status == "budget_excluded"
+
+    fusion = _fusion()
+    fusion.reset_episode("scene", "episode", 0)
+    assert fusion.build(
+        store, scene_id="scene", episode_id="episode", rollout_idx=0,
+        step=1, instruction="find the sofa", current_place_id=None,
+        rgb_width=300, events=[_event(table, [10, 1, 90, 80])],
+    ) is None
+    assert fusion.last_build_status == "no_candidates"
+
+    table_step2 = store.add(_record("table_2", label="dining table", step=2))
+    context = fusion.build(
+        store, scene_id="scene", episode_id="episode", rollout_idx=0,
+        step=2, instruction="find the table", current_place_id=None,
+        rgb_width=300, events=[_event(table_step2, [10, 1, 90, 80])],
+    )
+    assert context is not None
+    assert fusion.last_build_status == "built"

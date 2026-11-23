@@ -262,6 +262,11 @@ header/state/冲突/不确定说明在 320 字符内按整行择优；被预算�
 
 ## 6. 七种模式与默认行为
 
+> 2026-11 更新：本轮新增的 `--spatial_l3_mode on_demand` 是**独立单臂**，不属于
+> 下表六组消融；它可以与 `l1_original_only` 组合，保留该组 L1 Original 原文与
+> token 预算，只在 L1 返回空候选时追加 L3 CLIP 证据。原有六组代码/启动器/结果
+> 不变。运行方式见 [L3_ON_DEMAND_AUTODL.md](L3_ON_DEMAND_AUTODL.md)。
+
 | 模式 | 实际注入 | L3 是否运行 | L1 Prompt 构建器 |
 | --- | --- | --- | --- |
 | `legacy`（默认） | 旧路径：L3 可信候选，否则旧 Local Graph；不拼接、不改预算 | 按配置 | `LocalGraphFusion` |

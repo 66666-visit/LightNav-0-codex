@@ -21,7 +21,7 @@ import os
 import random
 import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable
@@ -148,6 +148,12 @@ class MemoryConfig:
             raise ValueError("spatial L3 requires local graph enabled")
         if self.spatial_l3.mode != "off" and self.extractor != "yolo11":
             raise ValueError("spatial L3 requires the independent L1 yolo11 detector")
+        if self.spatial_l3.mode == "on_demand" and self.prompt_mode not in (
+            "legacy", "l1_original_only",
+        ):
+            raise ValueError(
+                "on_demand L3 requires legacy or l1_original_only L1 prompt mode"
+            )
         if (self.spatial_l3.mode != "off" and self.spatial_l3.seg_model_path
                 == self.extractor_model_path):
             raise ValueError("spatial L3 and L1 must use independent model paths")
@@ -425,6 +431,24 @@ def _apply_decode_budget(engine: Any, bundle: Any, rvq_bundle: Any) -> None:
         engine.max_new_tokens = int(budget)
 
 
+def effective_spatial_l3_config(memory: MemoryConfig) -> SpatialL3Config:
+    """Keep the L3 sidecar only for paths that actually use it.
+
+    The six prompt-ablation modes turn the sidecar off unless the mode itself
+    consumes L3.  The new on-demand arm is special: ``l1_original_only`` does
+    not declare an L3 layer, but it must still build the map and feature cache
+    so it can query only when L1 is empty.
+    """
+    plan = mode_plan(memory.prompt_mode)
+    if (
+        memory.prompt_mode == "legacy"
+        or plan.uses_l3
+        or memory.spatial_l3.mode == "on_demand"
+    ):
+        return memory.spatial_l3
+    return replace(memory.spatial_l3, mode="off")
+
+
 def build_velocity_policy(
     cfg: HabitatEvalConfig, engine: Any, bundle: Any, info: dict[str, Any]
 ) -> TrajVocabVLNCEPolicy:
@@ -444,22 +468,13 @@ def build_velocity_policy(
     )
     memory_manager = None
     if cfg.memory.enabled:
-        from dataclasses import replace
-
         from lightnav.memory.manager import MemoryManager
 
-        prompt_plan = mode_plan(cfg.memory.prompt_mode)
-        # A layer that the selected mode never injects must not run its
-        # sidecar: this is what keeps the L1-only arms free of any L3 read.
-        # Legacy keeps the exact configured backend, including spatial L3.
-        manager_spatial = (
-            cfg.memory.spatial_l3
-            if cfg.memory.prompt_mode == "legacy" or prompt_plan.uses_l3
-            else replace(cfg.memory.spatial_l3, mode="off")
-        )
+        manager_spatial = effective_spatial_l3_config(cfg.memory)
         extractor = None
         place_extractor = None
         spatial_extractor = None
+        clip_encoder = None
         if cfg.memory.extractor == "yolo11":
             from lightnav.memory.yolo_scene_extractor import YOLOSceneExtractor
 
@@ -477,6 +492,16 @@ def build_velocity_policy(
                 device=manager_spatial.seg_device,
                 confidence=manager_spatial.seg_confidence,
                 every_n_steps=manager_spatial.seg_every_n_steps,
+            )
+        if manager_spatial.mode == "on_demand":
+            from lightnav.memory.clip_features import LocalClipEncoder
+
+            clip_encoder = LocalClipEncoder(
+                manager_spatial.clip_model_path,
+                device=manager_spatial.clip_device,
+                model_name=manager_spatial.clip_model_name,
+                precision=manager_spatial.clip_precision,
+                batch_size=manager_spatial.clip_batch_size,
             )
         if (
             cfg.memory.place_enabled and cfg.memory.strategy == "hierarchical"
@@ -504,6 +529,7 @@ def build_velocity_policy(
             local_graph_config=cfg.memory.local_graph,
             spatial_l3_config=manager_spatial,
             spatial_extractor=spatial_extractor,
+            clip_encoder=clip_encoder,
             prompt_mode=cfg.memory.prompt_mode,
         )
     return TrajVocabVLNCEPolicy(
@@ -1011,16 +1037,10 @@ def run_habitat_eval(
     elif cfg.memory.rgm_v4.enabled:
         _prepare_v4_output_dir(output_dir, cfg.memory.rgm_v4, resume=cfg.resume)
     elif cfg.memory.local_graph.enabled:
-        from dataclasses import replace as _replace
-
         _prepare_local_graph_output_dir(output_dir, cfg.memory.local_graph)
-        _prompt_plan = mode_plan(cfg.memory.prompt_mode)
-        _effective_spatial = (
-            cfg.memory.spatial_l3
-            if cfg.memory.prompt_mode == "legacy" or _prompt_plan.uses_l3
-            else _replace(cfg.memory.spatial_l3, mode="off")
+        _write_spatial_l3_protocol(
+            output_dir, effective_spatial_l3_config(cfg.memory),
         )
-        _write_spatial_l3_protocol(output_dir, _effective_spatial)
     else:
         _guard_non_v3_v4_output_dir(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -1485,6 +1505,13 @@ def run_habitat_eval(
                     if inference_latencies else None
                 ),
             }
+            if cfg.memory.spatial_l3.mode == "on_demand":
+                episode_stats = getattr(
+                    getattr(policy, "memory_manager", None),
+                    "last_episode_l3_query_stats", None,
+                )
+                if episode_stats:
+                    result["l3_query_stats"] = episode_stats
             # Only the experimental modes add the measured PathLength field; the
             # legacy result schema stays exactly as before.
             if (

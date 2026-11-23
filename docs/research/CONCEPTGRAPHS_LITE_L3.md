@@ -1,5 +1,12 @@
 # ConceptGraphs-Lite L3 V1.1：Geometry-only 第一阶段
 
+> 2026-11 更新：新增独立的 `spatial_l3.mode=on_demand` 模式。它保留本文件的
+> geometry-only 建图与 L1 Original 路径，只在 L1 返回空候选时用本地 CLIP 查询
+> 已有对象特征；几何关联、点云融合、3D IoU、对象 ID 和既有 `shadow`/`inject`
+> 行为均不变。实现、官方源码对应关系和测试见
+> [L3_ON_DEMAND_CLIP_QUERY.md](L3_ON_DEMAND_CLIP_QUERY.md)。本文件其余内容描述
+> 的是未启用该模式时的 V1.1 几何建图基线。
+
 ## 来源与实现边界
 
 本项目借用 [ConceptGraphs 原论文](https://concept-graphs.github.io/assets/pdf/2023-ConceptGraphs.pdf) 的**有位姿 RGB-D → 实例点云 → 跨视角物体关联 → 增量物体地图**主线。原论文使用类别无关实例分割，使用 CLIP/DINO 视觉特征与三维最近邻比例共同关联物体，融合点云，再由视觉语言模型生成物体描述、语言模型推断物体间关系。论文脚注允许用封闭类别分割模型替代类别无关模型；[官方项目说明](https://concept-graphs.github.io/)也描述了这些步骤。
@@ -81,6 +88,13 @@ V1.1 的三维物体地图按 Scene、Episode 和 rollout 隔离，并在每轮 
 三维适配器沿用现有 Local Graph 的 `MemoryContext` 候选与 Prompt 接口；有可信三维候选时走同一 Prompt 构造、预算和审计链，缺失时调用原 `LocalGraphFusion`。L1、L2、旧候选筛选、Prompt Formatter、Prompt Gate、Token Audit 和原 Prompt 回退均保留。候选可包含历史类别、历史观测位置、相对距离、相对方位、观测次数、Evidence 来源。Prompt 准入还要求独立 L3 分割分数不低于可配置的 `min_injection_confidence`（初值 0.5）；这个分数不是身份概率。距离和方位只由有效当前位姿与可信世界坐标计算；没有真实通行证据时通行状态为未知。
 
 `shadow` 建图、关联、检索并写诊断，但给模型的最终 sample、Prompt、Token ID 和动作与原始基线一致。`inject` 仅允许可信三维候选进入既有 Prompt 审计链；可信候选为空时沿用原 Local Graph，几何不足时不补写距离、方位或通行事实。两种模式都不触及权重与动作预测算法。
+
+新增的 `on_demand` 模式不替换 L1：每步仍先调用 `LocalGraphFusion`，只有它返回
+`no_candidates` 或 `budget_excluded` 时才查询已有 ObjectNode 的本地 CLIP 特征；
+查询命中后才按同一预算追加 Top-K 空间证据。地图未新增视觉证据时不会重复查询。
+该模式可与 `legacy` 或 `l1_original_only` 组合；后者保留历史 75% SR 的 L1
+Original 原文与 token 预算，原有 `shadow`/`inject` 与六组消融不变。
+详见 [L3_ON_DEMAND_CLIP_QUERY.md](L3_ON_DEMAND_CLIP_QUERY.md)。
 
 ## 验证与限制
 

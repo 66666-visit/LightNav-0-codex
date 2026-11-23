@@ -250,8 +250,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Maximum instruction-related landmarks in one local card.")
     p.add_argument("--local_graph_reactivation_steps", type=int, default=8,
                    help="Earliest step interval for reactivating an unchanged local card.")
-    p.add_argument("--spatial_l3_mode", choices=("off", "shadow", "inject"), default="off",
-                   help="ConceptGraphs-Lite: off, shadow diagnostics, or verified Prompt injection.")
+    p.add_argument("--spatial_l3_mode", choices=("off", "shadow", "inject", "on_demand"),
+                   default="off",
+                   help="ConceptGraphs-Lite: off, shadow diagnostics, verified Prompt "
+                        "injection, or L1-first on-demand CLIP query.")
     p.add_argument("--spatial_l3_seg_model_path", default="",
                    help="Local yolo11n-seg.pt path, independent of the L1 detector.")
     p.add_argument("--spatial_l3_seg_device", default="cpu")
@@ -263,6 +265,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Minimum best-versus-second L1 Evidence IoU margin.")
     p.add_argument("--spatial_l3_min_injection_confidence", type=float, default=0.5,
                    help="Minimum independent segmentation confidence for Prompt injection.")
+    p.add_argument("--spatial_l3_clip_model_path", default="",
+                   help="Local OpenCLIP checkpoint used only by on_demand mode; never downloaded.")
+    p.add_argument("--spatial_l3_clip_model_name", default="ViT-H-14",
+                   help="OpenCLIP architecture name; defaults to ConceptGraphs' ViT-H-14.")
+    p.add_argument("--spatial_l3_clip_device", default="cpu")
+    p.add_argument("--spatial_l3_clip_precision", choices=("fp32", "fp16", "bf16"),
+                   default="fp32",
+                   help="OpenCLIP inference precision; fp16 reduces 4090 VRAM use.")
+    p.add_argument("--spatial_l3_clip_batch_size", type=int, default=8,
+                   help="Maximum CLIP image crops per forward pass.")
+    p.add_argument("--spatial_l3_clip_top_k", type=int, default=3,
+                   help="Maximum CLIP query matches appended to an L1-empty Prompt.")
+    p.add_argument("--spatial_l3_clip_min_similarity", type=float, default=0.0,
+                   help="Cosine floor for a valid query match; 0.0 is the sign boundary.")
     geometry_defaults = GeometryConfig()
     for name in (
         "min_depth_m", "max_depth_m", "voxel_size_m", "max_center_distance_m",
@@ -450,6 +466,13 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                 evidence_min_iou=args.spatial_l3_evidence_min_iou,
                 evidence_ambiguity_margin=args.spatial_l3_evidence_ambiguity_margin,
                 min_injection_confidence=args.spatial_l3_min_injection_confidence,
+                clip_model_path=args.spatial_l3_clip_model_path,
+                clip_model_name=args.spatial_l3_clip_model_name,
+                clip_device=args.spatial_l3_clip_device,
+                clip_precision=args.spatial_l3_clip_precision,
+                clip_batch_size=args.spatial_l3_clip_batch_size,
+                clip_top_k=args.spatial_l3_clip_top_k,
+                clip_min_similarity=args.spatial_l3_clip_min_similarity,
                 geometry=GeometryConfig(**{
                     name: getattr(args, f"spatial_l3_{name}") for name in (
                         "min_depth_m", "max_depth_m", "min_points",
