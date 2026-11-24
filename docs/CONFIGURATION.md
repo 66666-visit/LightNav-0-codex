@@ -294,12 +294,15 @@ does not infer a route or change the action decoder.
 
 ### ConceptGraphs-Lite L3 (Habitat Local Graph extension)
 
-`--spatial_l3_mode {off,shadow,inject,on_demand}` adds the independent three-dimensional
-object map described in [CONCEPTGRAPHS_LITE_L3.md](research/CONCEPTGRAPHS_LITE_L3.md).
-`on_demand` is documented in
-[L3_ON_DEMAND_CLIP_QUERY.md](research/L3_ON_DEMAND_CLIP_QUERY.md): it keeps the
-L1 Original path primary and runs a local CLIP text query only after L1 returns an
-empty candidate set.
+`--spatial_l3_mode {off,shadow,inject,on_demand,geometry_on_demand}` adds the
+independent three-dimensional object map described in
+[CONCEPTGRAPHS_LITE_L3.md](research/CONCEPTGRAPHS_LITE_L3.md). `on_demand` is
+documented in [L3_ON_DEMAND_CLIP_QUERY.md](research/L3_ON_DEMAND_CLIP_QUERY.md):
+it keeps the L1 Original path primary and runs a local CLIP text query only after
+L1 returns an empty candidate set. `geometry_on_demand` uses the same L1-empty
+trigger and dedupe but the existing geometry-only candidate retrieval
+(`SpatialGraphAdapter`); it never loads CLIP weights or runs OpenCLIP. See
+[GEOMETRY_ON_DEMAND.md](research/GEOMETRY_ON_DEMAND.md).
 It requires `--memory_enabled --memory_strategy hierarchical --memory_layers
 short,mid,long --local_graph_enabled`. The default `off` preserves the existing
 Local Graph behavior. It runs only in the Habitat evaluation client when that
@@ -308,7 +311,7 @@ the WebSocket inference server has no RGB-D map interface.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--spatial_l3_mode` | `off` | `shadow` builds/searches the graph for diagnostics without modifying the original model input; `inject` allows audited, trustworthy spatial candidates; `on_demand` keeps L1 primary and queries L3 only after an empty L1 result |
+| `--spatial_l3_mode` | `off` | `shadow` builds/searches the graph for diagnostics without modifying the original model input; `inject` allows audited, trustworthy spatial candidates; `on_demand` keeps L1 primary and runs the CLIP query only after an empty L1 result; `geometry_on_demand` keeps the same trigger but retrieves the existing geometry-only spatial candidates (no CLIP) |
 | `--spatial_l3_seg_model_path FILE` | empty | Existing local `yolo11n-seg.pt`; required for `shadow`, `inject` or `on_demand`; never downloaded or overwritten |
 | `--spatial_l3_seg_device` | `cpu` | Independent segmentation inference device |
 | `--spatial_l3_seg_confidence` | `0.25` | Raw YOLO segmentation score floor, not a calibrated probability |
@@ -323,6 +326,10 @@ the WebSocket inference server has no RGB-D map interface.
 | `--spatial_l3_clip_batch_size` | `8` | Maximum image crops per CLIP forward pass; bounds activation memory |
 | `--spatial_l3_clip_top_k` | `3` | Maximum matched objects appended to an L1-empty Prompt |
 | `--spatial_l3_clip_min_similarity` | `0.0` | Cosine floor for a valid match; `0.0` is the sign boundary, not a tuned confidence threshold |
+| `--adaptive_l3_query` | off | Opt-in Adaptive L3 Query arm: a local controller decides whether to query L3 on any step, not only when L1 is empty |
+| `--adaptive_l3_query_max_new_tokens` | `24` | Maximum decoded tokens for one local controller decision |
+| `--adaptive_l3_query_max_query_chars` | `256` | Maximum characters of a controller-produced CLIP query |
+| `--adaptive_l3_query_min_evidence_confidence` | `0.5` | Minimum raw Evidence confidence accepted by the local fact validator |
 
 `on_demand` is valid with `--memory_prompt_mode legacy` or
 `--memory_prompt_mode l1_original_only`; the latter is the preserved 75 % SR
@@ -331,6 +338,43 @@ requires `--memory_extractor yolo11` and the optional `clip` extra
 (`pip install -e ".[clip]"`) for `open_clip_torch`. The L3 CLIP checkpoint is
 loaded from the local file path passed to OpenCLIP; LightNav never downloads
 weights.
+
+`geometry_on_demand` has the same L1-empty trigger, dedupe and Prompt insertion
+point, but retrieves the existing geometry-only candidate set from
+`SpatialGraphAdapter.build`. It requires no `--spatial_l3_clip_model_path`, does
+not import OpenCLIP at runtime and never computes a cosine similarity. The same
+`legacy` / `l1_original_only` restriction applies.
+
+#### Adaptive L3 Query (opt-in)
+
+`--adaptive_l3_query` keeps the original L1 card as the primary memory and adds
+one bounded sidecar: the already-loaded local LightNav inference engine answers
+a `NO_QUERY` / `QUERY_L3` question, the existing `L3ClipQuery` retrieves
+candidates with unchanged cosine Top-K, the engine then answers
+`USE C1 …` / `ABSTAIN` over candidate aliases, and a deterministic validator
+re-reads the real `ObjectNode` and **all** of its `SpatialEvidence` records.
+Only facts that pass are rendered by a deterministic formatter and appended
+after the L1 card. No controller output text reaches the Prompt.
+
+It requires `--memory_enabled --memory_strategy hierarchical --memory_layers
+short,mid,long --local_graph_enabled --memory_extractor yolo11
+--spatial_l3_mode shadow --spatial_l3_seg_model_path FILE
+--spatial_l3_clip_model_path FILE` and `--memory_prompt_mode legacy` or
+`l1_original_only`. `shadow` only builds the read-only map; it never injects
+spatial candidates, so the L1 path stays primary. The mode is rejected with
+`inject`, `on_demand`, other prompt modes, or a missing `clip_model_path`.
+It reuses the local inference engine; it does not call an external API and does
+not load a second model or download weights. `VLN_EVAL_TRAJ_TOP1=1` is rejected
+because that restriction masks text decoding to trajectory ids.
+
+The controller is asked once per step even when L1 has candidates; that is the
+point of the arm. A query is never repeated for the exact same query text and
+unchanged object map within one Episode (no fixed cooldown is involved). Every
+failure path — missing engine, parse failure, CLIP error, no candidate, invalid
+or current-step Evidence, missing `observed_from` edge, prompt budget — keeps the
+original L1 Prompt byte for byte. Diagnostics appear under `adaptive_l3` in the
+step diagnostic and `prompt_context` (`validated_object_ids`,
+`validated_evidence_ids`, `rejected`, `skipped_reason`, `prompt_verified`).
 
 The prompt-mode path uses the existing token-aware budget (base prompt and
 Processor/tokenizer measurement) and falls back to the original 320-character
@@ -437,7 +481,7 @@ default) keeps the original Local Graph/L3 execution path byte for byte.
 | Mode | Injected context |
 | --- | --- |
 | `legacy` | Original path: L3 spatial candidate when `inject`, otherwise the original Local Graph card |
-| `l1_original_only` | Original L1 Local Graph card; L3 is off by default, or an on-demand CLIP fallback when `--spatial_l3_mode on_demand` is set |
+| `l1_original_only` | Original L1 Local Graph card; L3 is off by default, an on-demand CLIP fallback with `--spatial_l3_mode on_demand`, an on-demand geometry-only fallback with `--spatial_l3_mode geometry_on_demand`, or a controller-gated verified block with `--adaptive_l3_query` |
 | `l1_organized_only` | Organized L1 card: current vs earlier detections, confidence, image sector, sightings; L3 does not run |
 | `l3_original_only` | Original L3 `Spatial history` line; no L1 prompt builder and no Local Graph fallback |
 | `l3_organized_only` | Organized L3 card: instruction-relevant objects, observation count, straight-line range/bearing marked "not a path", traversal evidence, unknown passage |

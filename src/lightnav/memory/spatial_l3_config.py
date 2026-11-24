@@ -10,9 +10,11 @@ from lightnav.memory.conceptgraphs_lite import GeometryConfig
 
 @dataclass(frozen=True)
 class SpatialL3Config:
-    # off | shadow | inject | on_demand.  ``on_demand`` keeps L1 Original as
-    # the primary path and runs the local CLIP query only after L1 reports an
-    # empty candidate set.
+    # off | shadow | inject | on_demand | geometry_on_demand.  ``on_demand``
+    # keeps L1 Original as the primary path and runs the local CLIP query only
+    # after L1 reports an empty candidate set.  ``geometry_on_demand`` uses the
+    # same gate but the existing geometry-only spatial candidate retrieval, so
+    # it never needs CLIP weights or OpenCLIP.
     mode: str = "off"
     seg_model_path: str = ""
     seg_device: str = "cpu"
@@ -33,8 +35,11 @@ class SpatialL3Config:
     geometry: GeometryConfig = field(default_factory=GeometryConfig)
 
     def __post_init__(self) -> None:
-        if self.mode not in {"off", "shadow", "inject", "on_demand"}:
-            raise ValueError("spatial_l3.mode must be off, shadow, inject or on_demand")
+        if self.mode not in {"off", "shadow", "inject", "on_demand", "geometry_on_demand"}:
+            raise ValueError(
+                "spatial_l3.mode must be off, shadow, inject, on_demand or "
+                "geometry_on_demand"
+            )
         if self.mode != "off" and not self.seg_model_path:
             raise ValueError("spatial_l3.seg_model_path is required when enabled")
         if not isinstance(self.seg_device, str) or not self.seg_device.strip():
@@ -59,7 +64,11 @@ class SpatialL3Config:
             raise ValueError("spatial_l3.clip_device must be nonempty")
         if self.clip_precision not in {"fp32", "fp16", "bf16"}:
             raise ValueError("spatial_l3.clip_precision must be fp32, fp16 or bf16")
-        if self.clip_device.strip().lower() == "cpu" and self.clip_precision != "fp32":
+        if (
+            (self.mode == "on_demand" or self.clip_model_path)
+            and self.clip_device.strip().lower() == "cpu"
+            and self.clip_precision != "fp32"
+        ):
             raise ValueError("non-fp32 spatial_l3.clip_precision requires a CUDA device")
         if type(self.clip_batch_size) is not int or self.clip_batch_size < 1:
             raise ValueError("spatial_l3.clip_batch_size must be a positive integer")

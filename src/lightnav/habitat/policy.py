@@ -177,6 +177,32 @@ class TrajVocabVLNCEPolicy:
             if memory_prompt_mode != "legacy":
                 raise ValueError("memory prompt modes require memory_enabled")
             self.memory_manager = None
+        self.adaptive_l3_runner = None
+        adaptive_config = getattr(
+            self.memory_manager, "adaptive_l3_query_config", None,
+        )
+        if self.memory_manager is not None and getattr(adaptive_config, "enabled", False):
+            from lightnav.memory.adaptive_l3_query import (
+                AdaptiveL3QueryRunner,
+                LocalLightNavQueryController,
+            )
+
+            manager = self.memory_manager
+            config = adaptive_config
+            controller = LocalLightNavQueryController(
+                engine,
+                self._adaptive_controller_video,
+                max_new_tokens=config.controller_max_new_tokens,
+                max_query_chars=config.max_query_chars,
+            )
+            self.adaptive_l3_runner = AdaptiveL3QueryRunner(
+                config=config,
+                controller=controller,
+                encoder=manager.clip_encoder,
+                top_k=manager.spatial_l3_config.clip_top_k,
+                min_similarity=manager.spatial_l3_config.clip_min_similarity,
+            )
+            manager.set_adaptive_l3_runner(self.adaptive_l3_runner)
         self._memory_episode_index = -1
         self._memory_episode_open = False
         self._memory_step = 0
@@ -202,6 +228,25 @@ class TrajVocabVLNCEPolicy:
         self._last_action_waypoint_index = None
         self._last_action_waypoint = None
         self._last_raw_text = ""
+
+    def _adaptive_controller_video(self) -> tuple[object, list[int]]:
+        """Expose the exact current video buffer to the local controller."""
+        return self.agent._get_video_tensor(), list(self.agent._history_frame_ids)
+
+    def _apply_adaptive_l3_context(
+        self, *, context: Any, step: int, instruction: str, l1_status: str,
+        agent_pose: Any, budget: int,
+    ) -> tuple[Any, dict[str, Any] | None]:
+        """Run the adaptive sidecar around one already-built L1 context."""
+        manager = self.memory_manager
+        config = getattr(manager, "adaptive_l3_query_config", None)
+        if manager is None or not getattr(config, "enabled", False):
+            return context, None
+        combined = manager.build_adaptive_l3_context(
+            step=step, instruction=instruction, l1_context=context,
+            l1_status=l1_status, agent_pose=agent_pose, max_chars=budget,
+        )
+        return combined, dict(manager.last_adaptive_l3_diagnostic)
 
     def reset(self, obs: dict[str, Any] | None = None, *,
               memory_episode_id: str | None = None,
@@ -478,7 +523,7 @@ class TrajVocabVLNCEPolicy:
         l3_query_diagnostic: dict[str, Any] = {}
         if spatial_mode != "off":
             with _preserve_global_rng() if spatial_mode in {
-                "shadow", "on_demand",
+                "shadow", "on_demand", "geometry_on_demand",
             } else nullcontext():
                 try:
                     spatial_diagnostic = manager.observe_spatial(obs, info, events, step=step)
@@ -516,27 +561,71 @@ class TrajVocabVLNCEPolicy:
             l1_status = manager.last_local_graph_status
             # L1 Original is primary: only an explicit empty L1 candidate set
             # (or an L1 card fully dropped by its own budget) can reach L3.
-            if context is None and spatial_mode == "on_demand":
-                pose = (
-                    manager.last_spatial_frame.agent_pose
-                    if manager.last_spatial_frame is not None else None
-                )
-                context = manager.get_on_demand_l3_context(
-                    step=step, instruction=self.instruction, agent_pose=pose,
-                    l1_status=l1_status or "no_candidates",
-                    max_chars=budget,
-                )
+            if context is None and spatial_mode in {
+                "on_demand", "geometry_on_demand",
+            }:
+                geometry_on_demand = spatial_mode == "geometry_on_demand"
+                if geometry_on_demand:
+                    context = manager.get_geometry_on_demand_context(
+                        step=step, instruction=self.instruction,
+                        l1_status=l1_status or "no_candidates",
+                        max_chars=budget,
+                    )
+                else:
+                    pose = (
+                        manager.last_spatial_frame.agent_pose
+                        if manager.last_spatial_frame is not None else None
+                    )
+                    context = manager.get_on_demand_l3_context(
+                        step=step, instruction=self.instruction, agent_pose=pose,
+                        l1_status=l1_status or "no_candidates",
+                        max_chars=budget,
+                    )
                 l3_query_diagnostic = dict(manager.last_l3_query_diagnostic)
                 if context is not None:
-                    context_source = "l3_on_demand"
+                    context_source = (
+                        "l3_geometry_on_demand" if geometry_on_demand
+                        else "l3_on_demand"
+                    )
                     if spatial_diagnostic is not None:
                         spatial_diagnostic["candidate_count"] = len(context.layer_items)
                 elif spatial_diagnostic is not None:
                     spatial_diagnostic["candidate_count"] = 0
                     spatial_fallback_reason = (
                         l3_query_diagnostic.get("skipped_reason")
-                        or "no_on_demand_l3_match"
+                        or (
+                            "no_geometry_on_demand_candidate" if geometry_on_demand
+                            else "no_on_demand_l3_match"
+                        )
                     )
+        adaptive_diagnostic: dict[str, Any] | None = None
+        adaptive_retry_used = False
+        l1_context_only = None
+        l1_only_evidence_ids: tuple[str, ...] = ()
+        if getattr(getattr(manager, "adaptive_l3_query_config", None), "enabled", False):
+            l1_context_only = context
+            l1_only_evidence_ids = tuple(dict.fromkeys(
+                ref.event_id for item in (context.layer_items if context else [])
+                for ref in item.evidence_refs
+            ))
+            pose = (
+                manager.last_spatial_frame.agent_pose
+                if manager.last_spatial_frame is not None else None
+            )
+            previous_context = context
+            with _preserve_global_rng():
+                context, adaptive_diagnostic = self._apply_adaptive_l3_context(
+                    context=context, step=step, instruction=self.instruction,
+                    l1_status=l1_status or "not_attempted", agent_pose=pose,
+                    budget=budget,
+                )
+            if context is not previous_context:
+                context_source = (
+                    "l1_plus_adaptive_l3"
+                    if previous_context is not None else "adaptive_l3"
+                )
+                if spatial_diagnostic is not None:
+                    spatial_diagnostic["candidate_count"] = len(context.layer_items)
         sample = base_sample
         memory_text = ""
         prompt_audit = None
@@ -586,6 +675,25 @@ class TrajVocabVLNCEPolicy:
                     }
                 except (KeyError, ValueError) as exc:
                     fallback_reason = f"prompt_contract: {exc}"
+                    if (
+                        context_source == "l1_plus_adaptive_l3"
+                        and l1_context_only is not None
+                        and not adaptive_retry_used
+                    ):
+                        # The verified L3 block failed the Prompt contract.
+                        # Retry the untouched L1 block once, never base_sample.
+                        adaptive_retry_used = True
+                        context = l1_context_only
+                        context_source = "local_graph"
+                        if adaptive_diagnostic is not None:
+                            adaptive_diagnostic["injected"] = False
+                            adaptive_diagnostic["skipped_reason"] = (
+                                "prompt_contract_excluded"
+                            )
+                        sample = base_sample
+                        memory_text = ""
+                        prompt_audit = None
+                        continue
                     if context_source == "local_graph":
                         manager.local_graph_fusion.discard_selection()
                     context = None
@@ -608,6 +716,23 @@ class TrajVocabVLNCEPolicy:
                 if context is None or "processor input length" not in str(exc):
                     raise
                 length_rejections += 1
+                if (
+                    context_source == "l1_plus_adaptive_l3"
+                    and l1_context_only is not None
+                    and len(context.layer_items) > len(l1_context_only.layer_items)
+                ):
+                    # Drop only the verified L3 block; retry the L1 card itself.
+                    context = l1_context_only
+                    context_source = "local_graph"
+                    if adaptive_diagnostic is not None:
+                        adaptive_diagnostic["injected"] = False
+                        adaptive_diagnostic["skipped_reason"] = (
+                            "processor_length_excluded"
+                        )
+                    sample = base_sample
+                    memory_text = ""
+                    prompt_audit = None
+                    continue
                 remaining = list(context.layer_items)
                 remaining.remove(max(remaining, key=lambda item: len(item.description)))
                 if remaining:
@@ -650,8 +775,22 @@ class TrajVocabVLNCEPolicy:
         if actual_injection:
             if context_source == "local_graph":
                 manager.local_graph_fusion.confirm_injected(visible_ids, step)
-        elif context is not None and context_source == "local_graph":
+            elif context_source == "l1_plus_adaptive_l3":
+                l1_visible = [
+                    evidence_id for evidence_id in visible_ids
+                    if evidence_id in set(l1_only_evidence_ids)
+                ]
+                if l1_visible:
+                    manager.local_graph_fusion.confirm_injected(l1_visible, step)
+        elif context is not None and context_source in {
+            "local_graph", "l1_plus_adaptive_l3",
+        }:
             manager.local_graph_fusion.discard_selection()
+        if adaptive_diagnostic is not None:
+            adaptive_diagnostic["l1_included"] = bool(
+                context is not None
+                and context_source in {"local_graph", "l1_plus_adaptive_l3"}
+            )
         historical_ids = [
             key for key in visible_ids
             if (
@@ -691,6 +830,10 @@ class TrajVocabVLNCEPolicy:
             ),
             "model_input_diagnostic": dict(model_input) if checked else None,
         }
+        if adaptive_diagnostic is not None:
+            adaptive_diagnostic["context_source"] = context_source
+            adaptive_diagnostic["prompt_verified"] = actual_injection
+            diagnostic["adaptive_l3"] = adaptive_diagnostic
         if spatial_diagnostic is not None:
             diagnostic["spatial_l3"] = {
                 **spatial_diagnostic,
@@ -700,7 +843,7 @@ class TrajVocabVLNCEPolicy:
                 "l1_status": l1_status,
                 "l3_query": l3_query_diagnostic,
             }
-            if spatial_mode == "on_demand":
+            if spatial_mode in {"on_demand", "geometry_on_demand"}:
                 stats = manager.l3_query_stats_summary()
                 diagnostic["spatial_l3"]["l3_query_stats"] = stats
                 diagnostic["l3_query_stats"] = stats
@@ -736,9 +879,14 @@ class TrajVocabVLNCEPolicy:
         spatial_diagnostic = None
         spatial_fallback_reason = None
         spatial_mode = manager.spatial_l3_config.mode
-        if plan.uses_l3 or spatial_mode == "on_demand":
+        if (
+            plan.uses_l3 or spatial_mode in {"on_demand", "geometry_on_demand"}
+            or getattr(
+                getattr(manager, "adaptive_l3_query_config", None), "enabled", False,
+            )
+        ):
             with _preserve_global_rng() if spatial_mode in {
-                "shadow", "on_demand",
+                "shadow", "on_demand", "geometry_on_demand",
             } else nullcontext():
                 try:
                     spatial_diagnostic = manager.observe_spatial(
@@ -800,6 +948,31 @@ class TrajVocabVLNCEPolicy:
                     else {"budget_source": "char_fallback_320"}
                 ),
             }
+        adaptive_diagnostic: dict[str, Any] | None = None
+        adaptive_applied = False
+        adaptive_retry_used = False
+        l1_context_only = context
+        if (
+            getattr(getattr(manager, "adaptive_l3_query_config", None), "enabled", False)
+            and plan.mode == "l1_original_only"
+        ):
+            previous_context = context
+            with _preserve_global_rng():
+                context, adaptive_diagnostic = self._apply_adaptive_l3_context(
+                    context=context, step=step, instruction=self.instruction,
+                    l1_status=manager.last_local_graph_status,
+                    agent_pose=getattr(frame, "agent_pose", None), budget=budget,
+                )
+            if context is not previous_context:
+                adaptive_applied = True
+                result_diagnostics = dict(result_diagnostics)
+                result_diagnostics["source"] = (
+                    "l1_plus_adaptive_l3" if previous_context is not None
+                    else "adaptive_l3"
+                )
+                if adaptive_diagnostic is not None:
+                    adaptive_diagnostic["l1_included"] = previous_context is not None
+                    result_diagnostics["adaptive_l3"] = adaptive_diagnostic
         sample = base_sample
         memory_text = ""
         prompt_audit = None
@@ -837,6 +1010,22 @@ class TrajVocabVLNCEPolicy:
                                 ))
                             )
                             if delta > token_budget.available_tokens:
+                                if adaptive_applied:
+                                    # Keep the original L1 block rather than let a
+                                    # generic trim remove one of its lines.
+                                    adaptive_applied = False
+                                    context = l1_context_only
+                                    if adaptive_diagnostic is not None:
+                                        adaptive_diagnostic["injected"] = False
+                                        adaptive_diagnostic["skipped_reason"] = (
+                                            "token_budget_excluded"
+                                        )
+                                    sample = base_sample
+                                    memory_text = ""
+                                    prompt_audit = None
+                                    accepted_records = []
+                                    memory_tokens_injected = None
+                                    continue
                                 new_context, dropped = trim_context_for_overflow(context)
                                 token_overflow_drops += dropped
                                 if new_context is None or dropped == 0:
@@ -893,6 +1082,25 @@ class TrajVocabVLNCEPolicy:
                     }
                 except (KeyError, ValueError) as exc:
                     fallback_reason = f"prompt_contract: {exc}"
+                    if (
+                        adaptive_applied
+                        and l1_context_only is not None
+                        and not adaptive_retry_used
+                    ):
+                        adaptive_retry_used = True
+                        adaptive_applied = False
+                        context = l1_context_only
+                        if adaptive_diagnostic is not None:
+                            adaptive_diagnostic["injected"] = False
+                            adaptive_diagnostic["skipped_reason"] = (
+                                "prompt_contract_excluded"
+                            )
+                        sample = base_sample
+                        memory_text = ""
+                        prompt_audit = None
+                        accepted_records = []
+                        memory_tokens_injected = None
+                        continue
                     manager.discard_prompt_context()
                     context = None
                     sample = base_sample
@@ -908,7 +1116,24 @@ class TrajVocabVLNCEPolicy:
                     raise
                 length_rejections += 1
                 memory_tokens_injected = None
-                if not context.layer_items:
+                if adaptive_applied:
+                    adaptive_applied = False
+                    context = l1_context_only
+                    if adaptive_diagnostic is not None:
+                        adaptive_diagnostic["injected"] = False
+                        adaptive_diagnostic["skipped_reason"] = (
+                            "processor_length_excluded"
+                        )
+                    sample = base_sample
+                    memory_text = ""
+                    prompt_audit = None
+                    accepted_records = []
+                    memory_tokens_injected = None
+                    continue
+                if context is None:
+                    fallback_reason = "no remaining prompt-mode items to drop"
+                    manager.discard_prompt_context()
+                elif not context.layer_items:
                     # A state-only card has nothing to drop; retry the original
                     # sample rather than crashing the episode on max([]).
                     context = None
@@ -1023,7 +1248,7 @@ class TrajVocabVLNCEPolicy:
         if spatial_diagnostic is not None:
             prompt_context["spatial_l3"] = {
                 **spatial_diagnostic,
-                "context_source": result.source if result is not None else "none",
+                "context_source": prompt_context.get("source", "none"),
                 "fallback_reason": spatial_fallback_reason,
             }
             on_demand = prompt_context.get("on_demand_l3")
@@ -1032,6 +1257,12 @@ class TrajVocabVLNCEPolicy:
                 prompt_context["spatial_l3"]["l3_query_stats"] = (
                     prompt_context.get("l3_query_stats")
                 )
+        if adaptive_diagnostic is not None:
+            adaptive_diagnostic["prompt_verified"] = actual_injection
+            prompt_context["adaptive_l3"] = adaptive_diagnostic
+            if actual_injection and context is not None:
+                prompt_context["context_chars"] = len(context.text)
+                prompt_context["item_count"] = len(context.layer_items)
         diagnostic = {
             "episode_id": manager.working.state.episode_id,
             "memory_backend": f"l1_l3_prompt:{plan.mode}",

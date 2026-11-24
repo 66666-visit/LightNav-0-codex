@@ -83,17 +83,44 @@ def build_prompt_protocol(memory: Any) -> dict[str, Any]:
             "whole_lines_only": True,
             "max_landmarks": memory.local_graph.max_landmarks,
         }
-        if (
-            plan.mode == "l1_original_only"
-            and getattr(memory.spatial_l3, "mode", "off") == "on_demand"
-        ):
-            layer_activation["l3_layer"] = "on_demand_clip_when_l1_empty"
-            layer_activation["l3_prompt_enabled"] = "on_demand_when_l1_empty"
-            budget["on_demand_l3"] = {
-                "trigger": "l1 no_candidates or budget_excluded",
-                "budget": "same token-aware budget; original char budget fallback",
-                "raw_similarity_is_not_confidence": True,
-            }
+        if plan.mode == "l1_original_only":
+            spatial_mode = getattr(memory.spatial_l3, "mode", "off")
+            if spatial_mode == "on_demand":
+                layer_activation["l3_layer"] = "on_demand_clip_when_l1_empty"
+                layer_activation["l3_prompt_enabled"] = "on_demand_when_l1_empty"
+                budget["on_demand_l3"] = {
+                    "trigger": "l1 no_candidates or budget_excluded",
+                    "budget": "same token-aware budget; original char budget fallback",
+                    "retrieval": "l3_clip_query",
+                    "raw_similarity_is_not_confidence": True,
+                }
+            elif spatial_mode == "geometry_on_demand":
+                layer_activation["l3_layer"] = "geometry_on_demand_when_l1_empty"
+                layer_activation["l3_prompt_enabled"] = (
+                    "geometry_on_demand_when_l1_empty"
+                )
+                budget["on_demand_l3"] = {
+                    "trigger": "l1 no_candidates or budget_excluded",
+                    "budget": "same token-aware budget; original char budget fallback",
+                    "retrieval": "spatial_graph_adapter",
+                    "clip_weights_required": False,
+                    "clip_similarity_used": False,
+                }
+    adaptive = getattr(memory, "adaptive_l3_query", None)
+    if getattr(adaptive, "enabled", False):
+        # Separate, opt-in arm: the original L1 layer is unchanged and L3 facts
+        # are added only after the local controller asks for a query and the
+        # local validator accepts every Evidence record.
+        layer_activation["adaptive_l3"] = "controller_gated_verified_facts"
+        budget["adaptive_l3"] = {
+            "trigger": "local controller decision, not an L1-empty shortcut",
+            "controller": "existing local LightNav inference engine",
+            "query": "existing L3ClipQuery cosine Top-K; unchanged",
+            "validation": "ObjectNode + complete historical Evidence set",
+            "formatter": "deterministic; model text is never copied",
+            "max_query_chars": adaptive.max_query_chars,
+            "min_evidence_confidence": adaptive.min_evidence_confidence,
+        }
     return {
         "protocol_version": PROMPT_PROTOCOL_VERSION,
         "mode": plan.mode,
@@ -118,6 +145,10 @@ def build_prompt_protocol(memory: Any) -> dict[str, Any]:
             "model_weights_unchanged": True,
             "fixed_character_allowance_added": False,
         },
+        **(
+            {"adaptive_l3_query": adaptive.to_dict()}
+            if getattr(adaptive, "enabled", False) else {}
+        ),
     }
 
 
@@ -248,6 +279,43 @@ def prompt_diagnostic_row(
     })
     if isinstance(context.get("spatial_l3"), dict):
         row["spatial_l3"] = context["spatial_l3"]
+    spatial = context.get("spatial_l3")
+    l3_query = spatial.get("l3_query") if isinstance(spatial, dict) else None
+    if l3_on_demand.get("source") is not None:
+        row["l3_on_demand_source"] = l3_on_demand.get("source")
+    if isinstance(l3_query, dict):
+        row.update({
+            "l3_on_demand_retrieval": l3_query.get("retrieval"),
+            "l3_on_demand_query_executed": l3_query.get("query_executed"),
+            "l3_on_demand_skipped_reason": l3_query.get("skipped_reason"),
+            "l3_on_demand_candidate_count": l3_query.get("candidate_count"),
+            "l3_on_demand_injected_count": l3_query.get("injected_count"),
+            "l3_on_demand_object_ids": l3_query.get("object_ids", []),
+            "l3_on_demand_evidence_ids": l3_query.get("evidence_ids", []),
+            "l3_on_demand_injected_object_ids": l3_query.get(
+                "injected_object_ids", []
+            ),
+            "l3_on_demand_injected_evidence_ids": l3_query.get(
+                "injected_evidence_ids", []
+            ),
+        })
+    stats = context.get("l3_query_stats")
+    if isinstance(stats, dict):
+        row.update({
+            "l3_queries_attempted": stats.get("queries_attempted"),
+            "l3_queries_with_match": stats.get("queries_with_match"),
+            "l3_queries_without_match": stats.get("queries_without_match"),
+            "l3_queries_injected": stats.get("queries_injected"),
+            "l3_prompt_budget_excluded": stats.get("prompt_budget_excluded"),
+            "l3_query_trigger_rate": stats.get("query_trigger_rate"),
+        })
+    if isinstance(context.get("adaptive_l3"), dict):
+        adaptive = context["adaptive_l3"]
+        row["adaptive_l3"] = adaptive
+        row["adaptive_l3_item_count"] = (
+            len(adaptive.get("validated_object_ids", []))
+            if adaptive.get("injected") else 0
+        )
     return row
 
 

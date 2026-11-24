@@ -55,6 +55,7 @@ from lightnav.habitat.results import (
     print_objectnav_summary,
     print_vlnce_summary,
 )
+from lightnav.memory.adaptive_l3_query_config import AdaptiveL3QueryConfig
 from lightnav.memory.local_graph_config import LOCAL_GRAPH_PROTOCOL_VERSION, LocalGraphConfig
 from lightnav.memory.prompt_modes import (
     MEMORY_PROMPT_MODES,
@@ -100,6 +101,7 @@ class MemoryConfig:
     rgm_v4: RGMV4Config = field(default_factory=RGMV4Config)
     local_graph: LocalGraphConfig = field(default_factory=LocalGraphConfig)
     spatial_l3: SpatialL3Config = field(default_factory=SpatialL3Config)
+    adaptive_l3_query: AdaptiveL3QueryConfig = field(default_factory=AdaptiveL3QueryConfig)
     prompt_mode: str = "legacy"
     prompt_measurement: bool = False
 
@@ -148,12 +150,32 @@ class MemoryConfig:
             raise ValueError("spatial L3 requires local graph enabled")
         if self.spatial_l3.mode != "off" and self.extractor != "yolo11":
             raise ValueError("spatial L3 requires the independent L1 yolo11 detector")
-        if self.spatial_l3.mode == "on_demand" and self.prompt_mode not in (
-            "legacy", "l1_original_only",
-        ):
+        if self.spatial_l3.mode in {
+            "on_demand", "geometry_on_demand",
+        } and self.prompt_mode not in ("legacy", "l1_original_only"):
             raise ValueError(
-                "on_demand L3 requires legacy or l1_original_only L1 prompt mode"
+                "on-demand L3 requires legacy or l1_original_only L1 prompt mode"
             )
+        if not isinstance(self.adaptive_l3_query, AdaptiveL3QueryConfig):
+            raise ValueError("memory.adaptive_l3_query must be AdaptiveL3QueryConfig")
+        if self.adaptive_l3_query.enabled:
+            if not self.enabled:
+                raise ValueError("adaptive L3 query requires memory_enabled")
+            if not self.local_graph.enabled:
+                raise ValueError("adaptive L3 query requires local_graph_enabled")
+            if self.prompt_mode not in ("legacy", "l1_original_only"):
+                raise ValueError(
+                    "adaptive L3 query requires legacy or l1_original_only L1 prompt mode"
+                )
+            if self.spatial_l3.mode != "shadow":
+                raise ValueError(
+                    "adaptive L3 query requires spatial_l3.mode=shadow so the "
+                    "original L1 path stays primary"
+                )
+            if not self.spatial_l3.clip_model_path:
+                raise ValueError(
+                    "adaptive L3 query requires a local spatial_l3.clip_model_path"
+                )
         if (self.spatial_l3.mode != "off" and self.spatial_l3.seg_model_path
                 == self.extractor_model_path):
             raise ValueError("spatial L3 and L1 must use independent model paths")
@@ -437,13 +459,16 @@ def effective_spatial_l3_config(memory: MemoryConfig) -> SpatialL3Config:
     The six prompt-ablation modes turn the sidecar off unless the mode itself
     consumes L3.  The new on-demand arm is special: ``l1_original_only`` does
     not declare an L3 layer, but it must still build the map and feature cache
-    so it can query only when L1 is empty.
+    so it can query only when L1 is empty.  The adaptive arm likewise needs the
+    map and the local CLIP encoder even though ``l1_original_only`` does not
+    declare an L3 layer; its own controller decides when to query.
     """
     plan = mode_plan(memory.prompt_mode)
     if (
         memory.prompt_mode == "legacy"
         or plan.uses_l3
-        or memory.spatial_l3.mode == "on_demand"
+        or memory.spatial_l3.mode in {"on_demand", "geometry_on_demand"}
+        or memory.adaptive_l3_query.enabled
     ):
         return memory.spatial_l3
     return replace(memory.spatial_l3, mode="off")
@@ -493,7 +518,10 @@ def build_velocity_policy(
                 confidence=manager_spatial.seg_confidence,
                 every_n_steps=manager_spatial.seg_every_n_steps,
             )
-        if manager_spatial.mode == "on_demand":
+        if (
+            manager_spatial.mode == "on_demand"
+            or cfg.memory.adaptive_l3_query.enabled
+        ):
             from lightnav.memory.clip_features import LocalClipEncoder
 
             clip_encoder = LocalClipEncoder(
@@ -531,6 +559,7 @@ def build_velocity_policy(
             spatial_extractor=spatial_extractor,
             clip_encoder=clip_encoder,
             prompt_mode=cfg.memory.prompt_mode,
+            adaptive_l3_query_config=cfg.memory.adaptive_l3_query,
         )
     return TrajVocabVLNCEPolicy(
         engine,

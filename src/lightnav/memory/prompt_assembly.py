@@ -80,6 +80,9 @@ def build_prompt_context(
     token_budget: MemoryTokenBudget | None = None,
     budget_failure: TokenBudgetFailure | None = None,
     on_demand_l3: Callable[[str], MemoryContext | None] | None = None,
+    on_demand_source: str = "l3_clip_query",
+    on_demand_empty_reason: str = "no_valid_on_demand_match",
+    on_demand_context_source: str = "l3_on_demand",
 ) -> PromptContextResult:
     """Build the mode's context without changing any underlying memory record."""
     if plan.require_legacy():
@@ -236,10 +239,10 @@ def build_prompt_context(
             l1_status = getattr(local_graph_fusion, "last_build_status", "not_attempted")
             context = on_demand_l3(l1_status)
             if context is not None:
-                source = "l3_on_demand"
+                source = on_demand_context_source
                 local_graph_pending = False
                 diagnostics["layers"]["l3_on_demand"] = {
-                    "layer": "l3_on_demand", "source": "l3_clip_query",
+                    "layer": "l3_on_demand", "source": on_demand_source,
                     "item_count": len(context.layer_items),
                     "prompt_chars": len(context.text),
                     "trigger": l1_status,
@@ -247,10 +250,10 @@ def build_prompt_context(
                 }
             else:
                 diagnostics["layers"]["l3_on_demand"] = {
-                    "layer": "l3_on_demand", "source": "l3_clip_query",
+                    "layer": "l3_on_demand", "source": on_demand_source,
                     "item_count": 0, "prompt_chars": 0,
                     "trigger": l1_status,
-                    "empty_reason": "no_valid_on_demand_match",
+                    "empty_reason": on_demand_empty_reason,
                 }
     else:
         context = l3_context

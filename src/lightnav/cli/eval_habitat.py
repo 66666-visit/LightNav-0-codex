@@ -15,6 +15,7 @@ import os
 import sys
 
 from lightnav.habitat.runner import HabitatEvalConfig, MemoryConfig, run_habitat_eval
+from lightnav.memory.adaptive_l3_query_config import AdaptiveL3QueryConfig
 from lightnav.memory.conceptgraphs_lite import GeometryConfig
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.prompt_modes import MEMORY_PROMPT_MODES
@@ -250,10 +251,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Maximum instruction-related landmarks in one local card.")
     p.add_argument("--local_graph_reactivation_steps", type=int, default=8,
                    help="Earliest step interval for reactivating an unchanged local card.")
-    p.add_argument("--spatial_l3_mode", choices=("off", "shadow", "inject", "on_demand"),
-                   default="off",
-                   help="ConceptGraphs-Lite: off, shadow diagnostics, verified Prompt "
-                        "injection, or L1-first on-demand CLIP query.")
+    p.add_argument(
+        "--spatial_l3_mode",
+        choices=("off", "shadow", "inject", "on_demand", "geometry_on_demand"),
+        default="off",
+        help="ConceptGraphs-Lite: off, shadow diagnostics, verified Prompt "
+             "injection, L1-first on-demand CLIP query, or L1-first on-demand "
+             "geometry retrieval (no CLIP).",
+    )
     p.add_argument("--spatial_l3_seg_model_path", default="",
                    help="Local yolo11n-seg.pt path, independent of the L1 detector.")
     p.add_argument("--spatial_l3_seg_device", default="cpu")
@@ -279,6 +284,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Maximum CLIP query matches appended to an L1-empty Prompt.")
     p.add_argument("--spatial_l3_clip_min_similarity", type=float, default=0.0,
                    help="Cosine floor for a valid query match; 0.0 is the sign boundary.")
+    p.add_argument(
+        "--adaptive_l3_query", action="store_true",
+        help="Enable the opt-in Adaptive L3 Query controller on the original L1 path. "
+             "Requires --spatial_l3_mode shadow and a local --spatial_l3_clip_model_path.",
+    )
+    p.add_argument(
+        "--adaptive_l3_query_max_new_tokens", type=int, default=24,
+        help="Maximum decoded tokens for one local controller decision.",
+    )
+    p.add_argument(
+        "--adaptive_l3_query_max_query_chars", type=int, default=256,
+        help="Maximum characters of controller-produced CLIP query text.",
+    )
+    p.add_argument(
+        "--adaptive_l3_query_min_evidence_confidence", type=float, default=0.5,
+        help="Minimum raw Evidence confidence accepted by the local fact validator.",
+    )
     geometry_defaults = GeometryConfig()
     for name in (
         "min_depth_m", "max_depth_m", "voxel_size_m", "max_center_distance_m",
@@ -448,6 +470,14 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                 prompt_max_records=args.rgm_v4_prompt_max_records,
                 prompt_max_chars=args.rgm_v4_prompt_max_chars,
                 revisit_enabled=args.rgm_v4_revisit_enabled,
+            ),
+            adaptive_l3_query=AdaptiveL3QueryConfig(
+                enabled=args.adaptive_l3_query,
+                controller_max_new_tokens=args.adaptive_l3_query_max_new_tokens,
+                max_query_chars=args.adaptive_l3_query_max_query_chars,
+                min_evidence_confidence=(
+                    args.adaptive_l3_query_min_evidence_confidence
+                ),
             ),
             prompt_mode=args.memory_prompt_mode,
             prompt_measurement=args.prompt_measurement_enabled,

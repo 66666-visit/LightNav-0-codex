@@ -6,11 +6,14 @@ import logging
 import re
 from copy import deepcopy
 from dataclasses import asdict, replace
+from html import escape
 from time import perf_counter
 from uuid import uuid4
 
 import numpy as np
 
+from lightnav.memory.adaptive_l3_query import AdaptiveL3QueryRunner
+from lightnav.memory.adaptive_l3_query_config import AdaptiveL3QueryConfig
 from lightnav.memory.clip_features import clip_crop_boxes
 from lightnav.memory.conceptgraphs_lite import ObjectMap, RGBDFrame
 from lightnav.memory.episodic_memory import EpisodicMemory
@@ -116,6 +119,7 @@ class MemoryManager:
         spatial_extractor: object | None = None,
         clip_encoder: object | None = None,
         prompt_mode: str = "legacy",
+        adaptive_l3_query_config: AdaptiveL3QueryConfig | None = None,
     ) -> None:
         if top_k < 0:
             raise ValueError("top_k must be nonnegative")
@@ -173,11 +177,11 @@ class MemoryManager:
             raise ValueError("spatial L3 requires Local Graph to be enabled")
         if self.spatial_l3_config.mode != "off" and spatial_extractor is None:
             raise ValueError("spatial L3 requires an independent segmentation extractor")
-        if self.spatial_l3_config.mode == "on_demand" and self.plan.mode not in (
-            "legacy", "l1_original_only",
-        ):
+        if self.spatial_l3_config.mode in {
+            "on_demand", "geometry_on_demand",
+        } and self.plan.mode not in ("legacy", "l1_original_only"):
             raise ValueError(
-                "on_demand L3 requires legacy or l1_original_only L1 prompt path"
+                "on-demand L3 requires legacy or l1_original_only L1 prompt path"
             )
         if self.spatial_l3_config.mode == "on_demand" and clip_encoder is None:
             raise ValueError("on_demand L3 requires a local CLIP encoder")
@@ -194,6 +198,14 @@ class MemoryManager:
         self.spatial_adapter = (
             SpatialGraphAdapter() if self.spatial_map is not None else None
         )
+        if (
+            self.spatial_l3_config.mode == "geometry_on_demand"
+            and clip_encoder is not None
+        ):
+            raise ValueError(
+                "geometry_on_demand must not receive a CLIP encoder; it uses "
+                "the existing geometry-only spatial retrieval"
+            )
         self.l3_query_controller = (
             L3QueryController(
                 clip_encoder,
@@ -202,8 +214,41 @@ class MemoryManager:
             )
             if self.spatial_l3_config.mode == "on_demand" else None
         )
+        # Decision-only instance of the original on-demand controller.  It owns
+        # the L1-empty gate and dedupe state; ``maybe_query`` is never called, so
+        # no CLIP encoder, weight or similarity computation is involved.
+        self.geometry_on_demand_controller = (
+            L3QueryController(None, top_k=1)
+            if self.spatial_l3_config.mode == "geometry_on_demand" else None
+        )
         self.last_local_graph_status = "not_attempted"
         self.last_l3_query_diagnostic: dict = {}
+        self.adaptive_l3_query_config = (
+            adaptive_l3_query_config or AdaptiveL3QueryConfig()
+        )
+        if not isinstance(self.adaptive_l3_query_config, AdaptiveL3QueryConfig):
+            raise ValueError(
+                "adaptive_l3_query_config must be an AdaptiveL3QueryConfig"
+            )
+        if self.adaptive_l3_query_config.enabled:
+            if not self.local_graph_config.enabled:
+                raise ValueError("adaptive L3 query requires Local Graph memory")
+            if self.spatial_l3_config.mode != "shadow":
+                # shadow builds the read-only map without injecting spatial
+                # candidates; inject/on_demand would bypass or duplicate L1.
+                raise ValueError(
+                    "adaptive L3 query requires spatial_l3.mode=shadow so the "
+                    "original L1 path stays primary"
+                )
+            if clip_encoder is None:
+                raise ValueError("adaptive L3 query requires a local CLIP encoder")
+            if self.plan.mode not in {"legacy", "l1_original_only"}:
+                raise ValueError(
+                    "adaptive L3 query requires the legacy or l1_original_only "
+                    "L1 prompt path"
+                )
+        self.adaptive_l3_runner: AdaptiveL3QueryRunner | None = None
+        self.last_adaptive_l3_diagnostic: dict = {}
         self.l3_query_stats = _empty_l3_query_stats()
         self.last_episode_l3_query_stats: dict = {}
         self._l3_stats_step: int | None = None
@@ -364,6 +409,15 @@ class MemoryManager:
             self.l3_query_controller.reset_episode(
                 self.v3_scene_id, episode_id, rollout_idx,
             )
+        if self.geometry_on_demand_controller is not None:
+            self.geometry_on_demand_controller.reset_episode(
+                self.v3_scene_id, episode_id, rollout_idx,
+            )
+        if self.adaptive_l3_runner is not None:
+            self.adaptive_l3_runner.reset_episode(
+                self.v3_scene_id, episode_id, rollout_idx,
+            )
+        self.last_adaptive_l3_diagnostic = {}
         self.last_local_graph_status = "not_attempted"
         self.last_l3_query_diagnostic = {}
         self.l3_query_stats = _empty_l3_query_stats()
@@ -540,7 +594,10 @@ class MemoryManager:
         the frozen policy.
         """
         if (self.clip_encoder is None or self.spatial_map is None
-                or self.spatial_l3_config.mode != "on_demand"):
+                or not (
+                    self.spatial_l3_config.mode == "on_demand"
+                    or self.adaptive_l3_query_config.enabled
+                )):
             return
         if not masks:
             return
@@ -625,21 +682,43 @@ class MemoryManager:
         )
         l3_diag: dict = {}
         on_demand_builder = None
-        if (
+        on_demand_source = "l3_clip_query"
+        on_demand_empty_reason = "no_valid_on_demand_match"
+        on_demand_context_source = "l3_on_demand"
+        geometry_on_demand = (
+            self.plan.mode == "l1_original_only"
+            and self.spatial_l3_config.mode == "geometry_on_demand"
+            and self.geometry_on_demand_controller is not None
+        )
+        clip_on_demand = (
             self.plan.mode == "l1_original_only"
             and self.spatial_l3_config.mode == "on_demand"
             and self.l3_query_controller is not None
-        ):
+        )
+        if geometry_on_demand or clip_on_demand:
             def _on_demand(l1_status: str) -> MemoryContext | None:
                 nonlocal l3_diag
-                pose = getattr(frame, "agent_pose", None) if frame is not None else None
-                context = self.get_on_demand_l3_context(
-                    step=step, instruction=instruction, agent_pose=pose,
-                    l1_status=l1_status, max_chars=char_limit,
-                )
+                if geometry_on_demand:
+                    context = self.get_geometry_on_demand_context(
+                        step=step, instruction=instruction,
+                        l1_status=l1_status, max_chars=char_limit,
+                    )
+                else:
+                    pose = (
+                        getattr(frame, "agent_pose", None)
+                        if frame is not None else None
+                    )
+                    context = self.get_on_demand_l3_context(
+                        step=step, instruction=instruction, agent_pose=pose,
+                        l1_status=l1_status, max_chars=char_limit,
+                    )
                 l3_diag = dict(self.last_l3_query_diagnostic)
                 return context
 
+            if geometry_on_demand:
+                on_demand_source = "spatial_graph_adapter"
+                on_demand_empty_reason = "no_geometry_candidate"
+                on_demand_context_source = "l3_geometry_on_demand"
             on_demand_builder = _on_demand
         result = build_prompt_context(
             self.plan,
@@ -667,6 +746,9 @@ class MemoryManager:
             token_budget=token_budget,
             budget_failure=budget_failure,
             on_demand_l3=on_demand_builder,
+            on_demand_source=on_demand_source,
+            on_demand_empty_reason=on_demand_empty_reason,
+            on_demand_context_source=on_demand_context_source,
         )
         l1_status = (
             result.diagnostics.get("layers", {}).get("l1", {}).get("build_status")
@@ -692,6 +774,22 @@ class MemoryManager:
                 l3_diag["skipped_reason"] = "prompt_budget_excluded"
                 l3_diag["prompt_budget_excluded"] = True
                 self.l3_query_stats["prompt_budget_excluded"] += 1
+            if result.context is not None:
+                injected_items = list(result.context.layer_items)
+                l3_diag["injected_count"] = len(injected_items)
+                l3_diag["injected_object_ids"] = [
+                    item.metadata.get("object_id") for item in injected_items
+                    if isinstance(item.metadata.get("object_id"), str)
+                ]
+                l3_diag["injected_evidence_ids"] = list(dict.fromkeys(
+                    evidence_id for item in injected_items
+                    for evidence_id in item.metadata.get("evidence_ids", [])
+                    if isinstance(evidence_id, str)
+                ))
+            else:
+                l3_diag["injected_count"] = 0
+                l3_diag["injected_object_ids"] = []
+                l3_diag["injected_evidence_ids"] = []
             result.diagnostics["on_demand_l3"] = l3_diag
             result.diagnostics["l3_query_stats"] = self.l3_query_stats_summary()
         if self.plan.l1_source == "original" and not result.local_graph_pending:
@@ -944,7 +1042,7 @@ class MemoryManager:
 
     def _record_l1_status(self, status: str, step: int) -> None:
         """Count one L1 retrieval outcome per step for the on-demand audit."""
-        if self.spatial_l3_config.mode != "on_demand":
+        if self.spatial_l3_config.mode not in {"on_demand", "geometry_on_demand"}:
             return
         if self._l3_stats_step == step:
             return
@@ -962,7 +1060,10 @@ class MemoryManager:
             self.l3_query_stats["l1_other"] += 1
 
     def _record_l3_query(self, diagnostic: dict | None) -> None:
-        if self.spatial_l3_config.mode != "on_demand" or not diagnostic:
+        if (
+            self.spatial_l3_config.mode not in {"on_demand", "geometry_on_demand"}
+            or not diagnostic
+        ):
             return
         if diagnostic.get("query_executed"):
             self.l3_query_stats["queries_attempted"] += 1
@@ -1039,6 +1140,133 @@ class MemoryManager:
         self._record_l3_query(self.last_l3_query_diagnostic)
         return context
 
+    def get_geometry_on_demand_context(
+        self, *, step: int, instruction: str, l1_status: str, max_chars: int,
+    ) -> MemoryContext | None:
+        """Original on-demand gate + 59d09ba geometry-only candidate retrieval.
+
+        The L1-empty trigger and the ``(map signature, query)`` dedupe are
+        delegated to :class:`L3QueryController.prepare_query`, the same code the
+        CLIP path uses.  Retrieval is the unchanged
+        :class:`SpatialGraphAdapter.build`; no CLIP encoder, weight, embedding or
+        cosine score exists on this path.
+        """
+        controller = self.geometry_on_demand_controller
+        if controller is None or self.spatial_map is None:
+            return None
+        if (
+            self.last_spatial_frame is None
+            or self.spatial_adapter is None
+            or self.v3_store is None
+        ):
+            diagnostic = {
+                "trigger": l1_status, "step": step,
+                "skipped_reason": "no_current_frame", "query_executed": False,
+                "candidate_count": 0, "injected_count": 0,
+                "retrieval": "geometry_spatial_graph_adapter",
+            }
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        prepared = controller.prepare_query(
+            self.spatial_map, step=step, instruction=instruction,
+            l1_status=l1_status,
+            available=lambda object_map: (
+                controller.has_historical_geometry_candidates(object_map, step)
+            ),
+            unavailable_reason="no_historical_geometry_object",
+            retrieval="geometry_spatial_graph_adapter",
+            signature_fn=controller.geometry_map_signature,
+        )
+        diagnostic = dict(controller.last_diagnostic or {})
+        diagnostic["injected_count"] = 0
+        if prepared is None:
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        _query, _ = prepared
+
+        def _build(context_chars: int) -> MemoryContext | None:
+            return self.spatial_adapter.build(
+                self.v3_store, self.spatial_map, self.last_spatial_frame,
+                scene_id=self.v3_scene_id,
+                episode_id=self.working.state.episode_id,
+                rollout_idx=self.v3_rollout_idx, step=step,
+                instruction=instruction, scope=self.local_graph_config.scope,
+                max_landmarks=self.local_graph_config.max_landmarks,
+                prompt_max_chars=context_chars,
+                min_confidence=self.spatial_l3_config.min_injection_confidence,
+            )
+
+        started = perf_counter()
+        try:
+            context = _build(max_chars)
+            diagnostic["query_ms"] = (perf_counter() - started) * 1000.0
+        except Exception as exc:  # noqa: BLE001 - a sidecar must not break L1
+            diagnostic["skipped_reason"] = "query_error"
+            diagnostic["error"] = f"{type(exc).__name__}: {exc}"
+            diagnostic["query_ms"] = (perf_counter() - started) * 1000.0
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        objects_total = len(self.spatial_map.objects)
+        diagnostic["objects_total"] = objects_total
+        if context is None:
+            # Distinguish "no geometric candidate" from "candidate dropped by
+            # the on-demand Prompt budget" without inventing a score.
+            probe = None
+            try:
+                probe = _build(UNBOUNDED_CHAR_LIMIT)
+            except Exception:  # noqa: BLE001 - diagnostic probe only
+                probe = None
+            if probe is not None:
+                diagnostic["candidate_count"] = len(probe.layer_items)
+                diagnostic["prompt_budget_excluded"] = True
+                diagnostic["skipped_reason"] = "prompt_budget_excluded"
+            else:
+                diagnostic["candidate_count"] = 0
+                diagnostic["skipped_reason"] = "no_geometry_candidate"
+            diagnostic["rejected_object_count"] = objects_total
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+
+        items = context.layer_items
+        object_ids: list[str] = []
+        evidence_ids: list[str] = []
+        matches: list[dict[str, object]] = []
+        for item in items:
+            object_id = item.metadata.get("object_id")
+            item_evidence = list(item.metadata.get("evidence_ids", []))
+            if isinstance(object_id, str):
+                object_ids.append(object_id)
+            evidence_ids.extend(
+                value for value in item_evidence if isinstance(value, str)
+            )
+            matches.append({
+                "object_id": object_id,
+                "label": item.label,
+                "evidence_ids": item_evidence,
+                "confidence": item.confidence,
+                "observation_count": item.metadata.get("observation_count"),
+                "center_world": item.metadata.get("center_world"),
+                "distance_m": item.metadata.get("current_relative_distance_m"),
+                "bearing_deg": item.metadata.get("current_relative_bearing_deg"),
+            })
+        diagnostic.update({
+            "candidate_count": len(items),
+            "injected_count": len(items),
+            "rejected_object_count": max(0, objects_total - len(items)),
+            "object_ids": object_ids,
+            "evidence_ids": list(dict.fromkeys(evidence_ids)),
+            "matches": matches,
+            "geometry_context_chars": len(context.text),
+            "skipped_reason": None,
+        })
+        self.last_l3_query_diagnostic = diagnostic
+        self._record_l3_query(diagnostic)
+        return context
+
     def query_l3_objects(self, text: str, top_k: int) -> L3QueryResult:
         """Local, non-mutating text query over the current L3 object map."""
         if self.spatial_map is None or self.clip_encoder is None:
@@ -1046,6 +1274,82 @@ class MemoryManager:
         return L3ClipQuery(self.spatial_map, self.clip_encoder).query(
             text, top_k,
             min_similarity=self.spatial_l3_config.clip_min_similarity,
+        )
+
+    def set_adaptive_l3_runner(self, runner: AdaptiveL3QueryRunner | None) -> None:
+        """Attach the policy-owned runner (it needs the already-loaded engine)."""
+        if not self.adaptive_l3_query_config.enabled:
+            raise ValueError("adaptive L3 query is disabled")
+        if runner is not None and not isinstance(runner, AdaptiveL3QueryRunner):
+            raise TypeError("runner must be an AdaptiveL3QueryRunner")
+        self.adaptive_l3_runner = runner
+
+    def build_adaptive_l3_context(
+        self, *, step: int, instruction: str, l1_context: MemoryContext | None,
+        l1_status: str, agent_pose: object | None, max_chars: int,
+    ) -> MemoryContext | None:
+        """Ask the controller whether to query, then combine only verified facts.
+
+        The L1 card is never rewritten.  If the runner abstains, fails, or returns
+        nothing that fits the remaining budget, the exact object it was given is
+        returned.  When L3 facts are added, the L1 text stays the prefix of the
+        combined text and the L1 items stay first.
+        """
+        if not self.adaptive_l3_query_config.enabled:
+            raise RuntimeError("adaptive L3 query is disabled")
+        if type(max_chars) is not int or max_chars < 1:
+            raise ValueError("adaptive L3 prompt budget must be a positive integer")
+        if self.adaptive_l3_runner is None:
+            self.last_adaptive_l3_diagnostic = {
+                "step": step, "skipped_reason": "controller_not_attached",
+                "injected": False, "query_executed": False,
+            }
+            return l1_context
+        if self.spatial_map is None:
+            self.last_adaptive_l3_diagnostic = {
+                "step": step, "skipped_reason": "l3_map_unavailable",
+                "injected": False, "query_executed": False,
+            }
+            return l1_context
+        l1_chars = len(l1_context.text) if l1_context is not None else 0
+        reserve = 1 if l1_context is not None else 0
+        remaining = max_chars - l1_chars - reserve
+        if remaining < len("[Verified L3 history]"):
+            self.last_adaptive_l3_diagnostic = {
+                "step": step, "skipped_reason": "l1_exhausts_prompt_budget",
+                "injected": False, "query_executed": False,
+                "l1_chars": l1_chars, "budget_chars": max_chars,
+            }
+            return l1_context
+        context = self.adaptive_l3_runner.run(
+            object_map=self.spatial_map, step=step, instruction=instruction,
+            l1_status=l1_status, l1_context=l1_context, agent_pose=agent_pose,
+            max_chars=remaining,
+        )
+        diagnostic = dict(self.adaptive_l3_runner.last_diagnostic)
+        diagnostic["l1_chars"] = l1_chars
+        diagnostic["budget_chars"] = max_chars
+        self.last_adaptive_l3_diagnostic = diagnostic
+        if context is None:
+            return l1_context
+        if l1_context is None:
+            diagnostic["l1_included"] = False
+            return context
+        combined_text = l1_context.text.rstrip("\n") + "\n" + context.text
+        # ``build_context_text`` escapes the whole block before injection, so
+        # check the escaped length to guarantee the L3 lines are never cut off.
+        if len(escape(combined_text, quote=False)) > max_chars:
+            diagnostic["injected"] = False
+            diagnostic["skipped_reason"] = "combined_prompt_budget_excluded"
+            return l1_context
+        diagnostic["l1_included"] = True
+        diagnostic["combined_chars"] = len(combined_text)
+        return MemoryContext(
+            events=l1_context.events,
+            nodes=l1_context.nodes,
+            edges=l1_context.edges,
+            text=combined_text,
+            layer_items=[*l1_context.layer_items, *context.layer_items],
         )
 
     def reformat_v4_context(self, excluded_evidence_ids: frozenset[str]) -> MemoryContext | None:
@@ -1117,11 +1421,18 @@ class MemoryManager:
                 self.last_spatial_diagnostic = {}
             if self.l3_query_controller is not None:
                 self.l3_query_controller.close_episode()
+            if self.geometry_on_demand_controller is not None:
+                self.geometry_on_demand_controller.close_episode()
+            if self.adaptive_l3_runner is not None:
+                self.adaptive_l3_runner.close_episode()
+            self.last_adaptive_l3_diagnostic = {}
             self.last_local_graph_status = "not_attempted"
             self.last_l3_query_diagnostic = {}
             self.last_episode_l3_query_stats = (
                 self.l3_query_stats_summary()
-                if self.spatial_l3_config.mode == "on_demand" else {}
+                if self.spatial_l3_config.mode in {
+                    "on_demand", "geometry_on_demand",
+                } else {}
             )
             self.l3_query_stats = _empty_l3_query_stats()
             self._l3_stats_step = None

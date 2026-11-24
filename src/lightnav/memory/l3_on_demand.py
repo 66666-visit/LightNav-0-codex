@@ -33,7 +33,7 @@ L1_EMPTY_STATUSES = frozenset({"no_candidates", "budget_excluded"})
 class L3QueryController:
     """Rate-limit and invoke the local CLIP query for an L3 object map."""
 
-    encoder: ClipFeatureEncoder
+    encoder: ClipFeatureEncoder | None
     top_k: int = 3
     min_similarity: float = 0.0
     _identity: tuple[str, str, int] | None = field(default=None, init=False, repr=False)
@@ -78,19 +78,74 @@ class L3QueryController:
             if node.clip_feature is not None and node.clip_feature_observations >= 1
         ))
 
-    def maybe_query(
+    @staticmethod
+    def has_clip_features(object_map: ObjectMap) -> bool:
+        """CLIP retrieval precondition; not part of the L1-empty trigger."""
+        return any(
+            node.clip_feature is not None and node.clip_feature_observations >= 1
+            for node in object_map.objects.values()
+        )
+
+    @staticmethod
+    def geometry_map_signature(object_map: ObjectMap) -> tuple[tuple[Any, ...], ...]:
+        """Geometry-only identity of the L3 map for the unchanged dedupe rule."""
+        return tuple(sorted(
+            (
+                node.object_id,
+                int(node.observation_count),
+                tuple(node.evidence_ids),
+                str(node.geometry_status),
+                int(len(node.points_world)),
+            )
+            for node in object_map.objects.values()
+        ))
+
+    @staticmethod
+    def has_geometry_candidates(object_map: ObjectMap) -> bool:
+        """Geometry retrieval precondition; equivalent role to has_clip_features."""
+        return any(
+            node.geometry_status == "observed" and bool(node.evidence_ids)
+            for node in object_map.objects.values()
+        )
+
+    @staticmethod
+    def has_historical_geometry_candidates(object_map: ObjectMap, step: int) -> bool:
+        """True only when a node already has an older observed Evidence record.
+
+        At the step a node is first created its fused geometry contains the
+        current observation, so there is nothing historical to retrieve yet.
+        Skipping the query there also avoids poisoning the unchanged-map dedupe
+        with a query that could not have produced a fact.
+        """
+        for node in object_map.objects.values():
+            if node.geometry_status != "observed":
+                continue
+            for evidence_id in node.evidence_ids:
+                record = object_map.evidence.get(evidence_id)
+                if (
+                    record is not None
+                    and record.geometry_status == "observed"
+                    and record.step_id < step
+                ):
+                    return True
+        return False
+
+    def prepare_query(
         self, object_map: ObjectMap, *, step: int, instruction: str, l1_status: str,
         query_text: str | None = None,
-    ) -> L3QueryResult | None:
-        """Run one query only when L1 is empty and the L3 evidence changed.
+        available: Any | None = None,
+        unavailable_reason: str = "no_object_features",
+        retrieval: str = "clip_l3_query",
+        signature_fn: Any | None = None,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Apply the 660320f on-demand gate, independent of the retrieval source.
 
-        ``query_text`` defaults to the raw navigation instruction, matching the
-        official ConceptGraphs text-query path (which accepts a caller-supplied
-        text string and does not parse it).  Tests and controlled experiments may
-        pass a short object landmark phrase explicitly; no parser is invented
-        here.  Returns ``None`` with a diagnostic reason when no query is
-        warranted or when the query produced no valid match.  A query is never
-        repeated for an unchanged object map and query text.
+        The L1-empty status test, input validation, query normalization and the
+        ``(map signature, query)`` dedupe are shared verbatim with the original
+        CLIP path.  ``available`` only selects the retrieval-specific
+        precondition (CLIP features vs. geometry evidence); it is checked at the
+        same point in the sequence.  ``signature_fn`` only changes which
+        read-only fields identify an unchanged map.
         """
         query = (
             " ".join(query_text.split()) if isinstance(query_text, str)
@@ -111,9 +166,6 @@ class L3QueryController:
             "query_source": query_source,
             "query_executed": False,
             "last_query_step": self._last_query_step,
-            "top_k": self.top_k,
-            "min_similarity": self.min_similarity,
-            "similarity_semantics": "raw_cosine_not_confidence",
             "candidate_count": 0,
             "scored_candidate_count": 0,
             "skipped_reason": None,
@@ -121,6 +173,14 @@ class L3QueryController:
             "matches": [],
             "candidates": [],
         }
+        if retrieval == "clip_l3_query":
+            diagnostic.update({
+                "top_k": self.top_k,
+                "min_similarity": self.min_similarity,
+                "similarity_semantics": "raw_cosine_not_confidence",
+            })
+        else:
+            diagnostic["retrieval"] = retrieval
         self.last_diagnostic = diagnostic
         if l1_status not in L1_EMPTY_STATUSES:
             diagnostic["skipped_reason"] = (
@@ -141,14 +201,15 @@ class L3QueryController:
         if not object_map.objects:
             diagnostic["skipped_reason"] = "empty_map"
             return None
-        if not any(
-            node.clip_feature is not None and node.clip_feature_observations >= 1
-            for node in object_map.objects.values()
-        ):
-            diagnostic["skipped_reason"] = "no_object_features"
+        if available is not None and not available(object_map):
+            diagnostic["skipped_reason"] = unavailable_reason
             return None
 
-        query_key = (self.map_signature(object_map), query)
+        signature = (
+            self.map_signature(object_map) if signature_fn is None
+            else signature_fn(object_map)
+        )
+        query_key = (signature, query)
         if query_key == self._last_query_key:
             diagnostic["skipped_reason"] = "map_unchanged_since_last_query"
             if self._last_query_step is not None:
@@ -157,6 +218,33 @@ class L3QueryController:
         self._last_query_key = query_key
         diagnostic["query_executed"] = True
         self._last_query_step = step
+        return query, diagnostic
+
+    def maybe_query(
+        self, object_map: ObjectMap, *, step: int, instruction: str, l1_status: str,
+        query_text: str | None = None,
+    ) -> L3QueryResult | None:
+        """Run one CLIP query only under the original 660320f on-demand gate.
+
+        ``query_text`` defaults to the raw navigation instruction, matching the
+        official ConceptGraphs text-query path (which accepts a caller-supplied
+        text string and does not parse it).  Tests and controlled experiments may
+        pass a short object landmark phrase explicitly; no parser is invented
+        here.  Returns ``None`` with a diagnostic reason when no query is
+        warranted or when the query produced no valid match.  A query is never
+        repeated for an unchanged CLIP map and query text.
+        """
+        prepared = self.prepare_query(
+            object_map, step=step, instruction=instruction, l1_status=l1_status,
+            query_text=query_text, available=self.has_clip_features,
+            unavailable_reason="no_object_features",
+        )
+        if prepared is None:
+            return None
+        query, diagnostic = prepared
+        if self.encoder is None:
+            diagnostic["skipped_reason"] = "no_clip_encoder"
+            return None
         try:
             result = L3ClipQuery(object_map, self.encoder).query(
                 query, self.top_k, min_similarity=self.min_similarity,
