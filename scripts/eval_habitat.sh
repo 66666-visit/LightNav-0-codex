@@ -645,6 +645,19 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ── 1. env servers ───────────────────────────────────────────────────────────
+# The Habitat server rejects --split-id with --single-scene-id.  Exact
+# single-Episode runs (the instance-disambiguation four-Episode arm) therefore
+# omit sharding and must use one GPU shard.
+SINGLE_EPISODE_SELECTION=0
+if [[ " ${SERVER_ARGS:-} " == *" --single-scene-id "* ]] \
+    || [[ " ${SERVER_ARGS:-} " == *" --single-scene-id="* ]]; then
+    SINGLE_EPISODE_SELECTION=1
+fi
+if [ "$SINGLE_EPISODE_SELECTION" = 1 ] && [ "$N" -ne 1 ]; then
+    echo "$TAG ERROR: single-Episode selection requires exactly one GPU shard" >&2
+    exit 1
+fi
+
 server_args=(--task "$TASK" --config "$HABITAT_CONFIG" --max-steps "$MAX_STEPS")
 [ -n "$SEED" ] && server_args+=(--seed "$SEED")
 [ "$STRICT_FULL_EVAL" = 1 ] && server_args+=(--strict-full-eval)
@@ -662,11 +675,16 @@ for ((i = 0; i < N; i++)); do
     port=$((BASE_PORT + i))
     log="$LOG_DIR/server_gpu${g}_shard${i}.log"
     echo "$TAG server shard $i/$N on GPU $g -> tcp://localhost:$port  (log: $log)"
+    if [ "$SINGLE_EPISODE_SELECTION" = 1 ]; then
+        server_split_args=()
+    else
+        server_split_args=(--split-id "$i" --split-num "$N")
+    fi
     HABITAT_SIM_GPU_ID=$g PYTHONUNBUFFERED=1 \
     PYTHONPATH="$REPO_ROOT/habitat_server${PYTHONPATH:+:$PYTHONPATH}" \
     LD_LIBRARY_PATH="${HABITAT_LD}${HABITAT_LD:+:}${LD_LIBRARY_PATH:-}" \
         "$HABITAT_PYTHON" -m lightnav_habitat.serve "${server_args[@]}" \
-            --port "$port" --split-id "$i" --split-num "$N" \
+            --port "$port" "${server_split_args[@]}" \
             --ready-file "$READY_DIR/shard${i}.ready" >"$log" 2>&1 &
     SERVER_PIDS+=("$!")
 done

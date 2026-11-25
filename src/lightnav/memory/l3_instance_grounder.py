@@ -3,8 +3,11 @@
 The module is an isolated adapter between the existing Geometry on-demand
 query and the existing Prompt formatter.  It does **not** re-rank candidates
 with hand-written rules: it loads the official ViL3DRel Nr3D Student checkpoint
-and runs the official text encoder + spatial transformer + grounding head.  The
-only decision is the official softmax argmax; no confidence threshold is added.
+and runs the official text encoder + spatial transformer + grounding head.  It
+returns the official softmax scores and argmax for every proposal; no
+confidence threshold is added.  Selecting an *eligible* proposal from those
+official scores (one that maps to a formatable geometry fact) is done by
+:mod:`lightnav.memory.l3_evidence_selector`, never by changing the scores.
 
 Inputs come from :mod:`lightnav.memory.rgb_sidecar`, which records the real
 XYZRGB pixels of every L3 Evidence mask.  The official preprocessing is
@@ -48,7 +51,13 @@ class ProposalTokenizer(Protocol):
 
 @dataclass(frozen=True)
 class ProposalScore:
-    """One proposal's official logit and softmax probability."""
+    """One proposal's official logit and softmax probability.
+
+    ``proposal_id`` is the per-forward proposal row; ``object_id`` is the
+    persistent ``ObjectNode`` ID it came from, and ``evidence_ids`` is the
+    node's Evidence set.  The mapping is recorded explicitly so a caller never
+    has to infer identity from list position.
+    """
 
     object_id: str
     class_name: str
@@ -57,14 +66,22 @@ class ProposalScore:
     size_vil: tuple[float, float, float]
     logit: float
     probability: float
+    proposal_id: str = ""
+    evidence_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "proposal_id": self.proposal_id,
+            "proposal_object_id": self.object_id,
+            "persistent_object_id": self.object_id,
             "object_id": self.object_id,
             "class_name": self.class_name,
+            "evidence_ids": list(self.evidence_ids),
             "point_count": self.point_count,
             "center_vil": list(self.center_vil),
             "size_vil": list(self.size_vil),
+            "grounding_logit": self.logit,
+            "grounding_probability": self.probability,
             "logit": self.logit,
             "probability": self.probability,
         }
@@ -210,9 +227,11 @@ def build_official_batch(
         obj_fts.append(features)
         obj_locs.append(loc)
         metadata.append({
+            "proposal_id": f"proposal-{index}",
             "object_id": proposal.object_id,
             "class_name": proposal.class_name,
             "point_count": proposal.point_count,
+            "evidence_ids": list(proposal.evidence_ids),
             "center_vil": [float(value) for value in center],
             "size_vil": [float(value) for value in size],
         })
@@ -455,10 +474,12 @@ class OfficialStudentRuntime:
             )
         started = time.perf_counter()
         offered: tuple[dict[str, Any], ...] = tuple({
+            "proposal_id": f"proposal-{index}",
             "object_id": proposal.object_id,
             "class_name": proposal.class_name,
             "point_count": proposal.point_count,
-        } for proposal in proposals)
+            "evidence_ids": list(proposal.evidence_ids),
+        } for index, proposal in enumerate(proposals))
         try:
             import torch
 
@@ -497,6 +518,8 @@ class OfficialStudentRuntime:
                     size_vil=tuple(float(value) for value in meta["size_vil"]),
                     logit=float(logit),
                     probability=float(probability),
+                    proposal_id=meta["proposal_id"],
+                    evidence_ids=tuple(meta["evidence_ids"]),
                 )
                 for proposal, meta, logit, probability in zip(
                     proposals, metadata, logits, probabilities,
@@ -548,6 +571,15 @@ class ViL3DRelGrounder:
         step: int,
         episode_id: str = "",
     ) -> InstanceGroundingResult:
+        """Score every complete proposal for one grounding query.
+
+        ``instruction`` is either the original navigation instruction or one
+        extracted instruction-landmark phrase.  In both cases the sidecar's
+        complete proposal list is passed to the official Student unchanged, so
+        spatial-relation reasoning still sees every candidate.  This method
+        returns the official argmax and all scores; choosing an eligible
+        proposal from those scores is the manager's responsibility.
+        """
         if not isinstance(sidecar, RGBSidecar):
             raise TypeError("sidecar must be an RGBSidecar")
         proposals, skipped = sidecar.proposals(object_map.objects)

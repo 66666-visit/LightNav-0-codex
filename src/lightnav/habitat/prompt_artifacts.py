@@ -106,6 +106,34 @@ def build_prompt_protocol(memory: Any) -> dict[str, Any]:
                     "clip_weights_required": False,
                     "clip_similarity_used": False,
                 }
+                grounder_config = getattr(memory, "spatial_l3", None)
+                if getattr(grounder_config, "instance_grounder_enabled", False):
+                    selection_mode = getattr(
+                        grounder_config, "grounder_selection_mode", "argmax",
+                    )
+                    budget["on_demand_l3"].update({
+                        "retrieval": (
+                            "spatial_graph_adapter+vil3dref_student"
+                        ),
+                        "grounder_selection_mode": selection_mode,
+                        "proposal_object_evidence_mapping": (
+                            selection_mode == "eligible"
+                        ),
+                        "eligible_proposal_selection": (
+                            selection_mode == "eligible"
+                        ),
+                        "landmark_queries": bool(getattr(
+                            grounder_config,
+                            "grounder_landmark_queries", False,
+                        )),
+                        "geometry_fallback": (
+                            "original SpatialGraphAdapter items"
+                            if getattr(
+                                grounder_config,
+                                "grounder_geometry_fallback", False,
+                            ) else False
+                        ),
+                    })
     adaptive = getattr(memory, "adaptive_l3_query", None)
     if getattr(adaptive, "enabled", False):
         # Separate, opt-in arm: the original L1 layer is unchanged and L3 facts
@@ -297,6 +325,26 @@ def prompt_diagnostic_row(
             ),
             "l3_on_demand_injected_evidence_ids": l3_query.get(
                 "injected_evidence_ids", []
+            ),
+            "l3_grounding_query": l3_query.get("grounding_query"),
+            "l3_grounding_query_source": l3_query.get("grounding_query_source"),
+            "l3_instruction_landmarks": l3_query.get("instruction_landmarks"),
+            "l3_grounder_proposal_count": l3_query.get(
+                "grounder_proposal_count"
+            ),
+            "l3_grounder_scored_count": l3_query.get("grounder_scored_count"),
+            "l3_formatable_proposal_count": l3_query.get(
+                "formatable_proposal_count"
+            ),
+            "l3_selected_valid_proposals": l3_query.get(
+                "selected_valid_proposals", []
+            ),
+            "l3_geometry_fallback_reason": l3_query.get(
+                "geometry_fallback_reason"
+            ),
+            "l3_actual_injection": l3_query.get("actual_injection"),
+            "l3_actual_injected_evidence_ids": l3_query.get(
+                "actual_injected_evidence_ids", []
             ),
         })
     stats = context.get("l3_query_stats")

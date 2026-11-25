@@ -299,8 +299,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Local official Nr3D Student checkpoint "
                         "(gtlabelpcd_mix/nr3d/ckpts/model_epoch_96.pt).")
     p.add_argument("--spatial_l3_grounder_config", default="",
-                   help="Official model YAML; empty uses the checked-in "
-                        "nr3d_gtlabelpcd_mix_model.yaml next to the reference source.")
+                   help="Official model YAML; empty uses the "
+                        "nr3d_gtlabelpcd_mix_model.yaml provided under "
+                        "references/vil3dref.")
     p.add_argument("--spatial_l3_grounder_device", default="cuda",
                    help="Torch device for the official Student; no silent CPU fallback.")
     p.add_argument("--spatial_l3_grounder_bert_vocab", default="",
@@ -308,6 +309,26 @@ def build_parser() -> argparse.ArgumentParser:
                         "Hugging Face cache (no network access).")
     p.add_argument("--spatial_l3_grounder_seed", type=int, default=0,
                    help="Deterministic 1024-point sampling seed per object.")
+    p.add_argument(
+        "--spatial_l3_grounder_selection",
+        choices=("argmax", "eligible"),
+        default="argmax",
+        help="argmax keeps the original d659e57 one-query/global-argmax path; "
+             "eligible enables joint proposal/ObjectNode/Evidence filtering.",
+    )
+    p.add_argument(
+        "--spatial_l3_grounder_landmark_queries",
+        action=argparse.BooleanOptionalAction, default=False,
+        help="Parse the original instruction once per Episode and ground each "
+             "verbatim landmark phrase separately. Requires "
+             "--spatial_l3_grounder_selection eligible.",
+    )
+    p.add_argument(
+        "--spatial_l3_grounder_geometry_fallback",
+        action=argparse.BooleanOptionalAction, default=False,
+        help="When no eligible Grounding fact exists, fall back to the original "
+             "SpatialGraphAdapter candidates. Requires selection eligible.",
+    )
     p.add_argument(
         "--adaptive_l3_query", action="store_true",
         help="Enable the opt-in Adaptive L3 Query controller on the original L1 path. "
@@ -534,6 +555,13 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                 grounder_device=args.spatial_l3_grounder_device,
                 grounder_bert_vocab_path=args.spatial_l3_grounder_bert_vocab,
                 grounder_seed=args.spatial_l3_grounder_seed,
+                grounder_selection_mode=args.spatial_l3_grounder_selection,
+                grounder_landmark_queries=(
+                    args.spatial_l3_grounder_landmark_queries
+                ),
+                grounder_geometry_fallback=(
+                    args.spatial_l3_grounder_geometry_fallback
+                ),
                 geometry=GeometryConfig(**{
                     name: getattr(args, f"spatial_l3_{name}") for name in (
                         "min_depth_m", "max_depth_m", "min_points",

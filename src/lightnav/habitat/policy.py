@@ -835,6 +835,21 @@ class TrajVocabVLNCEPolicy:
             adaptive_diagnostic["prompt_verified"] = actual_injection
             diagnostic["adaptive_l3"] = adaptive_diagnostic
         if spatial_diagnostic is not None:
+            l3_actual = bool(
+                context is not None
+                and context_source in {"l3_geometry_on_demand", "l3_on_demand"}
+                and actual_injection
+            )
+            if l3_query_diagnostic:
+                l3_query_diagnostic = dict(l3_query_diagnostic)
+                l3_query_diagnostic.update({
+                    "actual_injection": l3_actual,
+                    "actual_injected_evidence_ids": (
+                        list(visible_ids) if l3_actual else []
+                    ),
+                    "prompt_hash_before": diagnostic["prompt_hash_before"],
+                    "prompt_hash_after": diagnostic["prompt_hash_after"],
+                })
             diagnostic["spatial_l3"] = {
                 **spatial_diagnostic,
                 "context_source": context_source,
@@ -842,6 +857,12 @@ class TrajVocabVLNCEPolicy:
                 "shadow_no_spatial_injection": spatial_mode == "shadow",
                 "l1_status": l1_status,
                 "l3_query": l3_query_diagnostic,
+                "actual_injection": l3_actual,
+                "actual_injected_evidence_ids": (
+                    list(visible_ids) if l3_actual else []
+                ),
+                "prompt_hash_before": diagnostic["prompt_hash_before"],
+                "prompt_hash_after": diagnostic["prompt_hash_after"],
             }
             if spatial_mode in {"on_demand", "geometry_on_demand"}:
                 stats = manager.l3_query_stats_summary()
@@ -1250,9 +1271,24 @@ class TrajVocabVLNCEPolicy:
                 **spatial_diagnostic,
                 "context_source": prompt_context.get("source", "none"),
                 "fallback_reason": spatial_fallback_reason,
+                "actual_injection": actual_injection if checked else None,
+                "actual_injected_evidence_ids": (
+                    list(visible_ids) if actual_injection else []
+                ),
+                "prompt_hash_before": prompt_context["prompt_hash_before"],
+                "prompt_hash_after": prompt_context["prompt_hash_after"],
             }
             on_demand = prompt_context.get("on_demand_l3")
             if isinstance(on_demand, dict):
+                on_demand = dict(on_demand)
+                on_demand.update({
+                    "actual_injection": actual_injection if checked else None,
+                    "actual_injected_evidence_ids": (
+                        list(visible_ids) if actual_injection else []
+                    ),
+                    "prompt_hash_before": prompt_context["prompt_hash_before"],
+                    "prompt_hash_after": prompt_context["prompt_hash_after"],
+                })
                 prompt_context["spatial_l3"]["l3_query"] = on_demand
                 prompt_context["spatial_l3"]["l3_query_stats"] = (
                     prompt_context.get("l3_query_stats")

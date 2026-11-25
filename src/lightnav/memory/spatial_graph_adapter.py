@@ -9,6 +9,9 @@ from html import escape
 import numpy as np
 
 from lightnav.memory.conceptgraphs_lite import InstanceMask
+from lightnav.memory.l3_evidence_selector import (
+    label_relevant_to_instruction,
+)
 from lightnav.memory.local_graph_fusion import _plain_label
 from lightnav.memory.schemas import LayerMemoryItem, MemoryContext, ObservationEvidence
 from lightnav.memory.v3_retrieval import _terms
@@ -169,7 +172,7 @@ class SpatialGraphAdapter:
         self, store: V3MemoryStore, object_map: object, frame: object, *,
         scene_id: str, episode_id: str, rollout_idx: int, step: int,
         instruction: str, scope: str, max_landmarks: int, prompt_max_chars: int,
-        min_confidence: float,
+        min_confidence: float, alias_aware: bool = False,
     ) -> MemoryContext | None:
         if store.active_episode != (scene_id, episode_id, rollout_idx):
             raise ValueError("spatial selection requires the active Scene/Episode")
@@ -203,7 +206,11 @@ class SpatialGraphAdapter:
             ):
                 continue
             label = _plain_label(obj.class_name)
-            if not label or not (_terms(label) & _terms(instruction)):
+            relevant = (
+                label_relevant_to_instruction(label, instruction)
+                if alias_aware else bool(_terms(label) & _terms(instruction))
+            )
+            if not label or not relevant:
                 continue
             center = tuple(float(value) for value in obj.center_world)
             if len(center) != 3 or not all(math.isfinite(value) for value in center):

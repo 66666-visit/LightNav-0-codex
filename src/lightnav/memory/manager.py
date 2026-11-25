@@ -17,9 +17,20 @@ from lightnav.memory.adaptive_l3_query_config import AdaptiveL3QueryConfig
 from lightnav.memory.clip_features import clip_crop_boxes
 from lightnav.memory.conceptgraphs_lite import ObjectMap, RGBDFrame
 from lightnav.memory.episodic_memory import EpisodicMemory
+from lightnav.memory.instruction_landmarks import (
+    InstructionLandmarks,
+    parse_instruction_landmarks,
+)
 from lightnav.memory.joint_prompt import JointPromptBuilder
 from lightnav.memory.l1_prompt_organizer import L1PromptOrganizer
 from lightnav.memory.l3_clip_query import L3ClipQuery, L3QueryResult
+from lightnav.memory.l3_evidence_selector import (
+    build_proposal_eligibility,
+    choose_first_eligible,
+    eligible_object_ids,
+    geometry_fallback_item,
+    render_context,
+)
 from lightnav.memory.l3_on_demand import L3QueryController, build_l3_query_context
 from lightnav.memory.l3_prompt_organizer import L3PromptOrganizer
 from lightnav.memory.local_graph_config import LocalGraphConfig
@@ -77,7 +88,46 @@ from lightnav.memory.v4_utilization import REVISIT_AUDIT, FrameKey, MemoryUtiliz
 from lightnav.memory.working_memory import WorkingMemoryStore
 
 _LAYERS = frozenset({"short", "mid", "long"})
+_NAVIGATION_MEMORY_HEADER = "[Navigation Memory]"
 logger = logging.getLogger(__name__)
+
+
+def _spatial_match_payload(
+    item: LayerMemoryItem, *, selection_source: str | None = None,
+) -> dict:
+    """One existing geometry fact, reported without changing its text."""
+    metadata = item.metadata
+    return {
+        "object_id": metadata.get("object_id"),
+        "label": item.label,
+        "evidence_ids": list(metadata.get("evidence_ids", [])),
+        "confidence": item.confidence,
+        "observation_count": metadata.get("observation_count"),
+        "center_world": metadata.get("center_world"),
+        "distance_m": metadata.get("current_relative_distance_m"),
+        "bearing_deg": metadata.get("current_relative_bearing_deg"),
+        "selection_source": selection_source,
+    }
+
+
+def _grounding_failure_reason(eligibility: list, result: object) -> str:
+    """Name the concrete reason no eligible proposal remained."""
+    refusal = getattr(result, "refusal_reason", None)
+    error = getattr(result, "error", None)
+    if error is not None:
+        return refusal or "grounding_error"
+    if not eligibility:
+        return refusal or "no_scored_proposal"
+    if not any(proposal.formatable for proposal in eligibility):
+        return "no_formatable_grounding_candidate"
+    if not any(proposal.class_match for proposal in eligibility):
+        return "no_class_matching_proposal"
+    if any(
+        not proposal.object_node_valid or not proposal.evidence_mapping_valid
+        for proposal in eligibility
+    ):
+        return "invalid_evidence_mapping"
+    return refusal or "no_eligible_proposal"
 
 
 def _empty_l3_query_stats() -> dict:
@@ -122,6 +172,7 @@ class MemoryManager:
         prompt_mode: str = "legacy",
         adaptive_l3_query_config: AdaptiveL3QueryConfig | None = None,
         instance_grounder: object | None = None,
+        instruction_landmark_provider: object | None = None,
     ) -> None:
         if top_k < 0:
             raise ValueError("top_k must be nonnegative")
@@ -210,6 +261,15 @@ class MemoryManager:
             raise ValueError("instance grounder requires the RGB sidecar")
         self.instance_grounder = instance_grounder
         self._instance_grounder_error: str | None = None
+        # Parsed once per Episode (never per query) when the grounder is on.
+        # The provider hook lets an existing DeepSeek/OpenAI-compatible parser
+        # be reused; no provider is bundled and failure always falls back.
+        if instruction_landmark_provider is not None and not callable(
+            getattr(instruction_landmark_provider, "extract", None)
+        ):
+            raise TypeError("instruction_landmark_provider must provide extract()")
+        self.instruction_landmark_provider = instruction_landmark_provider
+        self.instruction_landmarks: InstructionLandmarks | None = None
         if self.instance_grounder is not None and not callable(
             getattr(self.instance_grounder, "select", None)
         ):
@@ -433,6 +493,28 @@ class MemoryManager:
             self.rgb_sidecar.reset_episode(
                 self.v3_scene_id, episode_id, rollout_idx,
             )
+        # Parse the original instruction once at Episode initialization and
+        # cache it.  A provider is optional; the local extractor is used when
+        # none is configured, and every phrase is checked against the source.
+        self.instruction_landmarks = None
+        if (
+            self.spatial_l3_config.instance_grounder_enabled
+            and self.spatial_l3_config.grounder_landmark_queries
+            and instruction.strip()
+        ):
+            try:
+                self.instruction_landmarks = parse_instruction_landmarks(
+                    instruction, provider=self.instruction_landmark_provider,
+                )
+            except Exception as exc:  # noqa: BLE001 - parsing must never fail nav
+                logger.warning(
+                    "instruction landmark parsing failed; using the full "
+                    "instruction for grounding: %s", exc,
+                )
+                self.instruction_landmarks = InstructionLandmarks(
+                    instruction=instruction, landmarks=(),
+                    source="parser_error_fallback",
+                )
         if self.adaptive_l3_runner is not None:
             self.adaptive_l3_runner.reset_episode(
                 self.v3_scene_id, episode_id, rollout_idx,
@@ -1219,13 +1301,15 @@ class MemoryManager:
         self.instance_grounder = grounder
         return grounder
 
-    def _grounded_geometry_context(
+    def _grounded_argmax_geometry_context(
         self, *, step: int, instruction: str, l1_status: str, max_chars: int,
     ) -> MemoryContext | None:
-        """Geometry candidates -> official Student argmax -> one existing fact.
+        """Original d659e57 path: one full query, official global argmax only.
 
-        This method is reached only when ``instance_grounder_enabled`` is on;
-        the original geometry path below remains byte-identical when it is off.
+        This is the explicit ablation C.  It is byte-for-byte the same
+        selection rule as the frozen baseline: no landmark parser, no
+        eligibility re-ranking and no geometry fallback.  Extra diagnostics are
+        observational only.
         """
         controller = self.geometry_on_demand_controller
         if controller is None or self.spatial_map is None:
@@ -1240,6 +1324,11 @@ class MemoryManager:
                 "skipped_reason": "no_current_frame", "query_executed": False,
                 "candidate_count": 0, "injected_count": 0,
                 "retrieval": "geometry_spatial_graph_adapter+vil3dref_student",
+                "grounding_query": instruction,
+                "grounding_query_source": "full_instruction",
+                "selection_mode": "argmax",
+                "actual_injection": False,
+                "actual_injected_evidence_ids": [],
             }
             self.last_l3_query_diagnostic = diagnostic
             self._record_l3_query(diagnostic)
@@ -1258,7 +1347,19 @@ class MemoryManager:
         diagnostic.update({
             "injected_count": 0,
             "retrieval": "geometry_spatial_graph_adapter+vil3dref_student",
+            "grounding_query": instruction,
+            "grounding_query_source": "full_instruction",
+            "selection_mode": "argmax",
+            "actual_injection": False,
+            "actual_injected_evidence_ids": [],
+            "geometry_fallback_reason": None,
+            "prompt_hash_before": None,
+            "prompt_hash_after": None,
         })
+        if self.instruction_landmarks is not None:
+            diagnostic["instruction_landmarks"] = (
+                self.instruction_landmarks.to_dict()
+            )
         if prepared is None:
             self.last_l3_query_diagnostic = diagnostic
             self._record_l3_query(diagnostic)
@@ -1290,12 +1391,18 @@ class MemoryManager:
         if full_context is None:
             diagnostic.update({
                 "candidate_count": 0,
+                "formatable_candidate_count": 0,
                 "skipped_reason": "no_geometry_candidate",
                 "query_ms": (perf_counter() - started) * 1000.0,
             })
             self.last_l3_query_diagnostic = diagnostic
             self._record_l3_query(diagnostic)
             return None
+        formatable_items = {
+            item.metadata.get("object_id"): item
+            for item in full_context.layer_items
+            if isinstance(item.metadata.get("object_id"), str)
+        }
         if self.rgb_sidecar is None:
             diagnostic.update({
                 "candidate_count": 0,
@@ -1337,21 +1444,58 @@ class MemoryManager:
             return None
         diagnostic["instance_grounding"] = result.to_dict()
         diagnostic["grounding_ms"] = result.latency_ms
-        # ``candidate_count`` is the existing "a valid match exists" statistic.
-        # A refused grounding (model error, unmapped selection, invalid
-        # proposal) must not be counted as a query match/injection; the full
-        # model proposal list remains in ``proposal_count``/instance_grounding.
-        diagnostic["candidate_count"] = len(result.proposals) if result.valid else 0
+        diagnostic["candidate_count"] = (
+            len(result.proposals) if result.valid else 0
+        )
         diagnostic["formatable_candidate_count"] = len(full_context.layer_items)
+        diagnostic["formatable_proposal_count"] = len(full_context.layer_items)
         diagnostic["proposal_count"] = (
             len(result.proposals) if result.proposals
             else len(result.offered_proposals)
+        )
+        diagnostic["grounder_proposal_count"] = diagnostic["proposal_count"]
+        diagnostic["grounder_scored_count"] = len(result.proposals)
+        ranked = sorted(
+            result.proposals,
+            key=lambda score: (
+                -float(score.probability), -float(score.logit), score.object_id,
+            ),
+        )
+        diagnostic["original_top1_probability"] = (
+            float(ranked[0].probability) if ranked else None
+        )
+        formatable_ids = [
+            score.object_id for score in ranked
+            if score.object_id in formatable_items
+        ]
+        diagnostic["selected_valid_proposals"] = formatable_ids
+        selected_score = next(
+            (
+                (rank, score) for rank, score in enumerate(ranked, start=1)
+                if score.object_id == result.selected_object_id
+            ),
+            None,
+        )
+        diagnostic["global_grounding_rank"] = (
+            selected_score[0] if selected_score is not None else None
+        )
+        diagnostic["selected_probability"] = (
+            float(selected_score[1].probability)
+            if selected_score is not None else None
+        )
+        diagnostic["selected_is_global_top1"] = bool(
+            selected_score is not None and selected_score[0] == 1
+        )
+        diagnostic["eligible_grounding_rank"] = (
+            formatable_ids.index(result.selected_object_id) + 1
+            if result.selected_object_id in formatable_ids else None
         )
         diagnostic["query_ms"] = (perf_counter() - started) * 1000.0
         if not result.valid or result.selected_object_id is None:
             diagnostic["skipped_reason"] = (
                 result.refusal_reason or "grounding_refused"
             )
+            diagnostic["rejection_reason"] = diagnostic["skipped_reason"]
             if result.error is not None:
                 diagnostic["error"] = result.error
             self.last_l3_query_diagnostic = diagnostic
@@ -1365,6 +1509,7 @@ class MemoryManager:
         if not selected_items:
             diagnostic["candidate_count"] = 0
             diagnostic["skipped_reason"] = "selected_object_not_formatable"
+            diagnostic["rejection_reason"] = "selected_object_not_formatable"
             self.last_l3_query_diagnostic = diagnostic
             self._record_l3_query(diagnostic)
             return None
@@ -1374,18 +1519,21 @@ class MemoryManager:
             diagnostic["candidate_count"] = 0
             diagnostic["skipped_reason"] = "prompt_budget_excluded"
             diagnostic["prompt_budget_excluded"] = True
+            diagnostic["rejection_reason"] = "prompt_budget_excluded"
             self.last_l3_query_diagnostic = diagnostic
             self._record_l3_query(diagnostic)
             return None
         metadata = item.metadata
+        evidence_ids = list(dict.fromkeys(
+            value for value in metadata.get("evidence_ids", [])
+            if isinstance(value, str)
+        ))
         diagnostic.update({
             "injected_count": 1,
             "selected_object_id": selected_id,
+            "selected_object_ids": [selected_id],
             "object_ids": [selected_id],
-            "evidence_ids": list(dict.fromkeys(
-                value for value in metadata.get("evidence_ids", [])
-                if isinstance(value, str)
-            )),
+            "evidence_ids": evidence_ids,
             "matches": [{
                 "object_id": selected_id,
                 "label": item.label,
@@ -1395,15 +1543,688 @@ class MemoryManager:
                 "center_world": metadata.get("center_world"),
                 "distance_m": metadata.get("current_relative_distance_m"),
                 "bearing_deg": metadata.get("current_relative_bearing_deg"),
+                "selection_source": "vil3dref_grounding",
+            }],
+            "selection_sources": ["vil3dref_grounding"],
+            "injection_provenance": [{
+                "object_id": selected_id,
+                "evidence_ids": evidence_ids,
+                "source": "vil3dref_grounding",
+                "grounding_query": instruction,
             }],
             "geometry_context_chars": len(text),
             "skipped_reason": None,
+            "rejection_reason": None,
+            "actual_injection": True,
+            "actual_injected_evidence_ids": evidence_ids,
         })
         diagnostic["injected_text"] = text
         context = MemoryContext(text=text, layer_items=[item])
         self.last_l3_query_diagnostic = diagnostic
         self._record_l3_query(diagnostic)
         return context
+
+    def _grounded_geometry_context(
+        self, *, step: int, instruction: str, l1_status: str, max_chars: int,
+    ) -> MemoryContext | None:
+        """Query -> official Student scores -> eligible sources -> Prompt facts.
+
+        Every call passes *all* complete ObjectNodes to the Student.  The
+        official logits/probabilities are kept unchanged; the manager then
+        selects from the eligible proposal set, not from the global argmax.
+        Geometry fallback is an explicit opt-in: with landmark queries only the
+        same-category item for that landmark is reused; a full-instruction
+        query uses the original bounded adapter output.
+        """
+        controller = self.geometry_on_demand_controller
+        if controller is None or self.spatial_map is None:
+            return None
+        if (
+            self.last_spatial_frame is None
+            or self.spatial_adapter is None
+            or self.v3_store is None
+        ):
+            diagnostic = {
+                "trigger": l1_status, "step": step,
+                "skipped_reason": "no_current_frame", "query_executed": False,
+                "candidate_count": 0, "injected_count": 0,
+                "retrieval": "geometry_spatial_graph_adapter+vil3dref_student",
+                "actual_injection": False, "actual_injected_evidence_ids": [],
+            }
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        prepared = controller.prepare_query(
+            self.spatial_map, step=step, instruction=instruction,
+            l1_status=l1_status,
+            available=lambda object_map: (
+                controller.has_historical_geometry_candidates(object_map, step)
+            ),
+            unavailable_reason="no_historical_geometry_object",
+            retrieval="geometry_spatial_graph_adapter+vil3dref_student",
+            signature_fn=controller.geometry_map_signature,
+        )
+        diagnostic = dict(controller.last_diagnostic or {})
+        diagnostic.update({
+            "injected_count": 0,
+            "retrieval": "geometry_spatial_graph_adapter+vil3dref_student",
+            "selection_mode": "eligible",
+            "actual_injection": False,
+            "actual_injected_evidence_ids": [],
+            "grounding_queries": [],
+            "geometry_fallback_reason": None,
+            "prompt_hash_before": None,
+            "prompt_hash_after": None,
+        })
+        landmarks = self.instruction_landmarks
+        if landmarks is not None:
+            diagnostic["instruction_landmarks"] = landmarks.to_dict()
+        if prepared is None:
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        _query, _ = prepared
+
+        objects_total = len(self.spatial_map.objects)
+
+        def _build(context_chars: int, max_landmarks: int) -> MemoryContext | None:
+            return self.spatial_adapter.build(
+                self.v3_store, self.spatial_map, self.last_spatial_frame,
+                scene_id=self.v3_scene_id,
+                episode_id=self.working.state.episode_id,
+                rollout_idx=self.v3_rollout_idx, step=step,
+                instruction=instruction, scope=self.local_graph_config.scope,
+                max_landmarks=max_landmarks,
+                prompt_max_chars=context_chars,
+                min_confidence=self.spatial_l3_config.min_injection_confidence,
+                alias_aware=True,
+            )
+
+        started = perf_counter()
+        try:
+            full_context = _build(UNBOUNDED_CHAR_LIMIT, max(1, objects_total))
+        except Exception as exc:  # noqa: BLE001
+            diagnostic["skipped_reason"] = "query_error"
+            diagnostic["error"] = f"{type(exc).__name__}: {exc}"
+            diagnostic["query_ms"] = (perf_counter() - started) * 1000.0
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        diagnostic["objects_total"] = objects_total
+        if full_context is None:
+            diagnostic.update({
+                "candidate_count": 0,
+                "formatable_candidate_count": 0,
+                "rejected_object_count": objects_total,
+                "skipped_reason": "no_geometry_candidate",
+                "query_ms": (perf_counter() - started) * 1000.0,
+            })
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        items_by_object: dict[str, LayerMemoryItem] = {}
+        for item in full_context.layer_items:
+            object_id = item.metadata.get("object_id")
+            if isinstance(object_id, str) and object_id not in items_by_object:
+                items_by_object[object_id] = item
+        diagnostic["formatable_candidate_count"] = len(items_by_object)
+        diagnostic["formatable_proposal_count"] = len(items_by_object)
+
+        def _geometry_fallback(reason: str) -> MemoryContext | None:
+            """Use the unchanged adapter output when Grounding cannot map."""
+            diagnostic["geometry_fallback_reason"] = reason
+            try:
+                fallback_context = _build(
+                    max_chars, self.local_graph_config.max_landmarks,
+                )
+            except Exception as exc:  # noqa: BLE001
+                diagnostic["skipped_reason"] = "query_error"
+                diagnostic["error"] = f"{type(exc).__name__}: {exc}"
+                diagnostic["query_ms"] = (perf_counter() - started) * 1000.0
+                self.last_l3_query_diagnostic = diagnostic
+                self._record_l3_query(diagnostic)
+                return None
+            if fallback_context is None:
+                probe = None
+                try:
+                    probe = _build(
+                        UNBOUNDED_CHAR_LIMIT,
+                        self.local_graph_config.max_landmarks,
+                    )
+                except Exception:  # noqa: BLE001 - diagnostic probe only
+                    probe = None
+                if probe is not None:
+                    diagnostic.update({
+                        "candidate_count": len(probe.layer_items),
+                        "prompt_budget_excluded": True,
+                        "skipped_reason": "prompt_budget_excluded",
+                        "actual_injection": False,
+                        "actual_injected_evidence_ids": [],
+                    })
+                else:
+                    diagnostic.update({
+                        "candidate_count": 0,
+                        "skipped_reason": "no_geometry_candidate",
+                        "actual_injection": False,
+                        "actual_injected_evidence_ids": [],
+                    })
+                diagnostic["query_ms"] = (perf_counter() - started) * 1000.0
+                self.last_l3_query_diagnostic = diagnostic
+                self._record_l3_query(diagnostic)
+                return None
+            fallback_items = fallback_context.layer_items
+            fallback_evidence_ids = list(dict.fromkeys(
+                evidence_id for item in fallback_items
+                for evidence_id in item.metadata.get("evidence_ids", [])
+                if isinstance(evidence_id, str)
+            ))
+            diagnostic.update({
+                "candidate_count": len(fallback_items),
+                "injected_count": len(fallback_items),
+                "selected_object_id": None,
+                "object_ids": [
+                    item.metadata.get("object_id") for item in fallback_items
+                ],
+                "evidence_ids": fallback_evidence_ids,
+                "matches": [
+                    _spatial_match_payload(item) for item in fallback_items
+                ],
+                "proposal_object_id": [],
+                "persistent_object_id": [],
+                "grounding_logit": [],
+                "grounding_probability": [],
+                "grounding_rank": [],
+                "selection_sources": ["geometry_fallback"] * len(fallback_items),
+                "injection_provenance": [
+                    {
+                        "object_id": item.metadata.get("object_id"),
+                        "evidence_ids": list(
+                            item.metadata.get("evidence_ids", [])
+                        ),
+                        "source": "geometry_fallback",
+                        "grounding_query": None,
+                    }
+                    for item in fallback_items
+                ],
+                "geometry_context_chars": len(fallback_context.text),
+                "skipped_reason": None,
+                "actual_injection": True,
+                "actual_injected_evidence_ids": fallback_evidence_ids,
+            })
+            diagnostic["query_ms"] = (perf_counter() - started) * 1000.0
+            diagnostic["injected_text"] = fallback_context.text
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return fallback_context
+
+        def _record_refusal(reason: str, *, error: str | None = None) -> None:
+            diagnostic.update({
+                "candidate_count": 0,
+                "skipped_reason": reason,
+                "rejection_reason": reason,
+                "actual_injection": False,
+                "actual_injected_evidence_ids": [],
+                "query_ms": (perf_counter() - started) * 1000.0,
+            })
+            if error is not None:
+                diagnostic["error"] = error
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+
+        if self.rgb_sidecar is None:
+            if self.spatial_l3_config.grounder_geometry_fallback:
+                return _geometry_fallback("rgb_sidecar_unavailable")
+            _record_refusal(
+                "rgb_sidecar_unavailable", error="RGB sidecar is not configured",
+            )
+            return None
+        try:
+            grounder = self._get_instance_grounder()
+        except Exception as exc:  # noqa: BLE001
+            if self.spatial_l3_config.grounder_geometry_fallback:
+                diagnostic["error"] = f"{type(exc).__name__}: {exc}"
+                return _geometry_fallback("grounder_load_error")
+            _record_refusal(
+                "grounder_load_error", error=f"{type(exc).__name__}: {exc}",
+            )
+            return None
+
+        # One official forward per cached landmark phrase.  The complete
+        # instruction still goes to LightNav; only the grounder query changes.
+        if landmarks is not None and landmarks.landmarks:
+            queries = [
+                (landmark.grounding_query, "instruction_landmark", landmark)
+                for landmark in landmarks.grounding_queries
+            ]
+        else:
+            queries = [(instruction, "full_instruction_fallback", None)]
+        if "instruction_landmarks" not in diagnostic:
+            diagnostic["instruction_landmarks"] = {
+                "instruction": instruction,
+                "source": "full_instruction_fallback",
+                "landmarks": [],
+                "target_objects": [],
+                "reference_objects": [],
+            }
+
+        selected_records: list[dict] = []
+        selected_ids: set[str] = set()
+        query_diagnostics: list[dict] = []
+        aggregate_valid: list[str] = []
+        aggregate_reasons: list[str] = []
+        primary_result = None
+        primary_diagnostic: dict = {}
+        grounding_ms = 0.0
+
+        for query_index, (query, query_source, landmark) in enumerate(queries):
+            target_object = (
+                landmark.target_object if landmark is not None else None
+            )
+            query_started = perf_counter()
+            try:
+                result = grounder.select(
+                    instruction=query,
+                    object_map=self.spatial_map,
+                    sidecar=self.rgb_sidecar,
+                    step=step,
+                    episode_id=self.working.state.episode_id,
+                )
+            except Exception as exc:  # noqa: BLE001 - a sidecar must fail closed
+                query_diagnostic = {
+                    "index": query_index,
+                    "grounding_query": query,
+                    "grounding_query_source": query_source,
+                    "role": landmark.role if landmark is not None else None,
+                    "target_phrase": (
+                        landmark.target_phrase if landmark is not None else None
+                    ),
+                    "target_object": target_object,
+                    "reference_phrase": (
+                        landmark.reference_phrase if landmark is not None else None
+                    ),
+                    "reference_objects": (
+                        list(landmark.reference_objects)
+                        if landmark is not None else []
+                    ),
+                    "grounder_proposal_count": 0,
+                    "grounder_scored_count": 0,
+                    "formatable_proposal_count": 0,
+                    "proposals": [],
+                    "selected_valid_proposals": [],
+                    "selected_object_id": None,
+                    "selection_source": None,
+                    "fallback_reason": "grounding_error",
+                    "rejection_reason": "grounding_error",
+                    "original_top1_probability": None,
+                    "selected_probability": None,
+                    "selected_is_global_top1": False,
+                    "global_grounding_rank": None,
+                    "eligible_grounding_rank": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "query_ms": (perf_counter() - query_started) * 1000.0,
+                }
+                query_diagnostics.append(query_diagnostic)
+                aggregate_reasons.append("grounding_error")
+                continue
+            if primary_result is None:
+                primary_result = result
+            grounding_ms += float(getattr(result, "latency_ms", 0.0) or 0.0)
+            eligibility = build_proposal_eligibility(
+                result,
+                object_map=self.spatial_map,
+                sidecar=self.rgb_sidecar,
+                items_by_object=items_by_object,
+                target_object=target_object,
+                selected_object_ids=selected_ids,
+            )
+            ranked_scores = sorted(
+                result.proposals,
+                key=lambda score: (
+                    -float(score.probability), -float(score.logit),
+                    score.object_id,
+                ),
+            )
+            original_top1_probability = (
+                float(ranked_scores[0].probability)
+                if ranked_scores else None
+            )
+            valid_ids = eligible_object_ids(eligibility)
+            for object_id in valid_ids:
+                if object_id not in aggregate_valid:
+                    aggregate_valid.append(object_id)
+            chosen = choose_first_eligible(
+                eligibility, selected_object_ids=selected_ids,
+            )
+            fallback_reason = None
+            chosen_item = None
+            selection_source = None
+            if chosen is not None:
+                chosen_item = items_by_object.get(chosen.persistent_object_id)
+                selection_source = "vil3dref_grounding"
+            else:
+                fallback_reason = _grounding_failure_reason(eligibility, result)
+                aggregate_reasons.append(fallback_reason)
+                # Reuse the original SpatialGraphAdapter item for this
+                # landmark only when geometry fallback is explicitly enabled.
+                # A full-instruction query has no landmark identity, so it
+                # falls through to the original bounded geometry fallback.
+                fallback_item = (
+                    geometry_fallback_item(
+                        full_context.layer_items,
+                        target_object=target_object,
+                        selected_object_ids=selected_ids,
+                    )
+                    if (
+                        self.spatial_l3_config.grounder_geometry_fallback
+                        and target_object is not None
+                    ) else None
+                )
+                if fallback_item is not None:
+                    chosen_item = fallback_item
+                    selection_source = "geometry_fallback"
+            if chosen_item is not None:
+                object_id = chosen_item.metadata.get("object_id")
+                if isinstance(object_id, str) and object_id not in selected_ids:
+                    selected_ids.add(object_id)
+                    selected_records.append({
+                        "item": chosen_item,
+                        "selection_source": selection_source,
+                        "proposal": chosen,
+                        "query": query,
+                        "query_source": query_source,
+                        "landmark": landmark,
+                    })
+            query_diagnostic = {
+                "index": query_index,
+                "grounding_query": query,
+                "grounding_query_source": query_source,
+                "role": landmark.role if landmark is not None else None,
+                "target_phrase": (
+                    landmark.target_phrase if landmark is not None else None
+                ),
+                "target_object": target_object,
+                "reference_phrase": (
+                    landmark.reference_phrase if landmark is not None else None
+                ),
+                "reference_objects": (
+                    list(landmark.reference_objects)
+                    if landmark is not None else []
+                ),
+                "grounder_proposal_count": (
+                    len(result.proposals) if result.proposals
+                    else len(result.offered_proposals)
+                ),
+                "grounder_scored_count": len(result.proposals),
+                "formatable_proposal_count": sum(
+                    1 for proposal in eligibility if proposal.formatable
+                ),
+                "proposals": [
+                    proposal.to_dict() for proposal in eligibility
+                ],
+                "selected_valid_proposals": valid_ids,
+                "grounder_selected_object_id": result.selected_object_id,
+                "selected_object_id": (
+                    chosen_item.metadata.get("object_id")
+                    if chosen_item is not None else None
+                ),
+                "selection_source": selection_source,
+                "fallback_reason": fallback_reason,
+                "rejection_reason": (
+                    fallback_reason if chosen is None and fallback_reason else None
+                ),
+                "original_top1_probability": original_top1_probability,
+                "selected_probability": (
+                    chosen.grounding_probability
+                    if chosen is not None else None
+                ),
+                "selected_is_global_top1": (
+                    chosen.global_grounding_rank == 1
+                    if chosen is not None else False
+                ),
+                "global_grounding_rank": (
+                    chosen.global_grounding_rank
+                    if chosen is not None else None
+                ),
+                "eligible_grounding_rank": (
+                    chosen.eligible_grounding_rank
+                    if chosen is not None else None
+                ),
+                "error": result.error,
+                "query_ms": (perf_counter() - query_started) * 1000.0,
+            }
+            query_diagnostics.append(query_diagnostic)
+            if not primary_diagnostic:
+                primary_diagnostic = query_diagnostic
+
+        with_proposals = [
+            item for item in query_diagnostics
+            if item.get("grounder_proposal_count")
+        ]
+        if with_proposals:
+            # Report the first real target query as primary, so a windows
+            # reference cannot become the headline grounding query.  Fall back
+            # to the first query that produced proposals.
+            primary_diagnostic = next(
+                (
+                    item for item in with_proposals
+                    if item.get("role") == "target"
+                ),
+                with_proposals[0],
+            )
+        diagnostic["grounding_queries"] = query_diagnostics
+        diagnostic["grounding_query"] = primary_diagnostic.get("grounding_query")
+        diagnostic["grounding_query_source"] = primary_diagnostic.get(
+            "grounding_query_source",
+        )
+        diagnostic["grounder_proposal_count"] = primary_diagnostic.get(
+            "grounder_proposal_count", 0,
+        )
+        diagnostic["grounder_scored_count"] = primary_diagnostic.get(
+            "grounder_scored_count", 0,
+        )
+        diagnostic["grounder_selected_object_id"] = primary_diagnostic.get(
+            "grounder_selected_object_id",
+        )
+        diagnostic["selected_valid_proposals"] = list(aggregate_valid)
+        diagnostic["selection_mode"] = "eligible"
+        diagnostic["original_top1_probability"] = primary_diagnostic.get(
+            "original_top1_probability",
+        )
+        diagnostic["selected_probability"] = primary_diagnostic.get(
+            "selected_probability",
+        )
+        diagnostic["selected_is_global_top1"] = primary_diagnostic.get(
+            "selected_is_global_top1",
+        )
+        diagnostic["global_grounding_rank"] = primary_diagnostic.get(
+            "global_grounding_rank",
+        )
+        diagnostic["eligible_grounding_rank"] = primary_diagnostic.get(
+            "eligible_grounding_rank",
+        )
+        diagnostic["rejection_reason"] = primary_diagnostic.get(
+            "rejection_reason",
+        )
+        diagnostic["grounding_ms"] = grounding_ms
+        if primary_result is not None:
+            diagnostic["instance_grounding"] = primary_result.to_dict()
+            diagnostic["proposal_count"] = diagnostic["grounder_proposal_count"]
+        diagnostic["query_ms"] = (perf_counter() - started) * 1000.0
+
+        if selected_records:
+            # Budget priority: final targets first, reference/source anchors
+            # afterwards.  Within a role the original instruction order is
+            # retained.  Diagnostics still list queries in instruction order.
+            render_records = sorted(
+                selected_records,
+                key=lambda record: (
+                    0 if (
+                        record["landmark"] is None
+                        or record["landmark"].role == "target"
+                    ) else 1,
+                    (
+                        record["landmark"].index
+                        if record["landmark"] is not None else 0
+                    ),
+                ),
+            )
+            selected_items = [
+                record["item"] for record in render_records
+            ]
+            text, included = render_context(
+                selected_items, header=_NAVIGATION_MEMORY_HEADER,
+                max_chars=max_chars,
+            )
+            if text is not None:
+                included_identity = {id(item) for item in included}
+                included_records = [
+                    record for record in render_records
+                    if id(record["item"]) in included_identity
+                ]
+                selected_object_ids = [
+                    item.metadata.get("object_id") for item in included
+                ]
+                selected_evidence_ids = list(dict.fromkeys(
+                    evidence_id for item in included
+                    for evidence_id in item.metadata.get("evidence_ids", [])
+                    if isinstance(evidence_id, str)
+                ))
+                diagnostic.update({
+                    "candidate_count": max(
+                        diagnostic["grounder_proposal_count"], len(included),
+                    ),
+                    "injected_count": len(included),
+                    "selected_object_id": selected_object_ids[0],
+                    "object_ids": selected_object_ids,
+                    "evidence_ids": selected_evidence_ids,
+                    "matches": [
+                        _spatial_match_payload(
+                            item,
+                            selection_source=record["selection_source"],
+                        )
+                        for item, record in zip(included, included_records)
+                    ],
+                    "proposal_object_id": [
+                        item.metadata.get("object_id") for item in included
+                    ],
+                    "persistent_object_id": [
+                        item.metadata.get("object_id") for item in included
+                    ],
+                    "grounding_logit": [
+                        record["proposal"].grounding_logit
+                        if record["proposal"] is not None else None
+                        for record in included_records
+                    ],
+                    "grounding_probability": [
+                        record["proposal"].grounding_probability
+                        if record["proposal"] is not None else None
+                        for record in included_records
+                    ],
+                    "grounding_rank": [
+                        record["proposal"].grounding_rank
+                        if record["proposal"] is not None else None
+                        for record in included_records
+                    ],
+                    "selected_global_grounding_ranks": [
+                        record["proposal"].global_grounding_rank
+                        if record["proposal"] is not None else None
+                        for record in included_records
+                    ],
+                    "selected_eligible_grounding_ranks": [
+                        record["proposal"].eligible_grounding_rank
+                        if record["proposal"] is not None else None
+                        for record in included_records
+                    ],
+                    "selected_probabilities": [
+                        record["proposal"].grounding_probability
+                        if record["proposal"] is not None else None
+                        for record in included_records
+                    ],
+                    "selected_is_global_top1_flags": [
+                        (
+                            record["proposal"].global_grounding_rank == 1
+                            if record["proposal"] is not None else None
+                        )
+                        for record in included_records
+                    ],
+                    "selection_sources": [
+                        record["selection_source"] for record in included_records
+                    ],
+                    "injection_provenance": [
+                        {
+                            "object_id": item.metadata.get("object_id"),
+                            "evidence_ids": list(
+                                item.metadata.get("evidence_ids", [])
+                            ),
+                            "source": record["selection_source"],
+                            "grounding_query": record["query"],
+                        }
+                        for item, record in zip(included, included_records)
+                    ],
+                    "geometry_context_chars": len(text),
+                    "skipped_reason": None,
+                    "actual_injection": True,
+                    "actual_injected_evidence_ids": selected_evidence_ids,
+                    "proposal_object_count": len(items_by_object),
+                })
+                fallback_sources = [
+                    record["selection_source"] for record in included_records
+                ]
+                if any(
+                    source == "geometry_fallback"
+                    for source in fallback_sources
+                ):
+                    diagnostic["geometry_fallback_reason"] = (
+                        "landmark_geometry_fallback: " + "; ".join(
+                            dict.fromkeys(aggregate_reasons)
+                        )
+                    )
+                else:
+                    diagnostic["geometry_fallback_reason"] = None
+                diagnostic["injected_text"] = text
+                context = MemoryContext(text=text, layer_items=list(included))
+                self.last_l3_query_diagnostic = diagnostic
+                self._record_l3_query(diagnostic)
+                return context
+            diagnostic.update({
+                "candidate_count": 0,
+                "skipped_reason": "prompt_budget_excluded",
+                "prompt_budget_excluded": True,
+                "actual_injection": False,
+                "actual_injected_evidence_ids": [],
+            })
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+
+        # No landmark produced an eligible Grounding fact.  With multi-landmark
+        # queries, only per-landmark same-category fallback is allowed, so a
+        # sink query can never reintroduce a bed/doorway item.  The global
+        # bounded geometry fallback is used only for a full-instruction query.
+        fallback_reason = "; ".join(dict.fromkeys(aggregate_reasons)) or (
+            "no_eligible_proposal"
+        )
+        has_landmark_queries = bool(
+            landmarks is not None
+            and landmarks.landmarks
+            and self.spatial_l3_config.grounder_landmark_queries
+        )
+        if (
+            self.spatial_l3_config.grounder_geometry_fallback
+            and not has_landmark_queries
+        ):
+            return _geometry_fallback(fallback_reason)
+        diagnostic.update({
+            "candidate_count": 0,
+            "skipped_reason": fallback_reason,
+            "rejection_reason": fallback_reason,
+            "actual_injection": False,
+            "actual_injected_evidence_ids": [],
+            "query_ms": (perf_counter() - started) * 1000.0,
+        })
+        self.last_l3_query_diagnostic = diagnostic
+        self._record_l3_query(diagnostic)
+        return None
 
     def get_geometry_on_demand_context(
         self, *, step: int, instruction: str, l1_status: str, max_chars: int,
@@ -1417,6 +2238,11 @@ class MemoryManager:
         cosine score exists on this path.
         """
         if self.spatial_l3_config.instance_grounder_enabled:
+            if self.spatial_l3_config.grounder_selection_mode == "argmax":
+                return self._grounded_argmax_geometry_context(
+                    step=step, instruction=instruction, l1_status=l1_status,
+                    max_chars=max_chars,
+                )
             return self._grounded_geometry_context(
                 step=step, instruction=instruction, l1_status=l1_status,
                 max_chars=max_chars,
@@ -1695,6 +2521,7 @@ class MemoryManager:
                 self.geometry_on_demand_controller.close_episode()
             if self.rgb_sidecar is not None:
                 self.rgb_sidecar.close_episode()
+            self.instruction_landmarks = None
             if self.adaptive_l3_runner is not None:
                 self.adaptive_l3_runner.close_episode()
             self.last_adaptive_l3_diagnostic = {}

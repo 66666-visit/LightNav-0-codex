@@ -133,3 +133,88 @@ def test_grounder_requires_sidecar_and_geometry_mode() -> None:
         SpatialL3Config(
             **{**base, "mode": "shadow", "rgb_sidecar_enabled": True},
         )
+
+
+def _grounder_ablation_base() -> list[str]:
+    return [
+        "--model_path", "/fake/model",
+        "--memory_enabled",
+        "--memory_strategy", "hierarchical",
+        "--memory_extractor", "yolo11",
+        "--memory_extractor_model_path", "/fake/yolo11n.pt",
+        "--local_graph_enabled",
+        "--spatial_l3_mode", "geometry_on_demand",
+        "--spatial_l3_seg_model_path", "/fake/seg.pt",
+        "--memory_prompt_mode", "l1_original_only",
+        "--spatial_l3_rgb_sidecar",
+        "--spatial_l3_instance_grounder",
+        "--spatial_l3_grounder_checkpoint", "/fake/student.pt",
+        "--output_dir", "/tmp/geometry_on_demand_cli_test",
+    ]
+
+
+def test_grounder_ablation_defaults_are_the_original_argmax_path() -> None:
+    parser = build_parser()
+    spatial = config_from_args(
+        parser.parse_args(_grounder_ablation_base())
+    ).memory.spatial_l3
+    assert spatial.grounder_selection_mode == "argmax"
+    assert spatial.grounder_landmark_queries is False
+    assert spatial.grounder_geometry_fallback is False
+
+
+def test_grounder_ablation_flags_are_independently_enableable() -> None:
+    parser = build_parser()
+    eligible = config_from_args(parser.parse_args([
+        *_grounder_ablation_base(),
+        "--spatial_l3_grounder_selection", "eligible",
+    ])).memory.spatial_l3
+    assert eligible.grounder_selection_mode == "eligible"
+    assert eligible.grounder_landmark_queries is False
+    assert eligible.grounder_geometry_fallback is False
+
+    landmarks = config_from_args(parser.parse_args([
+        *_grounder_ablation_base(),
+        "--spatial_l3_grounder_selection", "eligible",
+        "--spatial_l3_grounder_landmark_queries",
+    ])).memory.spatial_l3
+    assert landmarks.grounder_landmark_queries is True
+    assert landmarks.grounder_geometry_fallback is False
+
+    fallback = config_from_args(parser.parse_args([
+        *_grounder_ablation_base(),
+        "--spatial_l3_grounder_selection", "eligible",
+        "--spatial_l3_grounder_landmark_queries",
+        "--spatial_l3_grounder_geometry_fallback",
+    ])).memory.spatial_l3
+    assert fallback.grounder_geometry_fallback is True
+
+
+def test_landmark_or_fallback_require_eligible_selection() -> None:
+    base = {
+        "mode": "geometry_on_demand", "seg_model_path": "/fake/seg.pt",
+        "rgb_sidecar_enabled": True, "instance_grounder_enabled": True,
+        "grounder_checkpoint": "/fake/student.pt",
+    }
+    with pytest.raises(ValueError, match="grounder_selection_mode=eligible"):
+        SpatialL3Config(**{**base, "grounder_landmark_queries": True})
+    with pytest.raises(ValueError, match="grounder_selection_mode=eligible"):
+        SpatialL3Config(**{**base, "grounder_geometry_fallback": True})
+
+
+def test_protocol_records_joint_grounding_and_geometry_fallback() -> None:
+    config = _config(spatial_l3=SpatialL3Config(
+        mode="geometry_on_demand", seg_model_path="/fake/seg.pt",
+        rgb_sidecar_enabled=True, instance_grounder_enabled=True,
+        grounder_checkpoint="/fake/student.pt", grounder_device="cpu",
+        grounder_selection_mode="eligible",
+        grounder_landmark_queries=True,
+        grounder_geometry_fallback=True,
+    ))
+    block = build_prompt_protocol(config)["budget"]["on_demand_l3"]
+    assert block["retrieval"] == "spatial_graph_adapter+vil3dref_student"
+    assert block["grounder_selection_mode"] == "eligible"
+    assert block["proposal_object_evidence_mapping"] is True
+    assert block["eligible_proposal_selection"] is True
+    assert block["landmark_queries"] is True
+    assert block["geometry_fallback"] == "original SpatialGraphAdapter items"

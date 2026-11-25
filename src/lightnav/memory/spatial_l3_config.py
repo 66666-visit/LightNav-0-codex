@@ -45,6 +45,13 @@ class SpatialL3Config:
     grounder_device: str = "cuda"
     grounder_bert_vocab_path: str = ""
     grounder_seed: int = 0
+    # Ablation switches.  Defaults reproduce the original d659e57 ViL3DRel
+    # instance-disambiguation path exactly: one full-instruction query and the
+    # official global argmax.  The new joint selector, multi-landmark queries
+    # and geometry fallback are independent opt-ins.
+    grounder_selection_mode: str = "argmax"
+    grounder_landmark_queries: bool = False
+    grounder_geometry_fallback: bool = False
     geometry: GeometryConfig = field(default_factory=GeometryConfig)
 
     def __post_init__(self) -> None:
@@ -97,9 +104,30 @@ class SpatialL3Config:
             raise ValueError("spatial_l3.clip_model_path is required for on_demand mode")
         for name in (
             "rgb_sidecar_enabled", "instance_grounder_enabled",
+            "grounder_landmark_queries", "grounder_geometry_fallback",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"spatial_l3.{name} must be a boolean")
+        if self.grounder_selection_mode not in {"argmax", "eligible"}:
+            raise ValueError(
+                "spatial_l3.grounder_selection_mode must be argmax or eligible"
+            )
+        if (
+            self.grounder_landmark_queries
+            and self.grounder_selection_mode != "eligible"
+        ):
+            raise ValueError(
+                "spatial_l3.grounder_landmark_queries requires "
+                "grounder_selection_mode=eligible"
+            )
+        if (
+            self.grounder_geometry_fallback
+            and self.grounder_selection_mode != "eligible"
+        ):
+            raise ValueError(
+                "spatial_l3.grounder_geometry_fallback requires "
+                "grounder_selection_mode=eligible"
+            )
         for name in (
             "grounder_checkpoint", "grounder_config", "grounder_device",
             "grounder_bert_vocab_path",

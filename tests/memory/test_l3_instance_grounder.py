@@ -151,6 +151,12 @@ def test_build_batch_keeps_object_order_and_returns_one_1024_point_tensor() -> N
     assert batch["txt_masks"].all()
     assert [item["object_id"] for item in metadata] == ["object-A", "object-B"]
     assert [item["point_count"] for item in metadata] == [1400, 800]
+    assert [item["proposal_id"] for item in metadata] == [
+        "proposal-0", "proposal-1",
+    ]
+    assert [item["evidence_ids"] for item in metadata] == [
+        ["evidence-1"], ["evidence-1"],
+    ]
 
 
 def test_build_batch_rejects_empty_instruction_and_empty_proposals() -> None:
@@ -214,6 +220,16 @@ def test_ground_uses_official_argmax_and_reports_all_scores() -> None:
     assert result.top1_top2_gap is not None and result.top1_top2_gap > 0
     assert result.error is None
     assert len(result.offered_proposals) == 2
+    assert [item.proposal_id for item in result.proposals] == [
+        "proposal-0", "proposal-1",
+    ]
+    assert [item.evidence_ids for item in result.proposals] == [
+        ("evidence-1",), ("evidence-1",),
+    ]
+    payload = result.proposals[1].to_dict()
+    assert payload["persistent_object_id"] == "object-B"
+    assert payload["proposal_object_id"] == "object-B"
+    assert payload["grounding_probability"] == payload["probability"]
 
 
 def test_ground_error_keeps_offered_proposals_for_diagnostics() -> None:

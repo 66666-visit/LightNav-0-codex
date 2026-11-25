@@ -1251,12 +1251,28 @@ def test_single_episode_trace_records_model_input_and_evaluator_state(tmp_path):
                 "position": [float(self._step), 0.0, 0.0],
                 "rotation": [1.0, 0.0, 0.0, 0.0],
             }
+            info["collisions"] = [{"object": "wall"}]
             return info
 
     class TracedPolicy(FakePolicy):
         last_prompt_text = "full prompt with original instruction and local context"
         last_memory_text = "local context"
-        last_memory_diagnostic = {"actual_injection": True}
+        last_memory_diagnostic = {
+            "actual_injection": True,
+            "injected_evidence_ids": ["ev-1"],
+            "prompt_hash_before": "before",
+            "prompt_hash_after": "after",
+            "spatial_l3": {
+                "fallback_reason": "landing",
+                "l3_query": {
+                    "grounding_query": "far couch",
+                    "selected_object_ids": ["object-couch"],
+                    "actual_injection": True,
+                    "actual_injected_evidence_ids": ["ev-1"],
+                    "geometry_fallback_reason": None,
+                },
+            },
+        }
 
         def get_info(self):
             return {
@@ -1292,7 +1308,24 @@ def test_single_episode_trace_records_model_input_and_evaluator_state(tmp_path):
     assert rows[0]["pose_post"]["agent_pose"]["position"] == [1.0, 0.0, 0.0]
     assert rows[0]["distance_to_goal_pre"] == 5.0
     assert rows[0]["distance_to_goal_post"] == 4.0
-    assert rows[0]["memory_diagnostic"] == {"actual_injection": True}
+    assert rows[0]["memory_diagnostic"] == policy.last_memory_diagnostic
+    assert rows[0]["rollout_idx"] == 0
+    assert rows[0]["position"] == [0.0, 0.0, 0.0]
+    assert rows[0]["rotation"] == [1.0, 0.0, 0.0, 0.0]
+    assert rows[0]["action"] == {
+        "action": "velocity_control",
+        "action_args": {"linear_velocity": 0.1, "angular_velocity": 0.0},
+    }
+    assert rows[0]["decoded_action_label"] == "VEL(lin=+0.10,ang=+0.00)"
+    assert rows[0]["collision"] == [{"object": "wall"}]
+    assert rows[0]["memory_text"] == "local context"
+    assert rows[0]["actual_injection"] is True
+    assert rows[0]["actual_injected_evidence_ids"] == ["ev-1"]
+    assert rows[0]["prompt_hash_before"] == "before"
+    assert rows[0]["prompt_hash_after"] == "after"
+    assert rows[0]["grounding_query"] == "far couch"
+    assert rows[0]["selected_object_ids"] == ["object-couch"]
+    assert rows[0]["geometry_fallback_reason"] is None
     assert rows[0]["action_divergence_vs_baseline"] is None
     before = (output / "step_trace.jsonl").read_bytes()
     with pytest.raises(FileExistsError, match="step trace requires fresh"):

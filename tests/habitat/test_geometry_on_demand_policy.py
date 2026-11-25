@@ -38,6 +38,17 @@ class _Engine:
     def reset_episode_state(self) -> None:
         pass
 
+    def generate_from_frames(
+        self, video, instruction: str, *, predict_horizon: int = 1,
+        frame_ids=None, task_type: str = "vlnce_traj",
+    ) -> tuple[str, float]:
+        from lightnav.inference.samples import build_vln_traj_sample
+
+        return self.generate(build_vln_traj_sample(
+            video, instruction, list(frame_ids) if frame_ids else None,
+            self.bundle,
+        ))
+
     def generate(self, sample: dict) -> tuple[str, float]:
         self.samples.append(sample)
         prompt = sample["conversations"][0]["value"]
@@ -113,6 +124,7 @@ def _policy(
     l1_label: str = "chair", seg_label: str = "sofa",
     prompt_mode: str = "l1_original_only",
     rgb_sidecar: bool = False, instance_grounder=None,
+    memory_enabled: bool = True,
 ):
     detections = {
         step: SceneExtraction(
@@ -122,32 +134,40 @@ def _policy(
         )
         for step in (0, 1, 2)
     }
-    manager = MemoryManager(
-        extractor=MockSceneExtractor(detections), strategy="hierarchical",
-        local_graph_config=LocalGraphConfig(
-            enabled=True, reactivation_steps=1,
-        ),
-        spatial_l3_config=SpatialL3Config(
-            mode=mode, seg_model_path="/fake/yolo11n-seg.pt",
-            seg_every_n_steps=2, min_injection_confidence=0.5,
-            rgb_sidecar_enabled=rgb_sidecar,
-            instance_grounder_enabled=instance_grounder is not None,
-            grounder_checkpoint="/fake/official_nr3d_student.pt",
-            grounder_device="cpu",
-        ),
-        spatial_extractor=_SegExtractor(seg_label, every_n_steps=2),
-        clip_encoder=None,
-        prompt_mode=prompt_mode,
-        instance_grounder=instance_grounder,
-    )
+    manager = None
+    if memory_enabled:
+        manager = MemoryManager(
+            extractor=MockSceneExtractor(detections), strategy="hierarchical",
+            local_graph_config=LocalGraphConfig(
+                enabled=True, reactivation_steps=1,
+            ),
+            spatial_l3_config=SpatialL3Config(
+                mode=mode, seg_model_path="/fake/yolo11n-seg.pt",
+                seg_every_n_steps=2, min_injection_confidence=0.5,
+                rgb_sidecar_enabled=rgb_sidecar,
+                instance_grounder_enabled=instance_grounder is not None,
+                grounder_checkpoint="/fake/official_nr3d_student.pt",
+                grounder_device="cpu",
+                grounder_selection_mode=(
+                    "eligible" if instance_grounder is not None else "argmax"
+                ),
+                grounder_landmark_queries=instance_grounder is not None,
+                grounder_geometry_fallback=instance_grounder is not None,
+            ),
+            spatial_extractor=_SegExtractor(seg_label, every_n_steps=2),
+            clip_encoder=None,
+            prompt_mode=prompt_mode,
+            instance_grounder=instance_grounder,
+        )
     centroids = np.zeros((3, 10, 3), dtype=np.float32)
     centroids[1, :, 0] = 0.25
     engine = _Engine()
     policy = TrajVocabVLNCEPolicy(
         engine, centroids, dt=1.0, lin_vel_range=(0.0, 0.3),
         ang_vel_range=(-30.0, 30.0), num_history_frames=2,
-        memory_enabled=True, memory_manager=manager,
-        memory_prompt_mode=prompt_mode,
+        memory_enabled=memory_enabled,
+        memory_manager=manager if memory_enabled else None,
+        memory_prompt_mode=prompt_mode if memory_enabled else "legacy",
     )
     policy.reset(
         {"instruction": {"text": instruction}},
@@ -368,9 +388,104 @@ def test_grounded_geometry_injects_one_fact_and_keeps_l1_prefix() -> None:
     assert l3["injected_count"] == 1
     assert l3["instance_grounding"]["selected_object_id"] == l3["object_ids"][0]
     assert len(l3["instance_grounding"]["proposals"]) == 1
+    # The new joint Grounding/Geometry diagnostics are present and consistent.
+    assert l3["grounding_query"] == "sofa"
+    assert l3["grounding_query_source"] == "instruction_landmark"
+    assert l3["instruction_landmarks"]["landmarks"][0]["target_object"] == "sofa"
+    assert l3["grounder_proposal_count"] == 1
+    assert l3["grounder_scored_count"] == 1
+    assert l3["formatable_proposal_count"] == 1
+    assert l3["selected_valid_proposals"] == l3["object_ids"]
+    assert l3["geometry_fallback_reason"] is None
+    assert l3["actual_injection"] is True
+    assert l3["actual_injected_evidence_ids"] == l3["evidence_ids"]
+    assert l3["prompt_hash_before"] != l3["prompt_hash_after"]
+    assert diagnostic["spatial_l3"]["actual_injection"] is True
     # The L1 prefix outside the memory block is byte-identical to baseline.
     base_prompt = _prompt(baseline_engine)
     assert prompt.startswith(base_prompt.split("</navigation_task>.", 1)[0])
     start = prompt.index("[Navigation Memory]")
     end = prompt.index("\nYou may be", start) + 1
     assert prompt[:start] + prompt[end:] == base_prompt
+
+
+# -- Prompt invariance ---------------------------------------------------------
+
+_FROZEN_INSTRUCTION = (
+    "Go forward toward the windows. Go toward the the far couch, "
+    "Stop next to the couch, in front of the windows."
+)
+
+
+def test_lightnav_original_prompt_hash_is_frozen_before_the_change() -> None:
+    """The checkpoint prompt is a frozen contract; this hash predates this work."""
+    from hashlib import sha256
+
+    from lightnav.inference.samples import build_vln_traj_sample
+
+    bundle = SimpleNamespace(
+        pool_enable=True, pool_spatial=2, pool_mode="avg", video_fps=4,
+        num_history_frames=4, predict_horizon=1, slowfast_tiers=None,
+    )
+    sample = build_vln_traj_sample(
+        torch.zeros(5, 3, 4, 4), _FROZEN_INSTRUCTION,
+        [0, 1, 2, 3, 4], bundle,
+    )
+    prompt = sample["conversations"][0]["value"]
+    assert sha256(prompt.encode("utf-8")).hexdigest() == (
+        "ec014d7d9799597312e036345b19561e297f8c2d44d337e237597478e14dacfb"
+    )
+    assert sample["conversations"][1] == {"from": "gpt", "value": "placeholder"}
+    assert len(sample["video_segments"]) == 2
+    assert prompt.count("<video>") == 2
+
+
+def test_memory_disabled_policy_prompt_is_the_unmodified_lightnav_template() -> None:
+    from hashlib import sha256
+
+    from lightnav.prompts import VLN_TRAJ_PROMPT_TEMPLATE
+
+    policy, manager, engine = _policy(
+        "off", instruction=_FROZEN_INSTRUCTION, memory_enabled=False,
+    )
+    assert manager is None
+    _act(policy, 0)
+    _act(policy, 1)
+    prompt = _prompt(engine)
+    assert prompt == VLN_TRAJ_PROMPT_TEMPLATE.format(task=_FROZEN_INSTRUCTION)
+    assert prompt == engine.samples[0]["conversations"][0]["value"]
+    assert "[Navigation Memory]" not in prompt
+    assert sha256(prompt.encode("utf-8")).hexdigest() == (
+        "d4538cd84b1bdcaf5fca1019c4035ceca88cd2a31ac49c6d4469c80391681b90"
+    )
+
+
+def test_instance_grounder_with_no_candidate_changes_no_prompt_byte() -> None:
+    from hashlib import sha256
+
+    baseline, _, baseline_engine = _policy(
+        "off", instruction="find the sofa", l1_label="chair",
+    )
+    _act(baseline, 0)
+    _act(baseline, 1)
+    baseline_prompt = _prompt(baseline_engine)
+
+    policy, manager, engine = _policy(
+        "geometry_on_demand", instruction="find the sofa", l1_label="chair",
+        seg_label="lamp", rgb_sidecar=True, instance_grounder=_FakeGrounder(),
+    )
+    _act(policy, 0)
+    _act(policy, 1)
+    prompt = _prompt(engine)
+    diagnostic = policy.last_memory_diagnostic["prompt_context"]
+    l3 = diagnostic["spatial_l3"]["l3_query"]
+
+    assert prompt == baseline_prompt
+    assert "[Navigation Memory]" not in prompt
+    assert l3["skipped_reason"] == "no_geometry_candidate"
+    assert l3["actual_injection"] is False
+    assert l3["actual_injected_evidence_ids"] == []
+    assert l3["prompt_hash_before"] == l3["prompt_hash_after"]
+    assert l3["prompt_hash_before"] == sha256(prompt.encode("utf-8")).hexdigest()
+    assert diagnostic["spatial_l3"]["actual_injection"] is False
+    assert manager.l3_query_stats_summary()["queries_injected"] == 0

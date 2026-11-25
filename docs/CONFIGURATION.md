@@ -117,7 +117,14 @@ when the token audit can establish it, raw pointing and RVQ token strings,
 decoded waypoints and velocity action, raw RGB pixel checksum, plus evaluator-only pre/post distance
 and pose when the Habitat server supplies one. The bundled R2R server includes
 `agent_pose` (position and quaternion) when simulator state is available;
-otherwise the trace records `null`.
+otherwise the trace records `null`. Each row also carries top-level
+`rollout_idx`, `position`, `rotation`, `action`, `decoded_action_label`,
+`collision` (server field when supplied), `memory_text`, `actual_injection`,
+`actual_injected_evidence_ids`, `prompt_hash_before`, `prompt_hash_after`,
+`grounding_query`, `selected_object_ids` and `geometry_fallback_reason`.
+These fields are written after `policy.act`; none is forwarded to the policy,
+Grounder or memory selection. Goal distance/reference path remain
+evaluator-only offline fields.
 `action_divergence_vs_baseline`, `invalid_exploration`, and `wrong_turn` remain `null` until matched
 traces are compared with each other and the reference route. The legacy
 memory paths never feed evaluator distance or pose into the policy; the
@@ -302,7 +309,10 @@ it keeps the L1 Original path primary and runs a local CLIP text query only afte
 L1 returns an empty candidate set. `geometry_on_demand` uses the same L1-empty
 trigger and dedupe but the existing geometry-only candidate retrieval
 (`SpatialGraphAdapter`); it never loads CLIP weights or runs OpenCLIP. See
-[GEOMETRY_ON_DEMAND.md](research/GEOMETRY_ON_DEMAND.md).
+[GEOMETRY_ON_DEMAND.md](research/GEOMETRY_ON_DEMAND.md). The opt-in ViL3DRel
+instance grounder extends it with the joint proposal/Evidence selection and
+geometry fallback documented in
+[INSTANCE_DISAMBIGUATION.md](research/INSTANCE_DISAMBIGUATION.md).
 It requires `--memory_enabled --memory_strategy hierarchical --memory_layers
 short,mid,long --local_graph_enabled`. The default `off` preserves the existing
 Local Graph behavior. It runs only in the Habitat evaluation client when that
@@ -333,6 +343,9 @@ the WebSocket inference server has no RGB-D map interface.
 | `--spatial_l3_grounder_device` | `cuda` | Torch device for the official Student; no silent CPU fallback |
 | `--spatial_l3_grounder_bert_vocab FILE` | empty | Local `bert-base-uncased` `vocab.txt`; empty uses the local Hugging Face cache with `local_files_only=True` |
 | `--spatial_l3_grounder_seed` | `0` | Deterministic seed for the official 1024-point sampling |
+| `--spatial_l3_grounder_selection` | `argmax` | `argmax` is the original d659e57 one-full-instruction/global-argmax path. `eligible` enables joint proposal → ObjectNode → Evidence → formatable-fact filtering (ablation D/E/F) |
+| `--spatial_l3_grounder_landmark_queries` | off | Parse the original instruction once per Episode and send each verbatim target/reference phrase to ViL3DRel. Requires `--spatial_l3_grounder_selection eligible` (ablation E/F). The complete original instruction is still passed to LightNav unchanged |
+| `--spatial_l3_grounder_geometry_fallback` | off | When eligible Grounding cannot map a landmark, reuse the unchanged `SpatialGraphAdapter` item for that same landmark. Requires `eligible` (ablation F). A full-instruction query uses the original bounded geometry fallback |
 | `--adaptive_l3_query` | off | Opt-in Adaptive L3 Query arm: a local controller decides whether to query L3 on any step, not only when L1 is empty |
 | `--adaptive_l3_query_max_new_tokens` | `24` | Maximum decoded tokens for one local controller decision |
 | `--adaptive_l3_query_max_query_chars` | `256` | Maximum characters of a controller-produced CLIP query |
@@ -353,22 +366,39 @@ not import OpenCLIP at runtime and never computes a cosine similarity. The same
 `legacy` / `l1_original_only` restriction applies.
 
 The opt-in instance grounder is a separate gate on top of
-`geometry_on_demand` and is off by default. `--spatial_l3_rgb_sidecar` records
-the exact pixels of each Evidence mask (same `backproject_world` sampling and
-intrinsics/pose as the geometry map), so `--spatial_l3_instance_grounder` can
-build the official Student's `(1024, 6)` XYZRGB proposals without bbox
-synthesis. It feeds all complete ObjectNodes (including reference objects) to
-the official ViL3DRel Nr3D Student, takes the official softmax argmax, and
-returns only that ObjectNode's existing geometry fact. If the sidecar is
-incomplete, the checkpoint/pointnet2 cannot load, or argmax does not map back
-to a formatable geometry fact, the L3 injection is refused and the original L1
-Prompt is kept. The checkpoint, BERT vocab and compiled extension must be local;
-inference never downloads anything. Install the small official-model
-dependencies with `pip install -e ".[vil3dref]"` (the CUDA-enabled torch is
-provided by the existing inference environment). Build the extension with the
-same Python/torch as the inference process (or a venv with a matching
-Python/torch ABI); a Python extension is not portable across Python or torch
-builds. Build/check on a GPU host:
+`geometry_on_demand` and is off by default. The default grounder configuration
+is the original d659e57 path: one full-instruction query, the official global
+argmax, one existing fact, no geometry fallback (ablation C). The joint filter
+(D/E/F) is an explicit opt-in and never silently changes the old path.
+
+`--spatial_l3_rgb_sidecar` records the exact pixels of each Evidence mask (same
+`backproject_world` sampling and intrinsics/pose as the geometry map), so
+`--spatial_l3_instance_grounder` can build the official Student's `(1024, 6)`
+XYZRGB proposals without bbox synthesis. It feeds all complete ObjectNodes
+(including reference objects) to the official ViL3DRel Nr3D Student and keeps
+every original logit and softmax probability. No probability is renormalized.
+With `--spatial_l3_grounder_selection eligible`, each proposal is mapped
+explicitly to its persistent ObjectNode and Evidence set; the manager selects
+the highest-ranked proposal with a valid ObjectNode, observed Evidence mapping,
+formatable geometry fact and matching target category. If the global argmax
+fails those checks, the next valid candidate is used. Category identity is
+alias/plural aware for `couch/sofa`, `chair/armchair` and generic
+`table/dining table/coffee table`; dining table and coffee table remain
+distinct. With `--spatial_l3_grounder_landmark_queries`, the original
+instruction is parsed once per Episode into verbatim target/reference phrases
+and each phrase is sent to the Student separately; LightNav still receives the
+complete original instruction. Multiple valid ObjectNodes can be injected under
+the existing Prompt character/Token budget. With
+`--spatial_l3_grounder_geometry_fallback`, a failed landmark reuses its own
+existing `SpatialGraphAdapter` item; a full-instruction query uses the original
+bounded geometry fallback. Without it, a failed query keeps the original L1
+Prompt. The checkpoint, BERT vocab and compiled extension must be local;
+inference never downloads anything. Install the small official-model dependencies with
+`pip install -e ".[vil3dref]"` (the CUDA-enabled torch is provided by the
+existing inference environment). Build the extension with the same Python/torch
+as the inference process (or a venv with a matching Python/torch ABI); a Python
+extension is not portable across Python or torch builds. Build/check on a GPU
+host:
 
 ```bash
 CUDA_HOME=/usr/local/cuda PYTHON=/path/to/cuda-venv/bin/python \

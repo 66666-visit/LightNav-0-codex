@@ -68,6 +68,11 @@ def _manager(*, sidecar: bool, grounder=None) -> MemoryManager:
             instance_grounder_enabled=grounder is not None,
             grounder_checkpoint="/fake/official_student.pt",
             grounder_device="cpu",
+            grounder_selection_mode=(
+                "eligible" if grounder is not None else "argmax"
+            ),
+            grounder_landmark_queries=grounder is not None,
+            grounder_geometry_fallback=grounder is not None,
         ),
         spatial_extractor=_SegExtractor(),
         clip_encoder=None,
@@ -77,6 +82,8 @@ def _manager(*, sidecar: bool, grounder=None) -> MemoryManager:
 
 
 class _FakeGrounder:
+    """Deterministic official-score stub with the requested object ranked first."""
+
     def __init__(self, selected_object_id: str | None) -> None:
         self.selected_object_id = selected_object_id
         self.calls: list[dict] = []
@@ -88,6 +95,16 @@ class _FakeGrounder:
             "proposal_ids": [proposal.object_id for proposal in proposals],
             "skipped": list(skipped),
         })
+        ids = [proposal.object_id for proposal in proposals]
+        ranked = (
+            [self.selected_object_id] + [value for value in ids if value != self.selected_object_id]
+            if self.selected_object_id in ids
+            else ids
+        )
+        probability = {
+            object_id: (len(ranked) - index) / len(ranked)
+            for index, object_id in enumerate(ranked)
+        }
         scores = tuple(
             ProposalScore(
                 object_id=proposal.object_id,
@@ -95,8 +112,10 @@ class _FakeGrounder:
                 point_count=proposal.point_count,
                 center_vil=(0.0, 0.0, 0.0),
                 size_vil=(1.0, 1.0, 1.0),
-                logit=1.0 - index * 0.1,
-                probability=(len(proposals) - index) / len(proposals),
+                logit=float(probability.get(proposal.object_id, 0.0)),
+                probability=float(probability.get(proposal.object_id, 0.0)),
+                proposal_id=f"proposal-{index}",
+                evidence_ids=tuple(proposal.evidence_ids),
             )
             for index, proposal in enumerate(proposals)
         )
@@ -228,8 +247,39 @@ def test_l1_satisfied_never_calls_the_grounder_and_keeps_l1() -> None:
     assert manager.last_l3_query_diagnostic["skipped_reason"] == "l1_satisfied"
 
 
-def test_unmapped_selection_is_refused_not_reinjected_as_all_candidates() -> None:
-    grounder = _FakeGrounder("object-not-in-proposals")
+class _PhantomGrounder(_FakeGrounder):
+    """Official scores for an object ID that does not exist in the ObjectMap."""
+
+    def select(self, *, instruction, object_map, sidecar, step, episode_id):
+        self.calls.append({
+            "instruction": instruction, "step": step,
+            "proposal_ids": ["object-not-in-proposals"], "skipped": [],
+        })
+        score = ProposalScore(
+            object_id="object-not-in-proposals",
+            class_name="sofa",
+            point_count=8,
+            center_vil=(0.0, 0.0, 0.0),
+            size_vil=(1.0, 1.0, 1.0),
+            logit=2.0,
+            probability=1.0,
+            proposal_id="proposal-0",
+            evidence_ids=(),
+        )
+        return InstanceGroundingResult(
+            selected_object_id="object-not-in-proposals",
+            selected_index=0,
+            proposals=(score,),
+            top1_top2_gap=None,
+            latency_ms=1.0,
+            checkpoint="fake",
+            checkpoint_sha256="fake",
+            refusal_reason=None,
+        )
+
+
+def test_unmapped_proposal_falls_back_to_the_unchanged_geometry_fact() -> None:
+    grounder = _PhantomGrounder(None)
     manager = _manager(sidecar=True, grounder=grounder)
     manager.reset_episode("episode", "find the far sofa", scene_id=SCENE)
     _fill_map(manager)
@@ -237,9 +287,16 @@ def test_unmapped_selection_is_refused_not_reinjected_as_all_candidates() -> Non
         step=2, instruction="find the far sofa",
         l1_status="no_candidates", max_chars=320,
     )
-    assert context is None
-    assert manager.last_l3_query_diagnostic["skipped_reason"]
-    assert manager.last_l3_query_diagnostic["injected_count"] == 0
+    assert context is not None
+    assert context.layer_items
+    diagnostic = manager.last_l3_query_diagnostic
+    assert diagnostic["injected_count"] == len(context.layer_items)
+    assert diagnostic["selected_valid_proposals"] == []
+    assert diagnostic["geometry_fallback_reason"]
+    assert diagnostic["selection_sources"] == ["geometry_fallback"] * len(
+        context.layer_items
+    )
+    assert diagnostic["actual_injection"] is True
 
 
 class _OneMaskExtractor:
@@ -479,7 +536,7 @@ def test_incomplete_rgb_refuses_the_whole_grounding_before_the_model() -> None:
     assert runtime.calls == 0
 
 
-def test_selected_reference_object_not_in_geometry_facts_is_refused() -> None:
+def test_global_argmax_reference_falls_back_to_the_next_valid_candidate() -> None:
     grounder = _FakeGrounder("object-chair")
     manager = _manager(sidecar=True, grounder=grounder)
     manager.reset_episode("episode", "find the far sofa", scene_id=SCENE)
@@ -488,9 +545,21 @@ def test_selected_reference_object_not_in_geometry_facts_is_refused() -> None:
         step=2, instruction="find the far sofa",
         l1_status="no_candidates", max_chars=320,
     )
-    assert context is None
+    assert context is not None
     diagnostic = manager.last_l3_query_diagnostic
-    assert diagnostic["skipped_reason"] == "selected_object_not_formatable"
-    assert diagnostic["injected_count"] == 0
-    assert diagnostic["candidate_count"] == 0
+    injected = diagnostic["object_ids"]
+    assert injected and injected[0] != "object-chair"
+    assert set(injected) <= {"object-sofa-a", "object-sofa-b"}
+    assert "object-sofa-a" in diagnostic["selected_valid_proposals"]
+    assert "object-sofa-b" in diagnostic["selected_valid_proposals"]
     assert diagnostic["instance_grounding"]["selected_object_id"] == "object-chair"
+    assert diagnostic["grounder_selected_object_id"] == "object-chair"
+    assert diagnostic["injected_count"] == len(injected)
+    assert diagnostic["actual_injection"] is True
+    proposal = next(
+        item for item in diagnostic["grounding_queries"][0]["proposals"]
+        if item["persistent_object_id"] == "object-chair"
+    )
+    assert proposal["class_match"] is False
+    assert proposal["formatable"] is False
+    assert proposal["rejection_reason"] == "not_formatable"

@@ -899,6 +899,76 @@ def _trace_prompt(policy: Any, *, forced_stop: bool) -> tuple[str | None, str]:
     return prompt, "reconstructed_baseline_sample" if isinstance(prompt, str) else "unavailable"
 
 
+def _trace_pose_vectors(info: dict[str, Any]) -> tuple[Any, Any]:
+    """Return only pose vectors the server supplied; never estimate them."""
+    pose = _trace_pose(info) or {}
+    nested = pose.get("agent_pose")
+    source = nested if isinstance(nested, dict) else pose
+    position = (
+        source.get("position")
+        if isinstance(source, dict) else None
+    )
+    rotation = (
+        source.get("rotation")
+        if isinstance(source, dict) else None
+    )
+    if position is None:
+        position = pose.get("agent_position") or pose.get("position")
+    if rotation is None:
+        rotation = pose.get("agent_rotation") or pose.get("rotation")
+    return make_json_safe(position), make_json_safe(rotation)
+
+
+def _trace_l3_memory_fields(
+    diagnostic: Any, *, memory_text: str, actual_injection: bool | None,
+) -> dict[str, Any]:
+    """Flatten the L3/grounding fields already present in memory diagnostics."""
+    fields: dict[str, Any] = {
+        "memory_text": memory_text,
+        "actual_injection": actual_injection,
+        "actual_injected_evidence_ids": [],
+        "prompt_hash_before": None,
+        "prompt_hash_after": None,
+        "grounding_query": None,
+        "selected_object_ids": [],
+        "geometry_fallback_reason": None,
+    }
+    if not isinstance(diagnostic, dict):
+        return fields
+    fields["prompt_hash_before"] = diagnostic.get("prompt_hash_before")
+    fields["prompt_hash_after"] = diagnostic.get("prompt_hash_after")
+    fields["actual_injected_evidence_ids"] = list(
+        diagnostic.get("injected_evidence_ids", []) or []
+    )
+    spatial = diagnostic.get("spatial_l3")
+    l3_query = None
+    if isinstance(spatial, dict):
+        fields["geometry_fallback_reason"] = spatial.get("fallback_reason")
+        candidate = spatial.get("l3_query")
+        if isinstance(candidate, dict):
+            l3_query = candidate
+    if l3_query is None:
+        candidate = diagnostic.get("l3_query")
+        if isinstance(candidate, dict):
+            l3_query = candidate
+    if isinstance(l3_query, dict):
+        fields["grounding_query"] = l3_query.get("grounding_query")
+        fields["selected_object_ids"] = list(
+            l3_query.get("selected_object_ids")
+            or l3_query.get("object_ids")
+            or []
+        )
+        fields["geometry_fallback_reason"] = l3_query.get(
+            "geometry_fallback_reason"
+        )
+        if l3_query.get("actual_injection") is not None:
+            fields["actual_injection"] = l3_query.get("actual_injection")
+        actual_ids = l3_query.get("actual_injected_evidence_ids")
+        if actual_ids is not None:
+            fields["actual_injected_evidence_ids"] = list(actual_ids)
+    return fields
+
+
 def _trace_actual_injection(diagnostic: Any, *, memory_enabled: bool) -> bool | None:
     if not memory_enabled:
         return False
@@ -1328,10 +1398,19 @@ def run_habitat_eval(
                         )
                         agent = getattr(policy, "agent", None)
                         pre_distance = _trace_distance(info)
+                        position, rotation = _trace_pose_vectors(info)
+                        memory_fields = _trace_l3_memory_fields(
+                            memory_diagnostic, memory_text=memory_text,
+                            actual_injection=actual_injection,
+                        )
+                        memory_manager = getattr(policy, "memory_manager", None)
                         trace_row = {
                             "episode_id": episode_id,
                             "habitat_episode_id": habitat_ep_id,
                             "scene_id": habitat_scene_id,
+                            "rollout_idx": int(
+                                getattr(memory_manager, "v3_rollout_idx", 0) or 0
+                            ),
                             "model_path": cfg.model_path,
                             "action_tokenizer_bundle": cfg.action_tokenizer_bundle,
                             "decoder_method": getattr(policy, "method", None),
@@ -1344,6 +1423,10 @@ def run_habitat_eval(
                             "seed": cfg.seed,
                             "step": step,
                             "instruction": instruction,
+                            "position": position,
+                            "rotation": rotation,
+                            "action": make_json_safe(action),
+                            "decoded_action_label": _format_action(action),
                             "rgb": rgb_rel,
                             "rgb_raw_sha256": sha256(rgb.tobytes()).hexdigest(),
                             "rgb_shape": list(rgb.shape),
@@ -1352,11 +1435,29 @@ def run_habitat_eval(
                             "prompt": prompt,
                             "prompt_source": prompt_source,
                             "memory_text_in_prompt": memory_text,
+                            "memory_text": memory_fields["memory_text"],
                             "injected_memory_text": (
                                 memory_text if actual_injection is True else
                                 "" if actual_injection is False else None
                             ),
                             "actual_memory_injection": actual_injection,
+                            "actual_injection": memory_fields["actual_injection"],
+                            "actual_injected_evidence_ids": memory_fields[
+                                "actual_injected_evidence_ids"
+                            ],
+                            "prompt_hash_before": memory_fields[
+                                "prompt_hash_before"
+                            ],
+                            "prompt_hash_after": memory_fields[
+                                "prompt_hash_after"
+                            ],
+                            "grounding_query": memory_fields["grounding_query"],
+                            "selected_object_ids": memory_fields[
+                                "selected_object_ids"
+                            ],
+                            "geometry_fallback_reason": memory_fields[
+                                "geometry_fallback_reason"
+                            ],
                             "history_frame_ids": (
                                 list(agent._history_frame_ids) if agent is not None
                                 and hasattr(agent, "_history_frame_ids") else None
@@ -1408,6 +1509,9 @@ def run_habitat_eval(
                         pre_distance = trace_row["distance_to_goal_pre"]
                         trace_row.update({
                             "pose_post": _trace_pose(info),
+                            "collision": make_json_safe(
+                                info.get("collisions", info.get("collision"))
+                            ),
                             "distance_to_goal_post": post_distance,
                             "distance_delta_m": (
                                 post_distance - pre_distance
