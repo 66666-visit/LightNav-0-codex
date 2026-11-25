@@ -39,6 +39,7 @@ from lightnav.memory.prompt_modes import (
     validate_mode_backing,
 )
 from lightnav.memory.retriever import MemoryRetriever
+from lightnav.memory.rgb_sidecar import RGBSidecar
 from lightnav.memory.rgm_config import RGMConfig
 from lightnav.memory.scene_graph import SceneGraph
 from lightnav.memory.schemas import (
@@ -120,6 +121,7 @@ class MemoryManager:
         clip_encoder: object | None = None,
         prompt_mode: str = "legacy",
         adaptive_l3_query_config: AdaptiveL3QueryConfig | None = None,
+        instance_grounder: object | None = None,
     ) -> None:
         if top_k < 0:
             raise ValueError("top_k must be nonnegative")
@@ -198,6 +200,20 @@ class MemoryManager:
         self.spatial_adapter = (
             SpatialGraphAdapter() if self.spatial_map is not None else None
         )
+        # Read-only XYZRGB recorder for the opt-in ViL3DRel grounder.  It is
+        # created only when explicitly enabled; it never mutates ObjectNode.
+        self.rgb_sidecar = (
+            RGBSidecar(self.spatial_l3_config.geometry)
+            if self.spatial_l3_config.rgb_sidecar_enabled else None
+        )
+        if self.spatial_l3_config.instance_grounder_enabled and self.rgb_sidecar is None:
+            raise ValueError("instance grounder requires the RGB sidecar")
+        self.instance_grounder = instance_grounder
+        self._instance_grounder_error: str | None = None
+        if self.instance_grounder is not None and not callable(
+            getattr(self.instance_grounder, "select", None)
+        ):
+            raise TypeError("instance_grounder must provide select()")
         if (
             self.spatial_l3_config.mode == "geometry_on_demand"
             and clip_encoder is not None
@@ -413,6 +429,10 @@ class MemoryManager:
             self.geometry_on_demand_controller.reset_episode(
                 self.v3_scene_id, episode_id, rollout_idx,
             )
+        if self.rgb_sidecar is not None:
+            self.rgb_sidecar.reset_episode(
+                self.v3_scene_id, episode_id, rollout_idx,
+            )
         if self.adaptive_l3_runner is not None:
             self.adaptive_l3_runner.reset_episode(
                 self.v3_scene_id, episode_id, rollout_idx,
@@ -566,6 +586,29 @@ class MemoryManager:
             )
             diagnostic["observed_objects"] = len(observed)
             diagnostic["object_nodes"] = len(self.spatial_map.objects)
+            if self.rgb_sidecar is not None:
+                # Read-only: the sidecar stores the exact per-mask pixels after
+                # ObjectMap.observe has already assigned object identities.  A
+                # sidecar failure must never break L1 or the geometry map.
+                try:
+                    recorded = self.rgb_sidecar.record_frame(
+                        frame, masks, step_id=step,
+                    )
+                    bound = self.rgb_sidecar.bind_objects(
+                        self.spatial_map.objects.values(),
+                    )
+                    diagnostic["rgb_sidecar"] = {
+                        **recorded,
+                        "bound": bound,
+                        "summary": self.rgb_sidecar.summary(),
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    diagnostic["rgb_sidecar_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    logger.warning(
+                        "RGB sidecar failed step=%s: %s", step, exc,
+                    )
             self._attach_clip_features(frame, masks, observed, diagnostic)
             diagnostic["viewpoints"] = len(self.spatial_map.viewpoints)
             diagnostic["observed_from_edges"] = sum(
@@ -1140,6 +1183,228 @@ class MemoryManager:
         self._record_l3_query(self.last_l3_query_diagnostic)
         return context
 
+    def set_instance_grounder(self, grounder: object | None) -> None:
+        """Attach a grounder (used by tests and by a policy-owned runtime)."""
+        if grounder is not None and not callable(getattr(grounder, "select", None)):
+            raise TypeError("instance_grounder must provide select()")
+        self.instance_grounder = grounder
+        self._instance_grounder_error = None
+
+    def _get_instance_grounder(self) -> object:
+        """Load the official Student once; never silently disable it."""
+        if self.instance_grounder is not None:
+            return self.instance_grounder
+        # Do not cache a load failure permanently: a missing/misconfigured
+        # dependency can be fixed while the manager lives (e.g. a transient
+        # CUDA context/OOM error during startup).  The last error is retained
+        # for diagnostics and the next call retries.
+        config = self.spatial_l3_config
+        try:
+            from lightnav.memory.l3_instance_grounder import (
+                OfficialStudentRuntime,
+                ViL3DRelGrounder,
+            )
+
+            runtime = OfficialStudentRuntime(
+                config.grounder_checkpoint,
+                config_path=config.grounder_config or None,
+                device=config.grounder_device,
+                bert_vocab_path=config.grounder_bert_vocab_path or None,
+            )
+            grounder = ViL3DRelGrounder(runtime, seed=config.grounder_seed)
+        except Exception as exc:  # noqa: BLE001 - reported to the audit
+            self._instance_grounder_error = f"{type(exc).__name__}: {exc}"
+            raise
+        self._instance_grounder_error = None
+        self.instance_grounder = grounder
+        return grounder
+
+    def _grounded_geometry_context(
+        self, *, step: int, instruction: str, l1_status: str, max_chars: int,
+    ) -> MemoryContext | None:
+        """Geometry candidates -> official Student argmax -> one existing fact.
+
+        This method is reached only when ``instance_grounder_enabled`` is on;
+        the original geometry path below remains byte-identical when it is off.
+        """
+        controller = self.geometry_on_demand_controller
+        if controller is None or self.spatial_map is None:
+            return None
+        if (
+            self.last_spatial_frame is None
+            or self.spatial_adapter is None
+            or self.v3_store is None
+        ):
+            diagnostic = {
+                "trigger": l1_status, "step": step,
+                "skipped_reason": "no_current_frame", "query_executed": False,
+                "candidate_count": 0, "injected_count": 0,
+                "retrieval": "geometry_spatial_graph_adapter+vil3dref_student",
+            }
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        prepared = controller.prepare_query(
+            self.spatial_map, step=step, instruction=instruction,
+            l1_status=l1_status,
+            available=lambda object_map: (
+                controller.has_historical_geometry_candidates(object_map, step)
+            ),
+            unavailable_reason="no_historical_geometry_object",
+            retrieval="geometry_spatial_graph_adapter+vil3dref_student",
+            signature_fn=controller.geometry_map_signature,
+        )
+        diagnostic = dict(controller.last_diagnostic or {})
+        diagnostic.update({
+            "injected_count": 0,
+            "retrieval": "geometry_spatial_graph_adapter+vil3dref_student",
+        })
+        if prepared is None:
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        _query, _ = prepared
+
+        def _build(context_chars: int) -> MemoryContext | None:
+            return self.spatial_adapter.build(
+                self.v3_store, self.spatial_map, self.last_spatial_frame,
+                scene_id=self.v3_scene_id,
+                episode_id=self.working.state.episode_id,
+                rollout_idx=self.v3_rollout_idx, step=step,
+                instruction=instruction, scope=self.local_graph_config.scope,
+                max_landmarks=max(1, len(self.spatial_map.objects)),
+                prompt_max_chars=context_chars,
+                min_confidence=self.spatial_l3_config.min_injection_confidence,
+            )
+
+        started = perf_counter()
+        try:
+            full_context = _build(UNBOUNDED_CHAR_LIMIT)
+        except Exception as exc:  # noqa: BLE001
+            diagnostic["skipped_reason"] = "query_error"
+            diagnostic["error"] = f"{type(exc).__name__}: {exc}"
+            diagnostic["query_ms"] = (perf_counter() - started) * 1000.0
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        if full_context is None:
+            diagnostic.update({
+                "candidate_count": 0,
+                "skipped_reason": "no_geometry_candidate",
+                "query_ms": (perf_counter() - started) * 1000.0,
+            })
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        if self.rgb_sidecar is None:
+            diagnostic.update({
+                "candidate_count": 0,
+                "skipped_reason": "rgb_sidecar_unavailable",
+                "query_ms": (perf_counter() - started) * 1000.0,
+            })
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        try:
+            grounder = self._get_instance_grounder()
+        except Exception as exc:  # noqa: BLE001
+            diagnostic.update({
+                "candidate_count": 0,
+                "skipped_reason": "grounder_load_error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "query_ms": (perf_counter() - started) * 1000.0,
+            })
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        try:
+            result = grounder.select(
+                instruction=instruction,
+                object_map=self.spatial_map,
+                sidecar=self.rgb_sidecar,
+                step=step,
+                episode_id=self.working.state.episode_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - a sidecar must fail closed
+            diagnostic.update({
+                "candidate_count": 0,
+                "skipped_reason": "grounding_error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "query_ms": (perf_counter() - started) * 1000.0,
+            })
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        diagnostic["instance_grounding"] = result.to_dict()
+        diagnostic["grounding_ms"] = result.latency_ms
+        # ``candidate_count`` is the existing "a valid match exists" statistic.
+        # A refused grounding (model error, unmapped selection, invalid
+        # proposal) must not be counted as a query match/injection; the full
+        # model proposal list remains in ``proposal_count``/instance_grounding.
+        diagnostic["candidate_count"] = len(result.proposals) if result.valid else 0
+        diagnostic["formatable_candidate_count"] = len(full_context.layer_items)
+        diagnostic["proposal_count"] = (
+            len(result.proposals) if result.proposals
+            else len(result.offered_proposals)
+        )
+        diagnostic["query_ms"] = (perf_counter() - started) * 1000.0
+        if not result.valid or result.selected_object_id is None:
+            diagnostic["skipped_reason"] = (
+                result.refusal_reason or "grounding_refused"
+            )
+            if result.error is not None:
+                diagnostic["error"] = result.error
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        selected_id = result.selected_object_id
+        selected_items = [
+            item for item in full_context.layer_items
+            if item.metadata.get("object_id") == selected_id
+        ]
+        if not selected_items:
+            diagnostic["candidate_count"] = 0
+            diagnostic["skipped_reason"] = "selected_object_not_formatable"
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        item = selected_items[0]
+        text = "[Navigation Memory]\n" + item.description
+        if len(text) > max_chars:
+            diagnostic["candidate_count"] = 0
+            diagnostic["skipped_reason"] = "prompt_budget_excluded"
+            diagnostic["prompt_budget_excluded"] = True
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
+        metadata = item.metadata
+        diagnostic.update({
+            "injected_count": 1,
+            "selected_object_id": selected_id,
+            "object_ids": [selected_id],
+            "evidence_ids": list(dict.fromkeys(
+                value for value in metadata.get("evidence_ids", [])
+                if isinstance(value, str)
+            )),
+            "matches": [{
+                "object_id": selected_id,
+                "label": item.label,
+                "evidence_ids": list(metadata.get("evidence_ids", [])),
+                "confidence": item.confidence,
+                "observation_count": metadata.get("observation_count"),
+                "center_world": metadata.get("center_world"),
+                "distance_m": metadata.get("current_relative_distance_m"),
+                "bearing_deg": metadata.get("current_relative_bearing_deg"),
+            }],
+            "geometry_context_chars": len(text),
+            "skipped_reason": None,
+        })
+        diagnostic["injected_text"] = text
+        context = MemoryContext(text=text, layer_items=[item])
+        self.last_l3_query_diagnostic = diagnostic
+        self._record_l3_query(diagnostic)
+        return context
+
     def get_geometry_on_demand_context(
         self, *, step: int, instruction: str, l1_status: str, max_chars: int,
     ) -> MemoryContext | None:
@@ -1151,6 +1416,11 @@ class MemoryManager:
         :class:`SpatialGraphAdapter.build`; no CLIP encoder, weight, embedding or
         cosine score exists on this path.
         """
+        if self.spatial_l3_config.instance_grounder_enabled:
+            return self._grounded_geometry_context(
+                step=step, instruction=instruction, l1_status=l1_status,
+                max_chars=max_chars,
+            )
         controller = self.geometry_on_demand_controller
         if controller is None or self.spatial_map is None:
             return None
@@ -1423,6 +1693,8 @@ class MemoryManager:
                 self.l3_query_controller.close_episode()
             if self.geometry_on_demand_controller is not None:
                 self.geometry_on_demand_controller.close_episode()
+            if self.rgb_sidecar is not None:
+                self.rgb_sidecar.close_episode()
             if self.adaptive_l3_runner is not None:
                 self.adaptive_l3_runner.close_episode()
             self.last_adaptive_l3_diagnostic = {}

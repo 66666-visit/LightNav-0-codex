@@ -10,6 +10,10 @@ import torch
 
 from lightnav.habitat.policy import TrajVocabVLNCEPolicy
 from lightnav.inference.policies import NavigationPolicy
+from lightnav.memory.l3_instance_grounder import (
+    InstanceGroundingResult,
+    ProposalScore,
+)
 from lightnav.memory.local_graph_config import LocalGraphConfig
 from lightnav.memory.manager import MemoryManager
 from lightnav.memory.memory_writer import MockSceneExtractor
@@ -108,6 +112,7 @@ def _policy(
     mode: str = "geometry_on_demand", *, instruction: str = "find the sofa",
     l1_label: str = "chair", seg_label: str = "sofa",
     prompt_mode: str = "l1_original_only",
+    rgb_sidecar: bool = False, instance_grounder=None,
 ):
     detections = {
         step: SceneExtraction(
@@ -125,10 +130,15 @@ def _policy(
         spatial_l3_config=SpatialL3Config(
             mode=mode, seg_model_path="/fake/yolo11n-seg.pt",
             seg_every_n_steps=2, min_injection_confidence=0.5,
+            rgb_sidecar_enabled=rgb_sidecar,
+            instance_grounder_enabled=instance_grounder is not None,
+            grounder_checkpoint="/fake/official_nr3d_student.pt",
+            grounder_device="cpu",
         ),
         spatial_extractor=_SegExtractor(seg_label, every_n_steps=2),
         clip_encoder=None,
         prompt_mode=prompt_mode,
+        instance_grounder=instance_grounder,
     )
     centroids = np.zeros((3, 10, 3), dtype=np.float32)
     centroids[1, :, 0] = 0.25
@@ -297,3 +307,70 @@ def test_geometry_path_never_touches_clip_query_or_encoder(monkeypatch) -> None:
     _act(policy, 1)
     assert "Spatial history: sofa" in _prompt(engine)
     assert manager.clip_encoder is None
+
+
+class _FakeGrounder:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def select(self, *, instruction, object_map, sidecar, step, episode_id):
+        self.calls += 1
+        proposals, skipped = sidecar.proposals(object_map.objects)
+        scores = tuple(
+            ProposalScore(
+                object_id=proposal.object_id,
+                class_name=proposal.class_name,
+                point_count=proposal.point_count,
+                center_vil=(0.0, 0.0, 0.0),
+                size_vil=(1.0, 1.0, 1.0),
+                logit=1.0 - index,
+                probability=1.0 if index == 0 else 0.0,
+            )
+            for index, proposal in enumerate(proposals)
+        )
+        selected = proposals[-1].object_id if proposals else None
+        return InstanceGroundingResult(
+            selected_object_id=selected,
+            selected_index=len(proposals) - 1 if proposals else None,
+            proposals=scores,
+            top1_top2_gap=None,
+            latency_ms=1.0,
+            checkpoint="fake",
+            checkpoint_sha256="fake",
+            skipped_objects=tuple(skipped),
+            refusal_reason=None if selected else "no_rgb_proposals",
+        )
+
+
+def test_grounded_geometry_injects_one_fact_and_keeps_l1_prefix() -> None:
+    baseline, _, baseline_engine = _policy(
+        "off", instruction="find the sofa", l1_label="chair",
+    )
+    _act(baseline, 0)
+    _act(baseline, 1)
+
+    grounder = _FakeGrounder()
+    policy, manager, engine = _policy(
+        instruction="find the sofa", l1_label="chair", seg_label="sofa",
+        rgb_sidecar=True, instance_grounder=grounder,
+    )
+    _act(policy, 0)
+    _act(policy, 1)
+
+    assert grounder.calls == 1
+    assert manager.rgb_sidecar is not None
+    assert manager.rgb_sidecar.summary()["records"] >= 1
+    prompt = _prompt(engine)
+    assert prompt.count("Spatial history:") == 1
+    diagnostic = policy.last_memory_diagnostic["prompt_context"]
+    l3 = diagnostic["spatial_l3"]["l3_query"]
+    assert diagnostic["source"] == "l3_geometry_on_demand"
+    assert l3["injected_count"] == 1
+    assert l3["instance_grounding"]["selected_object_id"] == l3["object_ids"][0]
+    assert len(l3["instance_grounding"]["proposals"]) == 1
+    # The L1 prefix outside the memory block is byte-identical to baseline.
+    base_prompt = _prompt(baseline_engine)
+    assert prompt.startswith(base_prompt.split("</navigation_task>.", 1)[0])
+    start = prompt.index("[Navigation Memory]")
+    end = prompt.index("\nYou may be", start) + 1
+    assert prompt[:start] + prompt[end:] == base_prompt

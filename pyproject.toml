@@ -75,8 +75,14 @@ yolo11 = ["ultralytics>=8.3,<9"]
 # same encoder family ConceptGraphs uses (ViT-H-14 / laion2b_s32b_b79k); the
 # checkpoint is supplied as a local file and is never downloaded by LightNav.
 clip = ["open_clip_torch>=2.24"]
+# Official ViL3DRel Student adapter dependencies (the reference checkout supplies
+# the model source). The pointnet2 CUDA extension is built separately with
+# scripts/build_vil3dref_pointnet2.sh; it is not a pip dependency.
+vil3dref = ["easydict==1.10", "einops==0.6.0"]
 # CPU-only unit tests (scheduler, decode parsing, protocol, sample builders).
-test = ["pytest>=8", "pytest-asyncio>=0.24"]
+# jsonlines is needed only by the optional official-format parity test, which
+# importorskips when the full ViL3DRel reference data tooling is unavailable.
+test = ["pytest>=8", "pytest-asyncio>=0.24", "jsonlines>=3.1"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

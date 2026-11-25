@@ -285,6 +285,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--spatial_l3_clip_min_similarity", type=float, default=0.0,
                    help="Cosine floor for a valid query match; 0.0 is the sign boundary.")
     p.add_argument(
+        "--spatial_l3_rgb_sidecar", action="store_true",
+        help="Opt-in read-only XYZRGB sidecar for every L3 Evidence mask. "
+             "Requires a non-off spatial L3 mode; default off.",
+    )
+    p.add_argument(
+        "--spatial_l3_instance_grounder", action="store_true",
+        help="Ground same-class instances with the official ViL3DRel Nr3D "
+             "Student before Prompt injection. Requires --spatial_l3_rgb_sidecar "
+             "and a compiled pointnet2 extension; default off.",
+    )
+    p.add_argument("--spatial_l3_grounder_checkpoint", default="",
+                   help="Local official Nr3D Student checkpoint "
+                        "(gtlabelpcd_mix/nr3d/ckpts/model_epoch_96.pt).")
+    p.add_argument("--spatial_l3_grounder_config", default="",
+                   help="Official model YAML; empty uses the checked-in "
+                        "nr3d_gtlabelpcd_mix_model.yaml next to the reference source.")
+    p.add_argument("--spatial_l3_grounder_device", default="cuda",
+                   help="Torch device for the official Student; no silent CPU fallback.")
+    p.add_argument("--spatial_l3_grounder_bert_vocab", default="",
+                   help="Local bert-base-uncased vocab.txt; empty uses the local "
+                        "Hugging Face cache (no network access).")
+    p.add_argument("--spatial_l3_grounder_seed", type=int, default=0,
+                   help="Deterministic 1024-point sampling seed per object.")
+    p.add_argument(
         "--adaptive_l3_query", action="store_true",
         help="Enable the opt-in Adaptive L3 Query controller on the original L1 path. "
              "Requires --spatial_l3_mode shadow and a local --spatial_l3_clip_model_path.",
@@ -503,6 +527,13 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                 clip_batch_size=args.spatial_l3_clip_batch_size,
                 clip_top_k=args.spatial_l3_clip_top_k,
                 clip_min_similarity=args.spatial_l3_clip_min_similarity,
+                rgb_sidecar_enabled=args.spatial_l3_rgb_sidecar,
+                instance_grounder_enabled=args.spatial_l3_instance_grounder,
+                grounder_checkpoint=args.spatial_l3_grounder_checkpoint,
+                grounder_config=args.spatial_l3_grounder_config,
+                grounder_device=args.spatial_l3_grounder_device,
+                grounder_bert_vocab_path=args.spatial_l3_grounder_bert_vocab,
+                grounder_seed=args.spatial_l3_grounder_seed,
                 geometry=GeometryConfig(**{
                     name: getattr(args, f"spatial_l3_{name}") for name in (
                         "min_depth_m", "max_depth_m", "min_points",

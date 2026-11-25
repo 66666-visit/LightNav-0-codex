@@ -326,6 +326,13 @@ the WebSocket inference server has no RGB-D map interface.
 | `--spatial_l3_clip_batch_size` | `8` | Maximum image crops per CLIP forward pass; bounds activation memory |
 | `--spatial_l3_clip_top_k` | `3` | Maximum matched objects appended to an L1-empty Prompt |
 | `--spatial_l3_clip_min_similarity` | `0.0` | Cosine floor for a valid match; `0.0` is the sign boundary, not a tuned confidence threshold |
+| `--spatial_l3_rgb_sidecar` | off | Opt-in read-only XYZRGB sidecar: records the exact per-mask pixels of every L3 Evidence so the official ViL3DRel Student can consume real XYZRGB. It does not change ObjectNode, `observe()` or geometry association |
+| `--spatial_l3_instance_grounder` | off | Ground same-class instances with the official ViL3DRel Nr3D Student between the geometry query and the existing Prompt formatter. Requires the sidecar and a compiled official pointnet2 CUDA extension |
+| `--spatial_l3_grounder_checkpoint FILE` | empty | Local official Nr3D Student checkpoint (`gtlabelpcd_mix/nr3d/ckpts/model_epoch_96.pt`); never downloaded at inference |
+| `--spatial_l3_grounder_config FILE` | empty | Official model YAML; empty uses the `nr3d_gtlabelpcd_mix_model.yaml` provided under `references/vil3dref` |
+| `--spatial_l3_grounder_device` | `cuda` | Torch device for the official Student; no silent CPU fallback |
+| `--spatial_l3_grounder_bert_vocab FILE` | empty | Local `bert-base-uncased` `vocab.txt`; empty uses the local Hugging Face cache with `local_files_only=True` |
+| `--spatial_l3_grounder_seed` | `0` | Deterministic seed for the official 1024-point sampling |
 | `--adaptive_l3_query` | off | Opt-in Adaptive L3 Query arm: a local controller decides whether to query L3 on any step, not only when L1 is empty |
 | `--adaptive_l3_query_max_new_tokens` | `24` | Maximum decoded tokens for one local controller decision |
 | `--adaptive_l3_query_max_query_chars` | `256` | Maximum characters of a controller-produced CLIP query |
@@ -344,6 +351,33 @@ point, but retrieves the existing geometry-only candidate set from
 `SpatialGraphAdapter.build`. It requires no `--spatial_l3_clip_model_path`, does
 not import OpenCLIP at runtime and never computes a cosine similarity. The same
 `legacy` / `l1_original_only` restriction applies.
+
+The opt-in instance grounder is a separate gate on top of
+`geometry_on_demand` and is off by default. `--spatial_l3_rgb_sidecar` records
+the exact pixels of each Evidence mask (same `backproject_world` sampling and
+intrinsics/pose as the geometry map), so `--spatial_l3_instance_grounder` can
+build the official Student's `(1024, 6)` XYZRGB proposals without bbox
+synthesis. It feeds all complete ObjectNodes (including reference objects) to
+the official ViL3DRel Nr3D Student, takes the official softmax argmax, and
+returns only that ObjectNode's existing geometry fact. If the sidecar is
+incomplete, the checkpoint/pointnet2 cannot load, or argmax does not map back
+to a formatable geometry fact, the L3 injection is refused and the original L1
+Prompt is kept. The checkpoint, BERT vocab and compiled extension must be local;
+inference never downloads anything. Install the small official-model
+dependencies with `pip install -e ".[vil3dref]"` (the CUDA-enabled torch is
+provided by the existing inference environment). Build the extension with the
+same Python/torch as the inference process (or a venv with a matching
+Python/torch ABI); a Python extension is not portable across Python or torch
+builds. Build/check on a GPU host:
+
+```bash
+CUDA_HOME=/usr/local/cuda PYTHON=/path/to/cuda-venv/bin/python \
+  bash scripts/build_vil3dref_pointnet2.sh
+
+PYTHONPATH=src python scripts/check_vil3dref_cuda.py \
+  --checkpoint /path/model_epoch_96.pt \
+  --bert_vocab /path/bert-base-uncased/vocab.txt
+```
 
 #### Adaptive L3 Query (opt-in)
 

@@ -32,6 +32,19 @@ class SpatialL3Config:
     clip_batch_size: int = 8
     clip_top_k: int = 3
     clip_min_similarity: float = 0.0
+    # Opt-in read-only XYZRGB sidecar.  It records the exact pixels of each L3
+    # Evidence mask so the official ViL3DRel Student can consume real RGB.
+    # Disabled by default; it never changes ObjectNode or observe().
+    rgb_sidecar_enabled: bool = False
+    # Opt-in official ViL3DRel Nr3D Student grounding between the geometry
+    # query and the existing Prompt formatter.  Requires the sidecar and a
+    # locally built official pointnet2 extension.
+    instance_grounder_enabled: bool = False
+    grounder_checkpoint: str = ""
+    grounder_config: str = ""
+    grounder_device: str = "cuda"
+    grounder_bert_vocab_path: str = ""
+    grounder_seed: int = 0
     geometry: GeometryConfig = field(default_factory=GeometryConfig)
 
     def __post_init__(self) -> None:
@@ -82,5 +95,42 @@ class SpatialL3Config:
             raise ValueError("spatial_l3.clip_min_similarity must be finite and in [-1, 1]")
         if self.mode == "on_demand" and not self.clip_model_path:
             raise ValueError("spatial_l3.clip_model_path is required for on_demand mode")
+        for name in (
+            "rgb_sidecar_enabled", "instance_grounder_enabled",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"spatial_l3.{name} must be a boolean")
+        for name in (
+            "grounder_checkpoint", "grounder_config", "grounder_device",
+            "grounder_bert_vocab_path",
+        ):
+            if not isinstance(getattr(self, name), str):
+                raise ValueError(f"spatial_l3.{name} must be a string")
+        if self.instance_grounder_enabled:
+            if self.mode != "geometry_on_demand":
+                raise ValueError(
+                    "spatial_l3.instance_grounder_enabled requires "
+                    "mode=geometry_on_demand"
+                )
+            if not self.rgb_sidecar_enabled:
+                raise ValueError(
+                    "spatial_l3.instance_grounder_enabled requires "
+                    "rgb_sidecar_enabled"
+                )
+            if not self.grounder_checkpoint:
+                raise ValueError(
+                    "spatial_l3.grounder_checkpoint is required when the "
+                    "instance grounder is enabled"
+                )
+            if not self.grounder_device.strip():
+                raise ValueError("spatial_l3.grounder_device must be nonempty")
+            if type(self.grounder_seed) is not int or self.grounder_seed < 0:
+                raise ValueError(
+                    "spatial_l3.grounder_seed must be a nonnegative integer"
+                )
+        if self.rgb_sidecar_enabled and self.mode == "off":
+            raise ValueError(
+                "spatial_l3.rgb_sidecar_enabled requires a non-off spatial mode"
+            )
         if not isinstance(self.geometry, GeometryConfig):
             raise ValueError("spatial_l3.geometry must be GeometryConfig")

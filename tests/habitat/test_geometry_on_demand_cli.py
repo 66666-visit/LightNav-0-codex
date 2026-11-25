@@ -88,3 +88,48 @@ def test_config_from_args_wires_geometry_mode_without_clip() -> None:
     assert config.memory.spatial_l3.mode == "geometry_on_demand"
     assert config.memory.spatial_l3.clip_model_path == ""
     assert config.memory.spatial_l3.seg_every_n_steps == 5
+
+
+def test_cli_wires_opt_in_rgb_sidecar_and_grounder() -> None:
+    parser = build_parser()
+    args = parser.parse_args([
+        "--model_path", "/fake/model",
+        "--memory_enabled",
+        "--memory_strategy", "hierarchical",
+        "--memory_extractor", "yolo11",
+        "--memory_extractor_model_path", "/fake/yolo11n.pt",
+        "--local_graph_enabled",
+        "--spatial_l3_mode", "geometry_on_demand",
+        "--spatial_l3_seg_model_path", "/fake/seg.pt",
+        "--memory_prompt_mode", "l1_original_only",
+        "--spatial_l3_rgb_sidecar",
+        "--spatial_l3_instance_grounder",
+        "--spatial_l3_grounder_checkpoint", "/fake/student.pt",
+        "--spatial_l3_grounder_config", "/fake/model.yaml",
+        "--spatial_l3_grounder_device", "cuda:1",
+        "--spatial_l3_grounder_bert_vocab", "/fake/vocab.txt",
+        "--spatial_l3_grounder_seed", "7",
+        "--output_dir", "/tmp/geometry_on_demand_cli_test",
+    ])
+    spatial = config_from_args(args).memory.spatial_l3
+    assert spatial.rgb_sidecar_enabled is True
+    assert spatial.instance_grounder_enabled is True
+    assert spatial.grounder_checkpoint == "/fake/student.pt"
+    assert spatial.grounder_config == "/fake/model.yaml"
+    assert spatial.grounder_device == "cuda:1"
+    assert spatial.grounder_bert_vocab_path == "/fake/vocab.txt"
+    assert spatial.grounder_seed == 7
+
+
+def test_grounder_requires_sidecar_and_geometry_mode() -> None:
+    base = {
+        "mode": "geometry_on_demand", "seg_model_path": "/fake/seg.pt",
+        "instance_grounder_enabled": True,
+        "grounder_checkpoint": "/fake/student.pt",
+    }
+    with pytest.raises(ValueError, match="rgb_sidecar_enabled"):
+        SpatialL3Config(**base)
+    with pytest.raises(ValueError, match="geometry_on_demand"):
+        SpatialL3Config(
+            **{**base, "mode": "shadow", "rgb_sidecar_enabled": True},
+        )
