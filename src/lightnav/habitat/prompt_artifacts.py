@@ -133,6 +133,10 @@ def build_prompt_protocol(memory: Any) -> dict[str, Any]:
                                 "grounder_geometry_fallback", False,
                             ) else False
                         ),
+                        "ordered_landmark_memory": bool(getattr(
+                            grounder_config,
+                            "grounder_ordered_landmark_memory", False,
+                        )),
                     })
     adaptive = getattr(memory, "adaptive_l3_query", None)
     if getattr(adaptive, "enabled", False):
@@ -329,10 +333,23 @@ def prompt_diagnostic_row(
             "l3_grounding_query": l3_query.get("grounding_query"),
             "l3_grounding_query_source": l3_query.get("grounding_query_source"),
             "l3_instruction_landmarks": l3_query.get("instruction_landmarks"),
+            "l3_landmark_role": l3_query.get("landmark_role"),
+            "l3_landmark_order": l3_query.get("landmark_order"),
+            "l3_landmark_phrase": l3_query.get("landmark_phrase"),
             "l3_grounder_proposal_count": l3_query.get(
                 "grounder_proposal_count"
             ),
             "l3_grounder_scored_count": l3_query.get("grounder_scored_count"),
+            "l3_eligible_candidate_count": l3_query.get(
+                "eligible_candidate_count"
+            ),
+            "l3_geometry_fallback_attempted": l3_query.get(
+                "geometry_fallback_attempted"
+            ),
+            "l3_selected_object_id": l3_query.get("selected_object_id"),
+            "l3_evidence_ids": l3_query.get("evidence_ids", []),
+            "l3_selection_source": l3_query.get("selection_source"),
+            "l3_ordered_landmarks": l3_query.get("ordered_landmarks", []),
             "l3_formatable_proposal_count": l3_query.get(
                 "formatable_proposal_count"
             ),

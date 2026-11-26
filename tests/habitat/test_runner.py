@@ -1270,6 +1270,19 @@ def test_single_episode_trace_records_model_input_and_evaluator_state(tmp_path):
                     "actual_injection": True,
                     "actual_injected_evidence_ids": ["ev-1"],
                     "geometry_fallback_reason": None,
+                    "landmark_role": "intermediate",
+                    "landmark_order": 2,
+                    "landmark_phrase": "far couch",
+                    "grounder_proposal_count": 3,
+                    "eligible_candidate_count": 1,
+                    "geometry_fallback_attempted": True,
+                    "selection_source": "vil3dref_grounding",
+                    "ordered_landmarks": [{
+                        "landmark_order": 2,
+                        "landmark_role": "intermediate",
+                        "landmark_phrase": "far couch",
+                        "actual_injection": True,
+                    }],
                 },
             },
         }
@@ -1326,6 +1339,15 @@ def test_single_episode_trace_records_model_input_and_evaluator_state(tmp_path):
     assert rows[0]["grounding_query"] == "far couch"
     assert rows[0]["selected_object_ids"] == ["object-couch"]
     assert rows[0]["geometry_fallback_reason"] is None
+    assert rows[0]["landmark_role"] == "intermediate"
+    assert rows[0]["landmark_order"] == 2
+    assert rows[0]["landmark_phrase"] == "far couch"
+    assert rows[0]["grounder_proposal_count"] == 3
+    assert rows[0]["eligible_candidate_count"] == 1
+    assert rows[0]["geometry_fallback_attempted"] is True
+    assert rows[0]["selection_source"] == "vil3dref_grounding"
+    assert rows[0]["landmark_rows"][0]["landmark_phrase"] == "far couch"
+    assert rows[0]["decoded_stop_decision"] is False
     assert rows[0]["action_divergence_vs_baseline"] is None
     before = (output / "step_trace.jsonl").read_bytes()
     with pytest.raises(FileExistsError, match="step trace requires fresh"):

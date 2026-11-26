@@ -145,6 +145,14 @@ _OBJECT_MODIFIERS = frozenset({
 })
 _SENTENCE_END = frozenset({".", ";", "!", "?"})
 
+#: Action words that mark a *passage* landmark (a place the route goes
+#: through) rather than a destination.  The words are only matched inside the
+#: already-extracted verbatim action phrase; no relation is invented.
+_TRANSITION_ACTION_WORDS = frozenset({
+    "through", "enter", "enters", "entering", "exit", "exits", "exiting",
+    "pass", "passes", "passing", "cross", "crosses", "crossing", "across",
+})
+
 
 class LandmarkQueryProvider(Protocol):
     """Optional instruction-landmark provider.
@@ -180,11 +188,20 @@ class InstructionLandmark:
     grounding_query_span: tuple[int, int] | None = None
     reference_phrases: tuple[str, ...] = ()
     reference_spans: tuple[tuple[int, int], ...] = ()
+    #: Ordered-path role: ``source`` | ``intermediate`` | ``transition`` |
+    #: ``final`` | ``reference``.  ``role`` above keeps the original
+    #: target/reference distinction used by the ViL3DRel query path.
+    navigation_role: str = "final"
+    #: 1-based position in the original instruction, independent of ``role``.
+    landmark_order: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "index": self.index,
             "role": self.role,
+            "landmark_role": self.navigation_role,
+            "navigation_role": self.navigation_role,
+            "landmark_order": self.landmark_order,
             "target_phrase": self.target_phrase,
             "target_object": self.target_object,
             "target_span": list(self.target_span),
@@ -248,6 +265,19 @@ class InstructionLandmarks:
     def grounding_queries(self) -> tuple[InstructionLandmark, ...]:
         """Every extracted landmark is queried once, in original instruction order."""
         return self.landmarks
+
+    @property
+    def ordered_landmarks(self) -> tuple[InstructionLandmark, ...]:
+        """Landmarks sorted by their 1-based position in the instruction."""
+        return tuple(sorted(self.landmarks, key=lambda landmark: landmark.landmark_order))
+
+    @property
+    def path_landmarks(self) -> tuple[InstructionLandmark, ...]:
+        """Source/intermediate/transition/final landmarks, in instruction order."""
+        return tuple(
+            landmark for landmark in self.ordered_landmarks
+            if landmark.navigation_role != "reference"
+        )
 
 
 @dataclass(frozen=True)
@@ -540,6 +570,75 @@ def _make_record(
     }
 
 
+def _is_transition_action(action_phrase: str | None) -> bool:
+    """True when the verbatim action phrase marks passage through a landmark."""
+    if not isinstance(action_phrase, str) or not action_phrase.strip():
+        return False
+    words = {token.casefold() for token in _TOKEN_RE.findall(action_phrase)}
+    return bool(words & _TRANSITION_ACTION_WORDS)
+
+
+def _navigation_role(
+    *, role: str, relation_kind: str | None, action_phrase: str | None,
+    index: int, final_target_index: int | None,
+) -> str:
+    """Assign a path role from the parsed text only.
+
+    The last motion target is ``final`` (it is where the route ends).  Earlier
+    targets are ``transition`` when their own action phrase says the route goes
+    *through* them, otherwise ``intermediate``.  A source reference keeps the
+    ``source`` role; other locative references remain ``reference`` and are not
+    put on the ordered path.  No Episode ID or object lexicon participates.
+    """
+    if role == "reference":
+        return "source" if relation_kind == "source" else "reference"
+    if final_target_index is not None and index == final_target_index:
+        return "final"
+    if _is_transition_action(action_phrase):
+        return "transition"
+    return "intermediate"
+
+
+def _assign_navigation_roles(records: list[dict[str, Any]]) -> None:
+    target_indices = [
+        record["index"] for record in records if record["role"] == "target"
+    ]
+    final_target_index = target_indices[-1] if target_indices else None
+    for record in records:
+        record["landmark_order"] = int(record["index"]) + 1
+        record["navigation_role"] = _navigation_role(
+            role=record["role"],
+            relation_kind=record.get("relation_kind"),
+            action_phrase=record.get("action_phrase"),
+            index=int(record["index"]),
+            final_target_index=final_target_index,
+        )
+
+
+def _with_navigation_roles(
+    landmarks: Sequence[InstructionLandmark],
+) -> tuple[InstructionLandmark, ...]:
+    """Attach path roles to provider-produced landmarks using the same rules."""
+    target_indices = [
+        landmark.index for landmark in landmarks if landmark.role == "target"
+    ]
+    final_target_index = target_indices[-1] if target_indices else None
+    return tuple(
+        replace(
+            landmark,
+            landmark_order=landmark.index + 1,
+            navigation_role=_navigation_role(
+                role=landmark.role,
+                relation_kind=landmark.relation_kind,
+                action_phrase=landmark.action_phrase,
+                index=landmark.index,
+                final_target_index=final_target_index,
+            ),
+        )
+        for landmark in landmarks
+    )
+
+
 def _build_landmarks(instruction: str, source: str) -> InstructionLandmarks:
     tokens = _merge_phrases(instruction, _raw_tokens(instruction))
     runs = _content_runs(tokens)
@@ -711,6 +810,7 @@ def _build_landmarks(instruction: str, source: str) -> InstructionLandmarks:
             record["reference_objects"] = (match[2],)
             break
 
+    _assign_navigation_roles(records)
     landmarks = tuple(
         InstructionLandmark(**{
             key: value for key, value in record.items()
@@ -811,7 +911,9 @@ def _provider_landmarks(
         cursor = phrase_end
     if not landmarks:
         return None
-    return InstructionLandmarks(instruction, tuple(landmarks), "provider")
+    return InstructionLandmarks(
+        instruction, _with_navigation_roles(tuple(landmarks)), "provider",
+    )
 
 
 def parse_instruction_landmarks(

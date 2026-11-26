@@ -52,6 +52,11 @@ class SpatialL3Config:
     grounder_selection_mode: str = "argmax"
     grounder_landmark_queries: bool = False
     grounder_geometry_fallback: bool = False
+    #: Organize the existing Navigation Memory injection point as an ordered
+    #: instruction plan.  Landmarks with a verified fact keep that fact;
+    #: landmarks without one keep only verbatim instruction semantics.  This
+    #: is an opt-in so D/E/F keep their previously measured prompt shape.
+    grounder_ordered_landmark_memory: bool = False
     geometry: GeometryConfig = field(default_factory=GeometryConfig)
 
     def __post_init__(self) -> None:
@@ -105,6 +110,7 @@ class SpatialL3Config:
         for name in (
             "rgb_sidecar_enabled", "instance_grounder_enabled",
             "grounder_landmark_queries", "grounder_geometry_fallback",
+            "grounder_ordered_landmark_memory",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"spatial_l3.{name} must be a boolean")
@@ -128,6 +134,22 @@ class SpatialL3Config:
                 "spatial_l3.grounder_geometry_fallback requires "
                 "grounder_selection_mode=eligible"
             )
+        if self.grounder_ordered_landmark_memory:
+            if self.grounder_selection_mode != "eligible":
+                raise ValueError(
+                    "spatial_l3.grounder_ordered_landmark_memory requires "
+                    "grounder_selection_mode=eligible"
+                )
+            if not self.grounder_landmark_queries:
+                raise ValueError(
+                    "spatial_l3.grounder_ordered_landmark_memory requires "
+                    "grounder_landmark_queries"
+                )
+            if not self.instance_grounder_enabled:
+                raise ValueError(
+                    "spatial_l3.grounder_ordered_landmark_memory requires "
+                    "instance_grounder_enabled"
+                )
         for name in (
             "grounder_checkpoint", "grounder_config", "grounder_device",
             "grounder_bert_vocab_path",

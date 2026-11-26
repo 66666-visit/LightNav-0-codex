@@ -161,6 +161,7 @@ def test_grounder_ablation_defaults_are_the_original_argmax_path() -> None:
     assert spatial.grounder_selection_mode == "argmax"
     assert spatial.grounder_landmark_queries is False
     assert spatial.grounder_geometry_fallback is False
+    assert spatial.grounder_ordered_landmark_memory is False
 
 
 def test_grounder_ablation_flags_are_independently_enableable() -> None:
@@ -189,6 +190,15 @@ def test_grounder_ablation_flags_are_independently_enableable() -> None:
     ])).memory.spatial_l3
     assert fallback.grounder_geometry_fallback is True
 
+    ordered = config_from_args(parser.parse_args([
+        *_grounder_ablation_base(),
+        "--spatial_l3_grounder_selection", "eligible",
+        "--spatial_l3_grounder_landmark_queries",
+        "--spatial_l3_grounder_geometry_fallback",
+        "--spatial_l3_grounder_ordered_landmarks",
+    ])).memory.spatial_l3
+    assert ordered.grounder_ordered_landmark_memory is True
+
 
 def test_landmark_or_fallback_require_eligible_selection() -> None:
     base = {
@@ -200,6 +210,11 @@ def test_landmark_or_fallback_require_eligible_selection() -> None:
         SpatialL3Config(**{**base, "grounder_landmark_queries": True})
     with pytest.raises(ValueError, match="grounder_selection_mode=eligible"):
         SpatialL3Config(**{**base, "grounder_geometry_fallback": True})
+    with pytest.raises(ValueError, match="grounder_landmark_queries"):
+        SpatialL3Config(**{
+            **base, "grounder_selection_mode": "eligible",
+            "grounder_ordered_landmark_memory": True,
+        })
 
 
 def test_protocol_records_joint_grounding_and_geometry_fallback() -> None:
@@ -210,6 +225,7 @@ def test_protocol_records_joint_grounding_and_geometry_fallback() -> None:
         grounder_selection_mode="eligible",
         grounder_landmark_queries=True,
         grounder_geometry_fallback=True,
+        grounder_ordered_landmark_memory=True,
     ))
     block = build_prompt_protocol(config)["budget"]["on_demand_l3"]
     assert block["retrieval"] == "spatial_graph_adapter+vil3dref_student"
@@ -218,3 +234,4 @@ def test_protocol_records_joint_grounding_and_geometry_fallback() -> None:
     assert block["eligible_proposal_selection"] is True
     assert block["landmark_queries"] is True
     assert block["geometry_fallback"] == "original SpatialGraphAdapter items"
+    assert block["ordered_landmark_memory"] is True

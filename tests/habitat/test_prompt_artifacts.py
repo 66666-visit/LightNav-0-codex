@@ -403,3 +403,66 @@ def test_prompt_diagnostic_row_counts_on_demand_l3_items_and_query_stats() -> No
     assert row["l3_item_count"] == 2
     assert row["spatial_l3"]["l3_query"]["candidates"][0]["object_id"] == "o1"
     assert row["spatial_l3"]["l3_query_stats"]["query_trigger_rate"] == 1.0
+
+
+def test_prompt_diagnostic_row_flattens_ordered_landmark_fields() -> None:
+    landmarks = [{
+        "landmark_order": 4,
+        "landmark_role": "final",
+        "landmark_phrase": "two stairs",
+        "grounding_query": "two stairs",
+        "grounder_proposal_count": 3,
+        "eligible_candidate_count": 1,
+        "selected_object_id": "object-stairs",
+        "evidence_ids": ["ev-stairs"],
+        "geometry_fallback_attempted": False,
+        "geometry_fallback_reason": None,
+        "selection_source": "vil3dref_grounding",
+        "actual_injection": True,
+        "actual_injected_evidence_ids": ["ev-stairs"],
+        "included_in_prompt": True,
+        "spatial_fact_included": True,
+    }]
+    row = prompt_diagnostic_row(
+        {
+            "step": 38,
+            "prompt_mode": "l1_original_only",
+            "prompt_protocol_version": "l1_l3_prompt_ablation_v1",
+            "prompt_context": {
+                "source": "l3_geometry_on_demand",
+                "layers": {
+                    "l1": {"item_count": 0, "build_status": "no_candidates"},
+                    "l3_on_demand": {"item_count": 4, "trigger": "no_candidates"},
+                },
+                "spatial_l3": {
+                    "context_source": "l3_geometry_on_demand",
+                    "l3_query": {
+                        "query_executed": True,
+                        "landmark_role": "final",
+                        "landmark_order": 4,
+                        "landmark_phrase": "two stairs",
+                        "grounder_proposal_count": 3,
+                        "eligible_candidate_count": 1,
+                        "geometry_fallback_attempted": False,
+                        "selected_object_id": "object-stairs",
+                        "evidence_ids": ["ev-stairs"],
+                        "selection_source": "vil3dref_grounding",
+                        "ordered_landmarks": landmarks,
+                        "actual_injection": True,
+                        "actual_injected_evidence_ids": ["ev-stairs"],
+                    },
+                },
+            },
+        },
+        episode_id="ep", habitat_episode_id="1012", scene_id="s",
+    )
+    assert row["l3_landmark_role"] == "final"
+    assert row["l3_landmark_order"] == 4
+    assert row["l3_landmark_phrase"] == "two stairs"
+    assert row["l3_grounder_proposal_count"] == 3
+    assert row["l3_eligible_candidate_count"] == 1
+    assert row["l3_geometry_fallback_attempted"] is False
+    assert row["l3_selected_object_id"] == "object-stairs"
+    assert row["l3_evidence_ids"] == ["ev-stairs"]
+    assert row["l3_selection_source"] == "vil3dref_grounding"
+    assert row["l3_ordered_landmarks"] == landmarks

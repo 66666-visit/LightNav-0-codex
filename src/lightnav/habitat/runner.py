@@ -874,6 +874,24 @@ def _trace_distance(info: dict[str, Any]) -> float | None:
     return distance if math.isfinite(distance) else None
 
 
+def _trace_decoded_stop(policy_info: dict[str, Any]) -> bool | None:
+    """Evaluator-side view of the decoded trajectory: every waypoint is zero.
+
+    This reads the same ``predicted_traj`` the policy already produced.  It
+    never changes the action or the action interface.
+    """
+    traj = policy_info.get("predicted_traj")
+    if traj is None:
+        return None
+    try:
+        values = np.asarray(traj, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if values.ndim != 2 or values.shape[1] != 3 or not np.isfinite(values).all():
+        return None
+    return bool(np.all(np.abs(values) <= 1e-6))
+
+
 def _trace_prompt(policy: Any, *, forced_stop: bool) -> tuple[str | None, str]:
     if forced_stop:
         return None, "forced_stop_no_inference"
@@ -932,6 +950,14 @@ def _trace_l3_memory_fields(
         "grounding_query": None,
         "selected_object_ids": [],
         "geometry_fallback_reason": None,
+        "landmark_role": None,
+        "landmark_order": None,
+        "landmark_phrase": None,
+        "grounder_proposal_count": None,
+        "eligible_candidate_count": None,
+        "geometry_fallback_attempted": None,
+        "selection_source": None,
+        "landmark_rows": [],
     }
     if not isinstance(diagnostic, dict):
         return fields
@@ -960,6 +986,24 @@ def _trace_l3_memory_fields(
         )
         fields["geometry_fallback_reason"] = l3_query.get(
             "geometry_fallback_reason"
+        )
+        fields["landmark_role"] = l3_query.get("landmark_role")
+        fields["landmark_order"] = l3_query.get("landmark_order")
+        fields["landmark_phrase"] = l3_query.get("landmark_phrase")
+        fields["grounder_proposal_count"] = l3_query.get(
+            "grounder_proposal_count"
+        )
+        fields["eligible_candidate_count"] = l3_query.get(
+            "eligible_candidate_count"
+        )
+        fields["geometry_fallback_attempted"] = l3_query.get(
+            "geometry_fallback_attempted"
+        )
+        fields["selection_source"] = l3_query.get("selection_source")
+        fields["landmark_rows"] = list(
+            l3_query.get("ordered_landmarks")
+            or l3_query.get("landmark_rows")
+            or []
         )
         if l3_query.get("actual_injection") is not None:
             fields["actual_injection"] = l3_query.get("actual_injection")
@@ -1458,6 +1502,23 @@ def run_habitat_eval(
                             "geometry_fallback_reason": memory_fields[
                                 "geometry_fallback_reason"
                             ],
+                            "landmark_role": memory_fields["landmark_role"],
+                            "landmark_order": memory_fields["landmark_order"],
+                            "landmark_phrase": memory_fields["landmark_phrase"],
+                            "grounder_proposal_count": memory_fields[
+                                "grounder_proposal_count"
+                            ],
+                            "eligible_candidate_count": memory_fields[
+                                "eligible_candidate_count"
+                            ],
+                            "geometry_fallback_attempted": memory_fields[
+                                "geometry_fallback_attempted"
+                            ],
+                            "selection_source": memory_fields["selection_source"],
+                            "landmark_rows": memory_fields["landmark_rows"],
+                            "decoded_stop_decision": _trace_decoded_stop(
+                                visible_info
+                            ),
                             "history_frame_ids": (
                                 list(agent._history_frame_ids) if agent is not None
                                 and hasattr(agent, "_history_frame_ids") else None
@@ -1527,6 +1588,12 @@ def run_habitat_eval(
                             "wrong_turn": None,
                             "terminated": bool(terminated),
                             "truncated": bool(truncated),
+                            "stop_called": bool(info.get("is_stop_called", False)),
+                            "stop_decision": (
+                                "stop" if info.get("is_stop_called", False)
+                                else "continue" if not (terminated or truncated)
+                                else "episode_end_without_stop"
+                            ),
                         })
                         with trace_jsonl.open("a", encoding="utf-8") as trace_file:
                             trace_file.write(json.dumps(make_json_safe(trace_row), ensure_ascii=False) + "\n")

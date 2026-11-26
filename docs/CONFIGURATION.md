@@ -346,6 +346,7 @@ the WebSocket inference server has no RGB-D map interface.
 | `--spatial_l3_grounder_selection` | `argmax` | `argmax` is the original d659e57 one-full-instruction/global-argmax path. `eligible` enables joint proposal → ObjectNode → Evidence → formatable-fact filtering (ablation D/E/F) |
 | `--spatial_l3_grounder_landmark_queries` | off | Parse the original instruction once per Episode and send each verbatim target/reference phrase to ViL3DRel. Requires `--spatial_l3_grounder_selection eligible` (ablation E/F). The complete original instruction is still passed to LightNav unchanged |
 | `--spatial_l3_grounder_geometry_fallback` | off | When eligible Grounding cannot map a landmark, reuse the unchanged `SpatialGraphAdapter` item for that same landmark. Requires `eligible` (ablation F). A full-instruction query uses the original bounded geometry fallback |
+| `--spatial_l3_grounder_ordered_landmarks` | off | Organize the existing `[Navigation Memory]` block as the ordered instruction plan. Every landmark keeps its verbatim phrase, role and instruction order; a real spatial fact is added only for a landmark with a selected `SpatialGraphAdapter` item. Requires `--spatial_l3_grounder_selection eligible`, `--spatial_l3_grounder_landmark_queries` and `--spatial_l3_instance_grounder` (ablation G for 1012) |
 | `--adaptive_l3_query` | off | Opt-in Adaptive L3 Query arm: a local controller decides whether to query L3 on any step, not only when L1 is empty |
 | `--adaptive_l3_query_max_new_tokens` | `24` | Maximum decoded tokens for one local controller decision |
 | `--adaptive_l3_query_max_query_chars` | `256` | Maximum characters of a controller-produced CLIP query |
@@ -392,7 +393,14 @@ the existing Prompt character/Token budget. With
 `--spatial_l3_grounder_geometry_fallback`, a failed landmark reuses its own
 existing `SpatialGraphAdapter` item; a full-instruction query uses the original
 bounded geometry fallback. Without it, a failed query keeps the original L1
-Prompt. The checkpoint, BERT vocab and compiled extension must be local;
+Prompt. With `--spatial_l3_grounder_ordered_landmarks`, those selected facts are
+organized as an ordered instruction plan at the existing Prompt insertion point:
+a compact semantic line is reserved for every landmark, so a structural
+landmark whose detector class is absent (for example `doorway`/`stairs` under
+COCO) is still represented without invented coordinates; remaining characters
+enrich `final > transition > intermediate > source > reference` landmarks with
+their real stored facts. This is ablation G, used only for the 1012 diagnostic.
+The checkpoint, BERT vocab and compiled extension must be local;
 inference never downloads anything. Install the small official-model dependencies with
 `pip install -e ".[vil3dref]"` (the CUDA-enabled torch is provided by the
 existing inference environment). Build the extension with the same Python/torch

@@ -175,6 +175,7 @@ proposal_id -> persistent_object_id -> evidence_ids -> formatable LayerMemoryIte
 | D | 联合候选筛选 | C + `--spatial_l3_grounder_selection eligible` |
 | E | 联合筛选 + 多地标查询 | D + `--spatial_l3_grounder_landmark_queries` |
 | F | 联合筛选 + 多地标 + Geometry fallback | E + `--spatial_l3_grounder_geometry_fallback` |
+| G | F + 有序地标记忆（仅 1012 诊断） | F + `--spatial_l3_grounder_ordered_landmarks`；见 [ORDERED_LANDMARK_MEMORY_1012.md](ORDERED_LANDMARK_MEMORY_1012.md) |
 
 默认值故意是 C，保证不显式加 flag 时不会把旧 ViL3DRel 实验静默改成新算法。
 `landmark_queries` / `geometry_fallback` 在 config 层强制要求

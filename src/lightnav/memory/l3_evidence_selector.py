@@ -33,7 +33,10 @@ from lightnav.memory.schemas import LayerMemoryItem
 from lightnav.memory.v3_retrieval import _terms
 
 #: Category aliases for instance identity.  Only subtype/generic relations are
-#: aliased; dining table and coffee table stay distinct.
+#: aliased; dining table and coffee table stay distinct.  Structural passage
+#: synonyms are included because COCO/ScanNet-style detectors may emit
+#: ``door``/``staircase`` while the instruction says ``doorway``/``stairs``;
+#: these name the same instruction landmark, not a different object category.
 _CATEGORY_ALIASES = {
     "armchair": "chair",
     "armchairs": "chair",
@@ -43,6 +46,12 @@ _CATEGORY_ALIASES = {
     "tv": "television",
     "tvs": "television",
     "televisions": "television",
+    "doorway": "door",
+    "doorways": "door",
+    "staircase": "stair",
+    "staircases": "stair",
+    "stairway": "stair",
+    "stairways": "stair",
 }
 
 
@@ -271,6 +280,85 @@ def choose_first_eligible(
     return None
 
 
+@dataclass(frozen=True)
+class GeometryFallbackResult:
+    """Explicit outcome of the same-category Geometry On-demand fallback.
+
+    ``reason`` is populated even when fallback is disabled or no candidate
+    exists, so a diagnostic can distinguish "not attempted" from "attempted but
+    no same-category item" from "item selected".
+    """
+
+    item: LayerMemoryItem | None
+    attempted: bool
+    reason: str | None
+    same_category_item_count: int = 0
+    available_item_count: int = 0
+
+    @property
+    def selected(self) -> bool:
+        return self.item is not None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempted": self.attempted,
+            "reason": self.reason,
+            "selected_object_id": (
+                self.item.metadata.get("object_id")
+                if self.item is not None else None
+            ),
+            "same_category_item_count": self.same_category_item_count,
+            "available_item_count": self.available_item_count,
+        }
+
+
+def resolve_geometry_fallback(
+    items: Sequence[LayerMemoryItem],
+    *,
+    target_object: str | None,
+    selected_object_ids: Iterable[str] = (),
+    enabled: bool = True,
+) -> GeometryFallbackResult:
+    """Choose the original adapter item for one landmark, with an explicit reason.
+
+    This is still a *selection* over the unchanged ``SpatialGraphAdapter.build``
+    output.  It never re-runs geometry, changes the adapter order, or relaxes
+    the category check.  A cross-category item is never returned.
+    """
+    if not enabled:
+        return GeometryFallbackResult(None, False, "fallback_disabled")
+    if target_object is None:
+        return GeometryFallbackResult(None, False, "no_landmark_target")
+    if not items:
+        return GeometryFallbackResult(None, True, "no_formatable_geometry_item")
+    matching = [
+        item for item in items
+        if label_matches_target(item.label, target_object)
+    ]
+    if not matching:
+        return GeometryFallbackResult(
+            None, True, "no_same_category_geometry_item",
+            same_category_item_count=0,
+        )
+    selected = set(selected_object_ids)
+    available = [
+        item for item in matching
+        if isinstance(item.metadata.get("object_id"), str)
+        and item.metadata.get("object_id") not in selected
+    ]
+    if not available:
+        return GeometryFallbackResult(
+            None, True, "same_category_already_injected",
+            same_category_item_count=len(matching),
+            available_item_count=0,
+        )
+    return GeometryFallbackResult(
+        available[0], True, None,
+        same_category_item_count=len(matching),
+        available_item_count=len(available),
+    )
+
+
 def geometry_fallback_item(
     items: Sequence[LayerMemoryItem],
     *,
@@ -282,17 +370,23 @@ def geometry_fallback_item(
     ``items`` is the unchanged ``SpatialGraphAdapter.build`` output, already
     ordered by the original adapter.  This only chooses one of those existing
     facts; it never re-runs or re-implements geometry retrieval.
+
+    ``target_object=None`` keeps the original full-instruction behaviour: the
+    first unselected adapter item is used.  Landmark queries always pass a
+    target object, so they can never cross categories by accident.
     """
-    selected = set(selected_object_ids)
-    for item in items:
-        object_id = item.metadata.get("object_id")
-        if not isinstance(object_id, str) or object_id in selected:
-            continue
-        if target_object is None or label_matches_target(
-            item.label, target_object,
-        ):
-            return item
-    return None
+    if target_object is None:
+        selected = set(selected_object_ids)
+        for item in items:
+            object_id = item.metadata.get("object_id")
+            if isinstance(object_id, str) and object_id not in selected:
+                return item
+        return None
+    return resolve_geometry_fallback(
+        items,
+        target_object=target_object,
+        selected_object_ids=selected_object_ids,
+    ).item
 
 
 def render_context(
@@ -320,6 +414,7 @@ def render_context(
 
 
 __all__ = [
+    "GeometryFallbackResult",
     "ProposalEligibility",
     "build_proposal_eligibility",
     "choose_first_eligible",
@@ -329,4 +424,5 @@ __all__ = [
     "label_relevant_to_instruction",
     "normalized_label_terms",
     "render_context",
+    "resolve_geometry_fallback",
 ]

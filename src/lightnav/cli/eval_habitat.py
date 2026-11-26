@@ -330,6 +330,14 @@ def build_parser() -> argparse.ArgumentParser:
              "SpatialGraphAdapter candidates. Requires selection eligible.",
     )
     p.add_argument(
+        "--spatial_l3_grounder_ordered_landmarks",
+        action=argparse.BooleanOptionalAction, default=False,
+        help="Organize the existing Navigation Memory as an ordered instruction "
+             "plan. Landmarks with a verified fact keep the real spatial fact; "
+             "landmarks without one keep only verbatim instruction semantics. "
+             "Requires eligible selection, landmark queries and the grounder.",
+    )
+    p.add_argument(
         "--adaptive_l3_query", action="store_true",
         help="Enable the opt-in Adaptive L3 Query controller on the original L1 path. "
              "Requires --spatial_l3_mode shadow and a local --spatial_l3_clip_model_path.",
@@ -561,6 +569,9 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                 ),
                 grounder_geometry_fallback=(
                     args.spatial_l3_grounder_geometry_fallback
+                ),
+                grounder_ordered_landmark_memory=(
+                    args.spatial_l3_grounder_ordered_landmarks
                 ),
                 geometry=GeometryConfig(**{
                     name: getattr(args, f"spatial_l3_{name}") for name in (
