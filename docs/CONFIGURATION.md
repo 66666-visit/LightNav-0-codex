@@ -347,6 +347,8 @@ the WebSocket inference server has no RGB-D map interface.
 | `--spatial_l3_grounder_landmark_queries` | off | Parse the original instruction once per Episode and send each verbatim target/reference phrase to ViL3DRel. Requires `--spatial_l3_grounder_selection eligible` (ablation E/F). The complete original instruction is still passed to LightNav unchanged |
 | `--spatial_l3_grounder_geometry_fallback` | off | When eligible Grounding cannot map a landmark, reuse the unchanged `SpatialGraphAdapter` item for that same landmark. Requires `eligible` (ablation F). A full-instruction query uses the original bounded geometry fallback |
 | `--spatial_l3_grounder_ordered_landmarks` | off | Organize the existing `[Navigation Memory]` block as the ordered instruction plan. Every landmark keeps its verbatim phrase, role and instruction order; a real spatial fact is added only for a landmark with a selected `SpatialGraphAdapter` item. Requires `--spatial_l3_grounder_selection eligible`, `--spatial_l3_grounder_landmark_queries` and `--spatial_l3_instance_grounder` (ablation G for 1012) |
+| `--spatial_l3_grounder_include_missing_landmark_placeholders` | on | H1/H3 rendering switch. With `--spatial_l3_grounder_ordered_landmarks`, keep (default) or omit the coordinate-free `no 3D evidence` skeleton/`Plan:` lines for landmarks without a verified fact. Omitting them releases that budget to real fact lines; `ordered_memory_rendering` in the L3 diagnostic records the resulting line/fact/placeholder counts. Requires ordered landmarks |
+| `--spatial_l3_grounder_preserve_original_spatial_fact` | off | H2/H3 rendering switch. With `--spatial_l3_grounder_ordered_landmarks`, keep G's role/phrase prefix but render the fact body with F's original `render_context` sentence (coordinates, straight-line range, bearing sign, observation count, source, `passage unknown`) instead of G's compact sentence. Requires ordered landmarks |
 | `--adaptive_l3_query` | off | Opt-in Adaptive L3 Query arm: a local controller decides whether to query L3 on any step, not only when L1 is empty |
 | `--adaptive_l3_query_max_new_tokens` | `24` | Maximum decoded tokens for one local controller decision |
 | `--adaptive_l3_query_max_query_chars` | `256` | Maximum characters of a controller-produced CLIP query |
@@ -400,6 +402,21 @@ landmark whose detector class is absent (for example `doorway`/`stairs` under
 COCO) is still represented without invented coordinates; remaining characters
 enrich `final > transition > intermediate > source > reference` landmarks with
 their real stored facts. This is ablation G, used only for the 1012 diagnostic.
+
+The two rendering switches isolate the three changes G introduced. The default
+pair (placeholders on, G facts) is byte-identical to G.
+`--no-spatial_l3_grounder_include_missing_landmark_placeholders` is H1: no
+landmark without a selected fact contributes a skeleton or `Plan:` line, so the
+freed characters can carry additional real facts.
+`--spatial_l3_grounder_preserve_original_spatial_fact` is H2: placeholders,
+roles, order and the selection pipeline stay unchanged, but each fact body is
+F's exact `render_context` sentence rather than G's re-templated sentence.
+Enabling both is H3. The L3 diagnostic records
+`ordered_memory_rendering` with the effective switches and the rendered
+fact/placeholder line counts, so a budget-selection difference is never silent.
+Candidate filtering, Evidence IDs, fact enrichment order, map updates, query
+frequency and Grounding are not changed by either switch.
+
 The checkpoint, BERT vocab and compiled extension must be local;
 inference never downloads anything. Install the small official-model dependencies with
 `pip install -e ".[vil3dref]"` (the CUDA-enabled torch is provided by the

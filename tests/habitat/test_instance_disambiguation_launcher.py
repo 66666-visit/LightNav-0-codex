@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO_ROOT / "scripts" / "run_instance_disambiguation_4.sh"
 
@@ -86,6 +88,9 @@ def test_launcher_dry_run_resolves_four_exact_ids_without_gpu(tmp_path: Path) ->
         "grounder_selection_mode": "eligible",
         "grounder_landmark_queries": True,
         "grounder_geometry_fallback": True,
+        "ordered_landmark_memory": False,
+        "include_missing_landmark_placeholders": True,
+        "preserve_original_spatial_fact": False,
     }
     assert resolved["frozen"]["episodes_per_run"] == 1
     selection = json.loads(
@@ -101,3 +106,33 @@ def test_launcher_never_treats_episode_001_as_habitat_id_1(tmp_path: Path) -> No
     assert result.returncode != 0
     combined = result.stderr + result.stdout
     assert "matches=0" in combined or "exactly one manifest row" in combined
+
+
+@pytest.mark.parametrize(
+    ("group", "placeholders", "original_fact"),
+    [("H1", False, False), ("H2", True, True), ("H3", False, True)],
+)
+def test_launcher_wires_h1_h2_h3_switches(
+    tmp_path: Path, group: str, placeholders: bool, original_fact: bool,
+) -> None:
+    env = _assets(tmp_path, _rows(["487", "168", "1080", "1012"]))
+    env["ABLATION_GROUP"] = group
+    result = _run(tmp_path, env, f"out_{group}")
+    assert result.returncode == 0, result.stderr + result.stdout
+    resolved = json.loads(
+        (tmp_path / f"out_{group}" / f"group_{group}"
+         / "resolved_config.json").read_text()
+    )
+    ablation = resolved["ablation"]
+    assert ablation["id"] == group
+    assert ablation["ordered_landmark_memory"] is True
+    assert ablation["include_missing_landmark_placeholders"] is placeholders
+    assert ablation["preserve_original_spatial_fact"] is original_fact
+    assert resolved["flags"] == {
+        "spatial_l3_grounder_selection": "eligible",
+        "spatial_l3_grounder_landmark_queries": True,
+        "spatial_l3_grounder_geometry_fallback": True,
+        "spatial_l3_grounder_ordered_landmarks": True,
+        "spatial_l3_grounder_include_missing_landmark_placeholders": placeholders,
+        "spatial_l3_grounder_preserve_original_spatial_fact": original_fact,
+    }

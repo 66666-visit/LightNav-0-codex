@@ -7,24 +7,28 @@
 # fallback.  The four selected Episodes are run one at a time through the
 # existing Habitat server single-Episode selection; no 88-Episode run starts.
 #
-# ABLATION_GROUP selects one of the three pre-registered arms:
-#   D = eligible selection, landmark queries OFF, geometry fallback OFF
-#   E = eligible selection, landmark queries ON,  geometry fallback OFF
-#   F = eligible selection, landmark queries ON,  geometry fallback ON
+# ABLATION_GROUP selects one of the pre-registered arms:
+#   D  = eligible selection, landmark queries OFF, geometry fallback OFF
+#   E  = eligible selection, landmark queries ON,  geometry fallback OFF
+#   F  = eligible selection, landmark queries ON,  geometry fallback ON
+#   G  = F + ordered landmark memory (placeholders + G compact facts)
+#   H1 = G with no no-Evidence placeholder lines (G facts only)
+#   H2 = G with F's original render_context fact sentence (placeholders on)
+#   H3 = H1 + H2 (F fact sentence, no no-Evidence placeholders)
 # F is the default and reproduces the launcher's previous flags exactly, so an
 # invocation without ABLATION_GROUP keeps the old experiment's behaviour.
 #
-# Every arm writes under OUTPUT_ROOT/group_<G>, so D, E and F never overwrite
-# each other.  resolved_config.json records the effective group, the three
-# grounder switches and the complete client argument string.  Top-level
+# Every arm writes under OUTPUT_ROOT/group_<G>, so arms never overwrite each
+# other.  resolved_config.json records the effective group, all rendering
+# switches and the complete client argument string.  Top-level
 # resolved_config.json / four_episode_selection.json are compatibility copies
 # of the arm's files; the files inside group_<G> are authoritative.
 #
-# --self-test (or SELF_TEST=1) runs the CPU-only D/E/F dry-run matrix.  It uses
-# temporary dummy assets, never starts a server/GPU/Habitat process, and checks
-# the resolved flags, exact Episode keys and group-specific output roots.
-# DRY_RUN=1 performs CPU-only validation and prints the resolved commands; it
-# does not start a server, client or GPU process.
+# --self-test (or SELF_TEST=1) runs the CPU-only D/E/F/G/H1/H2/H3 dry-run
+# matrix.  It uses temporary dummy assets, never starts a server/GPU/Habitat
+# process, and checks the resolved flags, exact Episode keys and group-specific
+# output roots.  DRY_RUN=1 performs CPU-only validation and prints the resolved
+# commands; it does not start a server, client or GPU process.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,6 +37,11 @@ cd "$REPO_ROOT"
 parse_ablation_group() {
     ABLATION_GROUP=${ABLATION_GROUP:-F}
     ABLATION_GROUP=${ABLATION_GROUP^^}
+    # D/E/F keep ordered memory off.  G/H1/H2/H3 enable it and differ only in
+    # the two independent rendering switches.
+    ORDERED_LANDMARKS=0
+    INCLUDE_MISSING_PLACEHOLDERS=1
+    PRESERVE_ORIGINAL_SPATIAL_FACT=0
     case "$ABLATION_GROUP" in
         D)
             GROUNDER_SELECTION=eligible
@@ -49,8 +58,36 @@ parse_ablation_group() {
             GROUNDER_LANDMARK_QUERIES=1
             GROUNDER_GEOMETRY_FALLBACK=1
             ;;
+        G)
+            GROUNDER_SELECTION=eligible
+            GROUNDER_LANDMARK_QUERIES=1
+            GROUNDER_GEOMETRY_FALLBACK=1
+            ORDERED_LANDMARKS=1
+            ;;
+        H1)
+            GROUNDER_SELECTION=eligible
+            GROUNDER_LANDMARK_QUERIES=1
+            GROUNDER_GEOMETRY_FALLBACK=1
+            ORDERED_LANDMARKS=1
+            INCLUDE_MISSING_PLACEHOLDERS=0
+            ;;
+        H2)
+            GROUNDER_SELECTION=eligible
+            GROUNDER_LANDMARK_QUERIES=1
+            GROUNDER_GEOMETRY_FALLBACK=1
+            ORDERED_LANDMARKS=1
+            PRESERVE_ORIGINAL_SPATIAL_FACT=1
+            ;;
+        H3)
+            GROUNDER_SELECTION=eligible
+            GROUNDER_LANDMARK_QUERIES=1
+            GROUNDER_GEOMETRY_FALLBACK=1
+            ORDERED_LANDMARKS=1
+            INCLUDE_MISSING_PLACEHOLDERS=0
+            PRESERVE_ORIGINAL_SPATIAL_FACT=1
+            ;;
         *)
-            echo "[instance_disambiguation] ERROR: ABLATION_GROUP must be one of D, E, F (got '$ABLATION_GROUP')" >&2
+            echo "[instance_disambiguation] ERROR: ABLATION_GROUP must be one of D, E, F, G, H1, H2, H3 (got '$ABLATION_GROUP')" >&2
             exit 2
             ;;
     esac
@@ -109,8 +146,8 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump({"episodes": rows}, handle, indent=2)
 PY
 
-    local group out_base group_root log landmark_label fallback_label
-    for group in D E F; do
+    local group out_base group_root log ordered_label placeholder_label fact_label
+    for group in D E F G H1 H2 H3; do
         out_base="$tmp/out_$group"
         log="$tmp/group_$group.log"
         if ! (
@@ -157,10 +194,14 @@ from pathlib import Path
 
 resolved_path, group, group_root, base_root = sys.argv[1:5]
 resolved = json.loads(Path(resolved_path).read_text(encoding="utf-8"))
-landmark, fallback = {
-    "D": (False, False),
-    "E": (True, False),
-    "F": (True, True),
+landmark, fallback, ordered, placeholders, original_fact = {
+    "D": (False, False, False, True, False),
+    "E": (True, False, False, True, False),
+    "F": (True, True, False, True, False),
+    "G": (True, True, True, True, False),
+    "H1": (True, True, True, False, False),
+    "H2": (True, True, True, True, True),
+    "H3": (True, True, True, False, True),
 }[group]
 episode_ids = ["487", "168", "1080", "1012"]
 expected_keys = [
@@ -174,10 +215,19 @@ assert resolved["ablation"]["id"] == group
 assert resolved["ablation"]["grounder_selection_mode"] == "eligible"
 assert resolved["ablation"]["grounder_landmark_queries"] is landmark
 assert resolved["ablation"]["grounder_geometry_fallback"] is fallback
+assert resolved["ablation"]["ordered_landmark_memory"] is ordered
+assert (
+    resolved["ablation"]["include_missing_landmark_placeholders"]
+    is placeholders
+)
+assert resolved["ablation"]["preserve_original_spatial_fact"] is original_fact
 assert resolved["flags"] == {
     "spatial_l3_grounder_selection": "eligible",
     "spatial_l3_grounder_landmark_queries": landmark,
     "spatial_l3_grounder_geometry_fallback": fallback,
+    "spatial_l3_grounder_ordered_landmarks": ordered,
+    "spatial_l3_grounder_include_missing_landmark_placeholders": placeholders,
+    "spatial_l3_grounder_preserve_original_spatial_fact": original_fact,
 }
 assert resolved["episode_key"] == [
     "scene_basename", "habitat_episode_id", "rollout_idx",
@@ -208,6 +258,31 @@ for flag, enabled in (
 ):
     assert (flag in tokens) is enabled, (group, flag, tokens)
     assert (f"--no-{flag[2:]}" in tokens) is (not enabled), (group, flag, tokens)
+if ordered:
+    assert "--spatial_l3_grounder_ordered_landmarks" in tokens, (
+        group, tokens
+    )
+    assert "--no-spatial_l3_grounder_ordered_landmarks" not in tokens, (
+        group, tokens
+    )
+else:
+    assert "--spatial_l3_grounder_ordered_landmarks" not in tokens, (
+        group, tokens
+    )
+    assert "--no-spatial_l3_grounder_ordered_landmarks" not in tokens, (
+        group, tokens
+    )
+if ordered:
+    for flag, enabled in (
+        ("--spatial_l3_grounder_include_missing_landmark_placeholders",
+         placeholders),
+        ("--spatial_l3_grounder_preserve_original_spatial_fact",
+         original_fact),
+    ):
+        assert (flag in tokens) is enabled, (group, flag, tokens)
+        assert (f"--no-{flag[2:]}" in tokens) is (not enabled), (
+            group, flag, tokens
+        )
 
 assert not any(
     path.is_dir() and path.name.startswith("episode_")
@@ -229,7 +304,18 @@ PY
             E) landmark_label=on; fallback_label=off ;;
             F) landmark_label=on; fallback_label=on ;;
         esac
-        echo "[instance_disambiguation] SELF_TEST PASS $group: selection=eligible landmark_queries=$landmark_label geometry_fallback=$fallback_label output=$group_root"
+        ordered_label=off; placeholder_label=none; fact_label=g
+        case "$group" in
+            G) ordered_label=on; placeholder_label=on; fact_label=g ;;
+            H1) ordered_label=on; placeholder_label=off; fact_label=g ;;
+            H2) ordered_label=on; placeholder_label=on; fact_label=f ;;
+            H3) ordered_label=on; placeholder_label=off; fact_label=f ;;
+        esac
+        if [ "$ordered_label" = "on" ]; then
+            echo "[instance_disambiguation] SELF_TEST PASS $group: selection=eligible landmark_queries=on geometry_fallback=on ordered=on placeholders=$placeholder_label facts=$fact_label output=$group_root"
+        else
+            echo "[instance_disambiguation] SELF_TEST PASS $group: selection=eligible landmark_queries=$landmark_label geometry_fallback=$fallback_label ordered=off output=$group_root"
+        fi
     done
 
     local invalid_log="$tmp/invalid_group.log"
@@ -242,7 +328,7 @@ PY
         echo "[instance_disambiguation] SELF_TEST FAIL: ABLATION_GROUP=C should be rejected" >&2
         return 1
     fi
-    if ! grep -q "ABLATION_GROUP must be one of D, E, F" "$invalid_log"; then
+    if ! grep -q "ABLATION_GROUP must be one of D, E, F, G, H1, H2, H3" "$invalid_log"; then
         cat "$invalid_log" >&2
         echo "[instance_disambiguation] SELF_TEST FAIL: invalid-group diagnostic missing" >&2
         return 1
@@ -312,7 +398,7 @@ PY
         return 1
     fi
 
-    echo "[instance_disambiguation] SELF_TEST PASS: D/E/F CPU dry-runs (no GPU, no Habitat)."
+    echo "[instance_disambiguation] SELF_TEST PASS: D/E/F/G/H1/H2/H3 CPU dry-runs (no GPU, no Habitat)."
     echo "[instance_disambiguation] SELF_TEST PASS: invalid group rejected, ambiguous episode ID rejected."
     rm -rf "$SELFTEST_TMP"
     trap - EXIT
@@ -402,6 +488,19 @@ if [ "$GROUNDER_GEOMETRY_FALLBACK" = "1" ]; then
 else
     GROUNDER_FLAG_ARGS+=" --no-spatial_l3_grounder_geometry_fallback"
 fi
+if [ "$ORDERED_LANDMARKS" = "1" ]; then
+    GROUNDER_FLAG_ARGS+=" --spatial_l3_grounder_ordered_landmarks"
+    if [ "$INCLUDE_MISSING_PLACEHOLDERS" = "1" ]; then
+        GROUNDER_FLAG_ARGS+=" --spatial_l3_grounder_include_missing_landmark_placeholders"
+    else
+        GROUNDER_FLAG_ARGS+=" --no-spatial_l3_grounder_include_missing_landmark_placeholders"
+    fi
+    if [ "$PRESERVE_ORIGINAL_SPATIAL_FACT" = "1" ]; then
+        GROUNDER_FLAG_ARGS+=" --spatial_l3_grounder_preserve_original_spatial_fact"
+    else
+        GROUNDER_FLAG_ARGS+=" --no-spatial_l3_grounder_preserve_original_spatial_fact"
+    fi
+fi
 
 BASE_CLIENT_ARGS="--trace_steps --no_force_stop --verbose \
   --memory_enabled --memory_strategy hierarchical \
@@ -434,6 +533,8 @@ python3 - "$EPISODE_SELECTION" "$EPISODE_MANIFEST_PATH" "$EPISODE_IDS" \
     "$GROUNDER_BERT_VOCAB" "$DATA_PATH" "$SCENES_DIR" "$CLIENT_PYTHON" \
     "$GROUP_OUTPUT_ROOT" "$DRY_RUN" "$ABLATION_GROUP" \
     "$GROUNDER_LANDMARK_QUERIES" "$GROUNDER_GEOMETRY_FALLBACK" \
+    "$ORDERED_LANDMARKS" "$INCLUDE_MISSING_PLACEHOLDERS" \
+    "$PRESERVE_ORIGINAL_SPATIAL_FACT" \
     "$BASE_CLIENT_ARGS" "$OUTPUT_BASE" "$BASE_SELECTION_PATH" \
     "$BASE_RESOLVED_PATH" "$GROUNDER_SELECTION" <<'PY'
 import json
@@ -441,9 +542,9 @@ import os
 import sys
 from pathlib import Path
 
-if len(sys.argv) != 25:
+if len(sys.argv) != 28:
     raise SystemExit(
-        "internal launcher error: expected 24 config arguments, "
+        "internal launcher error: expected 27 config arguments, "
         f"got {len(sys.argv) - 1}"
     )
 
@@ -467,34 +568,53 @@ if len(sys.argv) != 25:
     ablation_group,
     landmark_queries_raw,
     geometry_fallback_raw,
+    ordered_raw,
+    placeholders_raw,
+    original_fact_raw,
     client_args,
     base_output_root,
     base_selection_path,
     base_resolved_path,
     selection_mode,
-) = sys.argv[1:25]
+) = sys.argv[1:28]
 
 landmark_queries = str(landmark_queries_raw) == "1"
 geometry_fallback = str(geometry_fallback_raw) == "1"
+ordered_landmarks = str(ordered_raw) == "1"
+include_placeholders = str(placeholders_raw) == "1"
+preserve_original_fact = str(original_fact_raw) == "1"
 expected_group_flags = {
-    "D": (False, False),
-    "E": (True, False),
-    "F": (True, True),
+    "D": (False, False, False, True, False),
+    "E": (True, False, False, True, False),
+    "F": (True, True, False, True, False),
+    "G": (True, True, True, True, False),
+    "H1": (True, True, True, False, False),
+    "H2": (True, True, True, True, True),
+    "H3": (True, True, True, False, True),
 }
 if ablation_group not in expected_group_flags:
     raise SystemExit(
         f"unsupported ABLATION_GROUP in resolved config: {ablation_group!r}"
     )
-if (landmark_queries, geometry_fallback) != expected_group_flags[ablation_group]:
+if (
+    landmark_queries,
+    geometry_fallback,
+    ordered_landmarks,
+    include_placeholders,
+    preserve_original_fact,
+) != expected_group_flags[ablation_group]:
     raise SystemExit(
-        "ABLATION_GROUP and effective grounder flags disagree: "
+        "ABLATION_GROUP and effective rendering flags disagree: "
         f"group={ablation_group!r} "
         f"landmark_queries={landmark_queries} "
-        f"geometry_fallback={geometry_fallback}"
+        f"geometry_fallback={geometry_fallback} "
+        f"ordered={ordered_landmarks} "
+        f"placeholders={include_placeholders} "
+        f"preserve_original_fact={preserve_original_fact}"
     )
 if selection_mode != "eligible":
     raise SystemExit(
-        "D/E/F all require --spatial_l3_grounder_selection eligible, "
+        "all arms require --spatial_l3_grounder_selection eligible, "
         f"got {selection_mode!r}"
     )
 semantics_by_group = {
@@ -503,6 +623,16 @@ semantics_by_group = {
     "F": (
         "joint eligible selection + multi-landmark queries + "
         "same-category geometry fallback"
+    ),
+    "G": (
+        "F + ordered landmark memory (missing-Evidence placeholders + "
+        "compact G facts)"
+    ),
+    "H1": "G with include_missing_landmark_placeholders=False",
+    "H2": "G with preserve_original_spatial_fact=True",
+    "H3": (
+        "G with include_missing_landmark_placeholders=False and "
+        "preserve_original_spatial_fact=True"
     ),
 }
 
@@ -617,11 +747,21 @@ resolved = {
         "grounder_selection_mode": selection_mode,
         "grounder_landmark_queries": landmark_queries,
         "grounder_geometry_fallback": geometry_fallback,
+        "ordered_landmark_memory": ordered_landmarks,
+        "include_missing_landmark_placeholders": include_placeholders,
+        "preserve_original_spatial_fact": preserve_original_fact,
     },
     "flags": {
         "spatial_l3_grounder_selection": selection_mode,
         "spatial_l3_grounder_landmark_queries": landmark_queries,
         "spatial_l3_grounder_geometry_fallback": geometry_fallback,
+        "spatial_l3_grounder_ordered_landmarks": ordered_landmarks,
+        "spatial_l3_grounder_include_missing_landmark_placeholders": (
+            include_placeholders
+        ),
+        "spatial_l3_grounder_preserve_original_spatial_fact": (
+            preserve_original_fact
+        ),
     },
     "effective_client_args": client_args,
     "frozen": {
@@ -693,6 +833,10 @@ case "$ABLATION_GROUP" in
     D) ABLATION_LABEL="eligible selection, landmark queries OFF, geometry fallback OFF" ;;
     E) ABLATION_LABEL="eligible selection, landmark queries ON, geometry fallback OFF" ;;
     F) ABLATION_LABEL="eligible selection, landmark queries ON, geometry fallback ON" ;;
+    G) ABLATION_LABEL="F + ordered landmark memory (placeholders + G facts)" ;;
+    H1) ABLATION_LABEL="G with no missing-Evidence placeholder lines" ;;
+    H2) ABLATION_LABEL="G with F original render_context fact sentences" ;;
+    H3) ABLATION_LABEL="H1 + H2 (F facts, no placeholder lines)" ;;
 esac
 
 if [ "$DRY_RUN" = "1" ]; then

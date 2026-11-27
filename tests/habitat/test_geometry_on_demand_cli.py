@@ -235,3 +235,80 @@ def test_protocol_records_joint_grounding_and_geometry_fallback() -> None:
     assert block["landmark_queries"] is True
     assert block["geometry_fallback"] == "original SpatialGraphAdapter items"
     assert block["ordered_landmark_memory"] is True
+
+
+def test_ordered_rendering_switches_default_to_g_behavior() -> None:
+    parser = build_parser()
+    spatial = config_from_args(
+        parser.parse_args(_grounder_ablation_base())
+    ).memory.spatial_l3
+    assert spatial.include_missing_landmark_placeholders is True
+    assert spatial.preserve_original_spatial_fact is False
+
+
+def test_ordered_rendering_switches_are_independent_h1_h2_h3() -> None:
+    base = [
+        *_grounder_ablation_base(),
+        "--spatial_l3_grounder_selection", "eligible",
+        "--spatial_l3_grounder_landmark_queries",
+        "--spatial_l3_grounder_geometry_fallback",
+        "--spatial_l3_grounder_ordered_landmarks",
+    ]
+    parser = build_parser()
+
+    h1 = config_from_args(parser.parse_args([
+        *base,
+        "--no-spatial_l3_grounder_include_missing_landmark_placeholders",
+    ])).memory.spatial_l3
+    assert h1.include_missing_landmark_placeholders is False
+    assert h1.preserve_original_spatial_fact is False
+
+    h2 = config_from_args(parser.parse_args([
+        *base,
+        "--spatial_l3_grounder_preserve_original_spatial_fact",
+    ])).memory.spatial_l3
+    assert h2.include_missing_landmark_placeholders is True
+    assert h2.preserve_original_spatial_fact is True
+
+    h3 = config_from_args(parser.parse_args([
+        *base,
+        "--no-spatial_l3_grounder_include_missing_landmark_placeholders",
+        "--spatial_l3_grounder_preserve_original_spatial_fact",
+    ])).memory.spatial_l3
+    assert h3.include_missing_landmark_placeholders is False
+    assert h3.preserve_original_spatial_fact is True
+
+
+def test_ordered_rendering_switches_require_ordered_landmarks() -> None:
+    parser = build_parser()
+    with pytest.raises(ValueError, match="grounder_ordered_landmark_memory"):
+        config_from_args(parser.parse_args([
+            *_grounder_ablation_base(),
+            "--spatial_l3_grounder_selection", "eligible",
+            "--spatial_l3_grounder_landmark_queries",
+            "--no-spatial_l3_grounder_include_missing_landmark_placeholders",
+        ]))
+    with pytest.raises(ValueError, match="grounder_ordered_landmark_memory"):
+        config_from_args(parser.parse_args([
+            *_grounder_ablation_base(),
+            "--spatial_l3_grounder_selection", "eligible",
+            "--spatial_l3_grounder_landmark_queries",
+            "--spatial_l3_grounder_preserve_original_spatial_fact",
+        ]))
+
+
+def test_protocol_records_ordered_rendering_switches() -> None:
+    config = _config(spatial_l3=SpatialL3Config(
+        mode="geometry_on_demand", seg_model_path="/fake/seg.pt",
+        rgb_sidecar_enabled=True, instance_grounder_enabled=True,
+        grounder_checkpoint="/fake/student.pt", grounder_device="cpu",
+        grounder_selection_mode="eligible",
+        grounder_landmark_queries=True,
+        grounder_geometry_fallback=True,
+        grounder_ordered_landmark_memory=True,
+        include_missing_landmark_placeholders=False,
+        preserve_original_spatial_fact=True,
+    ))
+    block = build_prompt_protocol(config)["budget"]["on_demand_l3"]
+    assert block["include_missing_landmark_placeholders"] is False
+    assert block["preserve_original_spatial_fact"] is True

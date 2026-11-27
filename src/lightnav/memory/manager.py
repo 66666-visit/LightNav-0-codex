@@ -116,6 +116,23 @@ def _spatial_match_payload(
     }
 
 
+def _render_original_spatial_fact(item: LayerMemoryItem) -> str | None:
+    """Return F's exact ``render_context`` sentence for one existing item.
+
+    This deliberately calls the original formatter instead of copying its
+    ``Spatial history: ...`` template.  Only the single fact body is returned;
+    the ordered renderer keeps G's role/phrase prefix around it.
+    """
+    text, included = render_context(
+        [item], header=_NAVIGATION_MEMORY_HEADER,
+        max_chars=UNBOUNDED_CHAR_LIMIT,
+    )
+    if text is None or not included:
+        return None
+    _, separator, line = text.partition("\n")
+    return line if separator else None
+
+
 def _grounding_failure_reason(eligibility: list, result: object) -> str:
     """Name the concrete reason no eligible proposal remained."""
     refusal = getattr(result, "refusal_reason", None)
@@ -1955,6 +1972,10 @@ class MemoryManager:
                     chosen_item.description
                     if chosen_item is not None else None
                 ),
+                original_spatial_fact=(
+                    _render_original_spatial_fact(chosen_item)
+                    if chosen_item is not None else None
+                ),
                 spatial_label=(
                     chosen_item.label if chosen_item is not None else None
                 ),
@@ -2306,8 +2327,25 @@ class MemoryManager:
         diagnostic["landmark_rows"] = [row.to_dict() for row in rows_in_order]
 
         if self.spatial_l3_config.grounder_ordered_landmark_memory:
+            diagnostic["ordered_memory_rendering"] = {
+                "include_missing_landmark_placeholders": bool(
+                    self.spatial_l3_config.include_missing_landmark_placeholders
+                ),
+                "preserve_original_spatial_fact": bool(
+                    self.spatial_l3_config.preserve_original_spatial_fact
+                ),
+                "line_count": 0,
+                "fact_line_count": 0,
+                "placeholder_line_count": 0,
+            }
             text, included = render_ordered_landmark_memory(
                 rows_in_order, max_chars=max_chars,
+                include_missing_landmark_placeholders=(
+                    self.spatial_l3_config.include_missing_landmark_placeholders
+                ),
+                preserve_original_spatial_fact=(
+                    self.spatial_l3_config.preserve_original_spatial_fact
+                ),
             )
             included_by_order = {
                 row.landmark_order: row for row in included
@@ -2364,6 +2402,14 @@ class MemoryManager:
                     and row.geometry_fallback_reason
                 )
             ]
+            rendered_line_count = max(0, len(text.splitlines()) - 1)
+            diagnostic["ordered_memory_rendering"].update({
+                "line_count": rendered_line_count,
+                "fact_line_count": len(evidence_rows),
+                "placeholder_line_count": max(
+                    0, rendered_line_count - len(evidence_rows),
+                ),
+            })
             diagnostic.update({
                 "candidate_count": max(
                     diagnostic["grounder_proposal_count"], len(included),

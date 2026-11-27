@@ -65,6 +65,11 @@ class LandmarkMemoryRow:
     #: Exact ``LayerMemoryItem.description`` from SpatialGraphAdapter.  It is
     #: copied verbatim when the compact metadata form is unavailable.
     spatial_fact: str | None = None
+    #: The exact sentence emitted by F's original ``render_context`` formatter
+    #: for this item.  It is populated by the manager so the H2/H3 rendering
+    #: arms can reuse F's string without copying or re-implementing its
+    #: ``Spatial history: ...`` template.
+    original_spatial_fact: str | None = None
     spatial_label: str | None = None
     center_world: tuple[float, float, float] | None = None
     distance_m: float | None = None
@@ -100,10 +105,23 @@ class LandmarkMemoryRow:
         """Instruction-only line; contains no coordinate and no range."""
         return f"{self._prefix()}: no 3D evidence."
 
-    def fact_line(self) -> str:
-        """Line with a real recorded fact, or the skeleton when none exists."""
+    def fact_line(
+        self, *, preserve_original_spatial_fact: bool = False,
+    ) -> str:
+        """Line with a real recorded fact, or the skeleton when none exists.
+
+        ``preserve_original_spatial_fact`` swaps only the fact sentence: the
+        exact string produced by F's original formatter is appended after the
+        same role/phrase prefix.  Coordinates, bearings, observed counts,
+        source and ``passage unknown`` are never re-derived here.
+        """
         if not self.has_verified_fact:
             return self.skeleton_line()
+        if preserve_original_spatial_fact:
+            fact = self.original_spatial_fact or self.spatial_fact
+            if not fact:
+                return self.skeleton_line()
+            return f"{self._prefix()}: {fact}"
         label = self.spatial_label or self.target_object
         parts: list[str] = []
         if self.center_world is not None:
@@ -140,6 +158,7 @@ class LandmarkMemoryRow:
             "evidence_ids": list(self.evidence_ids),
             "selection_source": self.selection_source,
             "spatial_fact": self.spatial_fact,
+            "original_spatial_fact": self.original_spatial_fact,
             "spatial_label": self.spatial_label,
             "center_world": (
                 list(self.center_world)
@@ -210,6 +229,7 @@ def _plan_line(rows: Sequence[LandmarkMemoryRow]) -> str:
 
 def _render_compact_plan(
     rows: Sequence[LandmarkMemoryRow], *, max_chars: int, header: str,
+    preserve_original_spatial_fact: bool,
 ) -> tuple[str | None, tuple[LandmarkMemoryRow, ...]]:
     """Fallback for many landmarks: one ordered plan line plus fact lines.
 
@@ -226,7 +246,9 @@ def _render_compact_plan(
     remaining = max_chars - used
     fact_rows: list[LandmarkMemoryRow] = []
     for row in _enrichment_order(rows):
-        fact = row.fact_line()
+        fact = row.fact_line(
+            preserve_original_spatial_fact=preserve_original_spatial_fact,
+        )
         if len(fact) + 1 <= remaining:
             fact_rows.append(row)
             remaining -= len(fact) + 1
@@ -236,13 +258,16 @@ def _render_compact_plan(
     included: list[LandmarkMemoryRow] = []
     for row in rows:
         if row.landmark_order in fact_by_order:
+            line = row.fact_line(
+                preserve_original_spatial_fact=preserve_original_spatial_fact,
+            )
             included.append(replace(
                 row,
                 included_in_prompt=True,
                 spatial_fact_included=True,
                 actual_injection=True,
                 actual_injected_evidence_ids=row.evidence_ids,
-                rendered_text=row.fact_line(),
+                rendered_text=line,
             ))
         else:
             included.append(replace(
@@ -254,10 +279,60 @@ def _render_compact_plan(
                 rendered_text=plan,
             ))
     fact_lines = [
-        fact_by_order[row.landmark_order].fact_line()
+        fact_by_order[row.landmark_order].fact_line(
+            preserve_original_spatial_fact=preserve_original_spatial_fact,
+        )
         for row in rows if row.landmark_order in fact_by_order
     ]
     text = header + "\n" + "\n".join([plan, *fact_lines])
+    if len(text) > max_chars:
+        return None, ()
+    return text, tuple(included)
+
+
+def _render_fact_lines_only(
+    rows: Sequence[LandmarkMemoryRow], *, max_chars: int, header: str,
+    preserve_original_spatial_fact: bool,
+) -> tuple[str | None, tuple[LandmarkMemoryRow, ...]]:
+    """Render verified fact lines only, without any no-Evidence placeholder.
+
+    This is the H1/H3 branch.  The same enrichment priority as G is used to
+    decide which whole fact lines fit, but no character budget is reserved for
+    a skeleton or a compact ``Plan:`` line.  The emitted line order is still the
+    original instruction order.  A row without a verified fact contributes
+    nothing, so no coordinate-free placeholder is injected.
+    """
+    if not any(row.has_verified_fact for row in rows):
+        return None, ()
+    remaining = max_chars - len(header)
+    selected_orders: set[int] = set()
+    for row in _enrichment_order(rows):
+        line = row.fact_line(
+            preserve_original_spatial_fact=preserve_original_spatial_fact,
+        )
+        if len(line) + 1 <= remaining:
+            selected_orders.add(row.landmark_order)
+            remaining -= len(line) + 1
+    if not selected_orders:
+        return None, ()
+    lines: list[str] = []
+    included: list[LandmarkMemoryRow] = []
+    for row in rows:
+        if row.landmark_order not in selected_orders:
+            continue
+        line = row.fact_line(
+            preserve_original_spatial_fact=preserve_original_spatial_fact,
+        )
+        lines.append(line)
+        included.append(replace(
+            row,
+            included_in_prompt=True,
+            spatial_fact_included=True,
+            actual_injection=True,
+            actual_injected_evidence_ids=row.evidence_ids,
+            rendered_text=line,
+        ))
+    text = header + "\n" + "\n".join(lines)
     if len(text) > max_chars:
         return None, ()
     return text, tuple(included)
@@ -268,18 +343,36 @@ def render_ordered_landmark_memory(
     *,
     max_chars: int,
     header: str = HEADER,
+    include_missing_landmark_placeholders: bool = True,
+    preserve_original_spatial_fact: bool = False,
 ) -> tuple[str | None, tuple[LandmarkMemoryRow, ...]]:
     """Render the ordered plan and as many real facts as the budget allows.
 
-    Returns ``(text, included_rows)``.  ``included_rows`` carry the exact
-    rendered line and whether their real fact (not just the semantic skeleton)
-    entered the text.  No line ever exceeds ``max_chars``.
+    The two keyword switches are the H1/H2/H3 rendering ablation:
+
+    * ``include_missing_landmark_placeholders=True`` (default) keeps G's
+      skeleton/``Plan:`` lines for landmarks without a verified fact.  When it
+      is false, only verified fact lines are rendered and the freed budget is
+      available to real facts.
+    * ``preserve_original_spatial_fact=True`` keeps G's role/phrase prefix but
+      reuses F's exact formatter sentence for the fact body.  It does not
+      re-template coordinates, bearing, observed counts or source.
+
+    With both switches at their defaults this function is byte-identical to the
+    original G renderer.  Returns ``(text, included_rows)``.  ``included_rows``
+    carry the exact rendered line and whether their real fact entered the text.
+    No line ever exceeds ``max_chars``.
     """
     if type(max_chars) is not int or max_chars < 1:
         raise ValueError("ordered landmark budget must be a positive integer")
     ordered = sorted(rows, key=lambda row: row.landmark_order)
     if not ordered or max_chars <= len(header) + 1:
         return None, ()
+    if not include_missing_landmark_placeholders:
+        return _render_fact_lines_only(
+            ordered, max_chars=max_chars, header=header,
+            preserve_original_spatial_fact=preserve_original_spatial_fact,
+        )
     retained = _retain_rows(ordered, max_chars=max_chars, header=header)
     if not retained:
         return None, ()
@@ -293,7 +386,9 @@ def render_ordered_landmark_memory(
     rendered = dict(skeleton_lines)
     fact_included: set[int] = set()
     for row in _enrichment_order(retained):
-        fact = row.fact_line()
+        fact = row.fact_line(
+            preserve_original_spatial_fact=preserve_original_spatial_fact,
+        )
         skeleton = skeleton_lines[row.landmark_order]
         delta = len(fact) - len(skeleton)
         if delta <= remaining:
@@ -325,7 +420,10 @@ def render_ordered_landmark_memory(
 
     # Many landmarks: per-landmark skeletons leave no room for a fact.  Use one
     # ordered plan line and then the verified fact lines.
-    return _render_compact_plan(ordered, max_chars=max_chars, header=header)
+    return _render_compact_plan(
+        ordered, max_chars=max_chars, header=header,
+        preserve_original_spatial_fact=preserve_original_spatial_fact,
+    )
 
 
 def build_ordered_memory_context(

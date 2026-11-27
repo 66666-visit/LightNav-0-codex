@@ -338,6 +338,22 @@ def build_parser() -> argparse.ArgumentParser:
              "Requires eligible selection, landmark queries and the grounder.",
     )
     p.add_argument(
+        "--spatial_l3_grounder_include_missing_landmark_placeholders",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="H1/H3 rendering switch. With ordered landmarks enabled, keep "
+             "(default) or omit the no-3D-evidence placeholder lines for "
+             "landmarks without a selected fact. Requires "
+             "--spatial_l3_grounder_ordered_landmarks.",
+    )
+    p.add_argument(
+        "--spatial_l3_grounder_preserve_original_spatial_fact",
+        action=argparse.BooleanOptionalAction, default=False,
+        help="H2/H3 rendering switch. With ordered landmarks enabled, render "
+             "each verified fact with F's original render_context sentence "
+             "instead of G's compact fact sentence. Requires "
+             "--spatial_l3_grounder_ordered_landmarks.",
+    )
+    p.add_argument(
         "--adaptive_l3_query", action="store_true",
         help="Enable the opt-in Adaptive L3 Query controller on the original L1 path. "
              "Requires --spatial_l3_mode shadow and a local --spatial_l3_clip_model_path.",
@@ -572,6 +588,12 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                 ),
                 grounder_ordered_landmark_memory=(
                     args.spatial_l3_grounder_ordered_landmarks
+                ),
+                include_missing_landmark_placeholders=(
+                    args.spatial_l3_grounder_include_missing_landmark_placeholders
+                ),
+                preserve_original_spatial_fact=(
+                    args.spatial_l3_grounder_preserve_original_spatial_fact
                 ),
                 geometry=GeometryConfig(**{
                     name: getattr(args, f"spatial_l3_{name}") for name in (

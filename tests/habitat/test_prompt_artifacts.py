@@ -448,6 +448,13 @@ def test_prompt_diagnostic_row_flattens_ordered_landmark_fields() -> None:
                         "evidence_ids": ["ev-stairs"],
                         "selection_source": "vil3dref_grounding",
                         "ordered_landmarks": landmarks,
+                        "ordered_memory_rendering": {
+                            "include_missing_landmark_placeholders": False,
+                            "preserve_original_spatial_fact": True,
+                            "line_count": 1,
+                            "fact_line_count": 1,
+                            "placeholder_line_count": 0,
+                        },
                         "actual_injection": True,
                         "actual_injected_evidence_ids": ["ev-stairs"],
                     },
@@ -466,3 +473,10 @@ def test_prompt_diagnostic_row_flattens_ordered_landmark_fields() -> None:
     assert row["l3_evidence_ids"] == ["ev-stairs"]
     assert row["l3_selection_source"] == "vil3dref_grounding"
     assert row["l3_ordered_landmarks"] == landmarks
+    assert row["l3_ordered_memory_rendering"] == {
+        "include_missing_landmark_placeholders": False,
+        "preserve_original_spatial_fact": True,
+        "line_count": 1,
+        "fact_line_count": 1,
+        "placeholder_line_count": 0,
+    }

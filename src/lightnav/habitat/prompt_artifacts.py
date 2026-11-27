@@ -137,6 +137,14 @@ def build_prompt_protocol(memory: Any) -> dict[str, Any]:
                             grounder_config,
                             "grounder_ordered_landmark_memory", False,
                         )),
+                        "include_missing_landmark_placeholders": bool(getattr(
+                            grounder_config,
+                            "include_missing_landmark_placeholders", True,
+                        )),
+                        "preserve_original_spatial_fact": bool(getattr(
+                            grounder_config,
+                            "preserve_original_spatial_fact", False,
+                        )),
                     })
     adaptive = getattr(memory, "adaptive_l3_query", None)
     if getattr(adaptive, "enabled", False):
@@ -350,6 +358,9 @@ def prompt_diagnostic_row(
             "l3_evidence_ids": l3_query.get("evidence_ids", []),
             "l3_selection_source": l3_query.get("selection_source"),
             "l3_ordered_landmarks": l3_query.get("ordered_landmarks", []),
+            "l3_ordered_memory_rendering": l3_query.get(
+                "ordered_memory_rendering"
+            ),
             "l3_formatable_proposal_count": l3_query.get(
                 "formatable_proposal_count"
             ),

@@ -57,6 +57,16 @@ class SpatialL3Config:
     #: landmarks without one keep only verbatim instruction semantics.  This
     #: is an opt-in so D/E/F keep their previously measured prompt shape.
     grounder_ordered_landmark_memory: bool = False
+    #: H1/H2/H3 rendering ablation.  With the defaults below the ordered
+    #: renderer is byte-identical to G: missing-Evidence landmarks keep a
+    #: coordinate-free placeholder, and every verified fact uses G's compact
+    #: sentence.  ``include_missing_landmark_placeholders=False`` omits those
+    #: placeholder lines; the freed budget may then carry additional real fact
+    #: lines (recorded in ``ordered_memory_rendering``).  Setting
+    #: ``preserve_original_spatial_fact=True`` swaps only the fact body for F's
+    #: original ``render_context`` sentence.
+    include_missing_landmark_placeholders: bool = True
+    preserve_original_spatial_fact: bool = False
     geometry: GeometryConfig = field(default_factory=GeometryConfig)
 
     def __post_init__(self) -> None:
@@ -111,6 +121,8 @@ class SpatialL3Config:
             "rgb_sidecar_enabled", "instance_grounder_enabled",
             "grounder_landmark_queries", "grounder_geometry_fallback",
             "grounder_ordered_landmark_memory",
+            "include_missing_landmark_placeholders",
+            "preserve_original_spatial_fact",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"spatial_l3.{name} must be a boolean")
@@ -150,6 +162,15 @@ class SpatialL3Config:
                     "spatial_l3.grounder_ordered_landmark_memory requires "
                     "instance_grounder_enabled"
                 )
+        if not self.grounder_ordered_landmark_memory and (
+            not self.include_missing_landmark_placeholders
+            or self.preserve_original_spatial_fact
+        ):
+            raise ValueError(
+                "spatial_l3.include_missing_landmark_placeholders=False or "
+                "spatial_l3.preserve_original_spatial_fact=True requires "
+                "grounder_ordered_landmark_memory"
+            )
         for name in (
             "grounder_checkpoint", "grounder_config", "grounder_device",
             "grounder_bert_vocab_path",

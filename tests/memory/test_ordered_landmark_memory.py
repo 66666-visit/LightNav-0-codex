@@ -174,6 +174,8 @@ def _manager(
     grounder, *, ordered: bool = True, landmark_queries: bool = True,
     geometry_fallback: bool = True, selection_mode: str = "eligible",
     instruction: str = INSTRUCTION_1012,
+    include_placeholders: bool = True,
+    preserve_original_fact: bool = False,
 ) -> MemoryManager:
     manager = MemoryManager(
         strategy="hierarchical",
@@ -189,6 +191,8 @@ def _manager(
             grounder_landmark_queries=landmark_queries,
             grounder_geometry_fallback=geometry_fallback,
             grounder_ordered_landmark_memory=ordered,
+            include_missing_landmark_placeholders=include_placeholders,
+            preserve_original_spatial_fact=preserve_original_fact,
         ),
         spatial_extractor=_SegExtractor(), clip_encoder=None,
         prompt_mode="l1_original_only", instance_grounder=grounder,
@@ -803,3 +807,427 @@ def test_prompt_roundtrip_preserves_instruction_and_template() -> None:
     end = new_prompt.index("\nHistory follows.", start)
     assert new_prompt[:start] + new_prompt[end + 1:] == base_prompt
     assert augmented["video_segments"] is base["video_segments"]
+
+
+# ------------------------------------------------------- H1 / H2 / H3 ablation
+
+
+def _three_fact_scores() -> dict[str, dict[str, float]]:
+    return {
+        "sink": {"bed": 0.9},
+        "foot of bed": {"bed": 0.9},
+        "doorway": {"door": 0.9, "bed": 0.1},
+        "two stairs": {"stairs": 0.9, "bed": 0.1},
+    }
+
+
+def _three_fact_specs() -> list[tuple[str, str, tuple[float, float, float], float]]:
+    return [
+        ("object-bed", "bed", (2.0, 0.0, 1.0), 0.9),
+        ("object-door", "door", (3.0, 0.0, 1.0), 0.9),
+        ("object-stairs", "stairs", (4.0, 0.0, 1.0), 0.9),
+    ]
+
+
+def _variant(
+    scores: dict[str, dict[str, float]],
+    specs: list[tuple[str, str, tuple[float, float, float], float]],
+    *,
+    max_chars: int = 320,
+    instruction: str = INSTRUCTION_1012,
+    **kwargs,
+) -> tuple[MemoryManager, object | None]:
+    manager = _manager(
+        _StubGrounder(_QueryScores(scores)),
+        instruction=instruction,
+        **kwargs,
+    )
+    _fill_map(manager, specs)
+    context = _query(manager, max_chars=max_chars, instruction=instruction)
+    return manager, context
+
+
+def _selection_state(manager: MemoryManager) -> list[tuple]:
+    diagnostic = manager.last_l3_query_diagnostic or {}
+    rows = diagnostic.get("ordered_landmarks") or diagnostic.get("landmark_rows")
+    assert rows
+    return [
+        (
+            row["landmark_order"],
+            row["landmark_role"],
+            row["landmark_phrase"],
+            row["selected_object_id"],
+            tuple(row["evidence_ids"]),
+            row["selection_source"],
+            row["geometry_fallback_reason"],
+        )
+        for row in rows
+    ]
+
+
+def _fact_lines(text: str, *, original_facts: bool) -> list[str]:
+    lines = text.splitlines()[1:]
+    if original_facts:
+        return [line for line in lines if "Spatial history:" in line]
+    return [line for line in lines if "world (" in line and "no 3D evidence" not in line]
+
+
+def test_default_rendering_is_byte_identical_to_pre_ablation_g() -> None:
+    # SHA-256 values captured from the committed G/F code immediately before
+    # the H1/H2/H3 switches were added.  These are prompt-byte regressions, not
+    # diagnostic assertions.
+    manager, context = _variant(
+        {"sink": {"bed": 0.9}, "foot of bed": {"bed": 0.9},
+         "doorway": {"bed": 0.9}, "two stairs": {"bed": 0.9}},
+        [("object-bed", "bed", (2.0, 0.0, 1.0), 0.9)],
+        ordered=True,
+    )
+    assert context is not None
+    assert len(context.text) == 239
+    assert hashlib.sha256(context.text.encode()).hexdigest() == (
+        "4a0d7c514aa9e8406cdc30e5c5e6677391c4426166d5abbe80da1387d8f854d8"
+    )
+
+    manager, old_f = _variant(
+        _three_fact_scores(),
+        _three_fact_specs(),
+        ordered=False,
+    )
+    assert old_f is not None
+    assert len(old_f.text) == 180
+    assert hashlib.sha256(old_f.text.encode()).hexdigest() == (
+        "6e6da0181e86d23516cf2ab8ee5defd58587a8431992b652393a93246df70aba"
+    )
+
+    _, old_g = _variant(
+        _three_fact_scores(),
+        _three_fact_specs(),
+        ordered=True,
+    )
+    assert old_g is not None
+    assert len(old_g.text) == 306
+    assert hashlib.sha256(old_g.text.encode()).hexdigest() == (
+        "0cc8270e19c7445250e58e15bff128ff2985497c7f04441fcbcc75ed58cc18ce"
+    )
+
+
+def test_h1_deletes_only_missing_evidence_placeholders_at_320_chars() -> None:
+    for scores, specs in (
+        ({"sink": {"bed": 0.9}, "foot of bed": {"bed": 0.9},
+          "doorway": {"bed": 0.9}, "two stairs": {"bed": 0.9}},
+         [("object-bed", "bed", (2.0, 0.0, 1.0), 0.9)]),
+        (_three_fact_scores(), _three_fact_specs()),
+    ):
+        g_manager, g_context = _variant(scores, specs, ordered=True)
+        h1_manager, h1_context = _variant(
+            scores, specs, ordered=True, include_placeholders=False,
+        )
+        assert g_context is not None and h1_context is not None
+        g_lines = g_context.text.splitlines()
+        h1_lines = h1_context.text.splitlines()
+        assert g_lines[0] == h1_lines[0] == "[Navigation Memory]"
+        g_fact_lines = _fact_lines(g_context.text, original_facts=False)
+        assert h1_lines[1:] == g_fact_lines
+        assert all("no 3D evidence" not in line for line in h1_lines[1:])
+        assert "Plan:" not in h1_context.text
+        # No-Evidence landmarks stay in the diagnostic even though H1 does not
+        # put a placeholder line into the Prompt.
+        diagnostic_rows = h1_manager.last_l3_query_diagnostic["ordered_landmarks"]
+        assert len(diagnostic_rows) == len(g_manager.last_l3_query_diagnostic[
+            "ordered_landmarks"
+        ])
+        missing = [
+            row for row in diagnostic_rows
+            if row["selected_object_id"] is None
+        ]
+        assert missing
+        assert all(row["actual_injection"] is False for row in missing)
+        assert all(row["included_in_prompt"] is False for row in missing)
+
+
+def test_h1_reallocates_freed_budget_to_real_facts_and_records_it() -> None:
+    # At 360 characters G can only fit two facts because its skeleton lines
+    # reserve budget; H1 fits the additional bed fact.  This is the explicitly
+    # recorded budget-selection difference, not a silent change.
+    g_manager, _ = _variant(
+        _three_fact_scores(), _three_fact_specs(),
+        max_chars=360, ordered=True,
+    )
+    h1_manager, _ = _variant(
+        _three_fact_scores(), _three_fact_specs(),
+        max_chars=360, ordered=True, include_placeholders=False,
+    )
+    g_context = g_manager.last_l3_query_diagnostic
+    h1_context = h1_manager.last_l3_query_diagnostic
+    assert g_context["ordered_memory_rendering"]["fact_line_count"] == 2
+    assert h1_context["ordered_memory_rendering"]["fact_line_count"] == 3
+    assert g_context["ordered_memory_rendering"]["placeholder_line_count"] > 0
+    assert h1_context["ordered_memory_rendering"]["placeholder_line_count"] == 0
+    # Every fact line G already rendered is byte-identical in H1.
+    g_rendered = h1_context["injected_text"]
+    for line in g_context["injected_text"].splitlines()[1:]:
+        if "world (" in line:
+            assert line in g_rendered
+
+
+def test_h2_uses_the_exact_f_render_context_fact_sentence() -> None:
+    _, old_f = _variant(
+        _three_fact_scores(), _three_fact_specs(),
+        max_chars=400, ordered=False,
+    )
+    h2_manager, _ = _variant(
+        _three_fact_scores(), _three_fact_specs(),
+        max_chars=400, ordered=True, preserve_original_fact=True,
+    )
+    assert old_f is not None
+    h2 = h2_manager.last_l3_query_diagnostic
+    f_lines = old_f.text.splitlines()[1:]
+    assert f_lines
+    h2_facts = _fact_lines(h2["injected_text"], original_facts=True)
+    assert h2_facts
+    fact_rows = {
+        row["landmark_order"]: row
+        for row in h2["ordered_landmarks"]
+        if row.get("spatial_fact_included")
+    }
+    for line in h2_facts:
+        assert any(
+            line.endswith(row["original_spatial_fact"])
+            for row in fact_rows.values()
+        )
+    # The G compact sentence is not present; F's exact sentence is.
+    assert "at world (4.0,0.0,1.0)m" not in h2["injected_text"]
+    assert "now 4.2 m straight-line, bearing -104 deg (left +)" in (
+        h2["injected_text"]
+    )
+    rows = {
+        row["landmark_order"]: row
+        for row in h2["ordered_landmarks"]
+        if row.get("spatial_fact_included")
+    }
+    for row in rows.values():
+        assert row["original_spatial_fact"] == row["spatial_fact"]
+        assert row["original_spatial_fact"].startswith("Spatial history: ")
+
+
+def test_h3_combines_original_facts_without_placeholders() -> None:
+    h2_manager, _ = _variant(
+        _three_fact_scores(), _three_fact_specs(),
+        max_chars=400, ordered=True, preserve_original_fact=True,
+    )
+    h3_manager, _ = _variant(
+        _three_fact_scores(), _three_fact_specs(),
+        max_chars=400, ordered=True, include_placeholders=False,
+        preserve_original_fact=True,
+    )
+    h2 = h2_manager.last_l3_query_diagnostic
+    h3 = h3_manager.last_l3_query_diagnostic
+    assert h2["injected_text"] is not None
+    assert h3["injected_text"] is not None
+    assert "no 3D evidence" not in h3["injected_text"]
+    assert "Plan:" not in h3["injected_text"]
+    assert "Spatial history:" in h3["injected_text"]
+    assert h3["ordered_memory_rendering"]["placeholder_line_count"] == 0
+    assert (
+        h3["ordered_memory_rendering"]["preserve_original_spatial_fact"] is True
+    )
+    # H3 has no skeleton/Plan reservation, so it can fit at least as many
+    # original fact lines as H2, and every H2 fact line is byte-identical.
+    assert (
+        h3["ordered_memory_rendering"]["fact_line_count"]
+        >= h2["ordered_memory_rendering"]["fact_line_count"]
+    )
+    for line in _fact_lines(h2["injected_text"], original_facts=True):
+        assert line in h3["injected_text"]
+
+
+def test_rendering_switches_do_not_change_selected_object_or_evidence_ids() -> None:
+    variants = {
+        "F": {"ordered": False},
+        "G": {"ordered": True},
+        "H1": {"ordered": True, "include_placeholders": False},
+        "H2": {"ordered": True, "preserve_original_fact": True},
+        "H3": {
+            "ordered": True, "include_placeholders": False,
+            "preserve_original_fact": True,
+        },
+    }
+    states = {}
+    calls = {}
+    for label, kwargs in variants.items():
+        manager, _ = _variant(
+            _three_fact_scores(), _three_fact_specs(), **kwargs,
+        )
+        states[label] = _selection_state(manager)
+        calls[label] = list(manager.instance_grounder.calls)
+    reference = states["F"]
+    for label in ("G", "H1", "H2", "H3"):
+        assert states[label] == reference, label
+        assert calls[label] == calls["F"], label
+
+
+def test_no_verified_evidence_keeps_original_no_injection_protocol() -> None:
+    for label, kwargs in {
+        "G": {"ordered": True},
+        "H1": {"ordered": True, "include_placeholders": False},
+        "H2": {"ordered": True, "preserve_original_fact": True},
+        "H3": {
+            "ordered": True, "include_placeholders": False,
+            "preserve_original_fact": True,
+        },
+    }.items():
+        manager = _manager(
+            _RefusingGrounder(), geometry_fallback=False, **kwargs,
+        )
+        _fill_map(manager, [("object-bed", "bed", (2.0, 0.0, 1.0), 0.9)])
+        context = _query(manager)
+        assert context is None, label
+        diagnostic = manager.last_l3_query_diagnostic
+        assert diagnostic["actual_injection"] is False
+        assert diagnostic["actual_injected_evidence_ids"] == []
+        assert diagnostic["skipped_reason"] == "ordered_memory_budget_excluded"
+        assert len(diagnostic["ordered_landmarks"]) == 4
+        assert all(
+            row["actual_injection"] is False
+            for row in diagnostic["ordered_landmarks"]
+        )
+        assert "injected_text" not in diagnostic
+
+
+def test_h_variants_survive_prompt_roundtrip_and_token_budget() -> None:
+    for label, kwargs in {
+        "H1": {"include_placeholders": False},
+        "H2": {"preserve_original_fact": True},
+        "H3": {
+            "include_placeholders": False, "preserve_original_fact": True,
+        },
+    }.items():
+        manager, context = _variant(
+            _three_fact_scores(), _three_fact_specs(), **kwargs,
+        )
+        assert context is not None, label
+        base_prompt = (
+            "You are a navigation agent.\n"
+            f"<navigation_task>{INSTRUCTION_1012}</navigation_task>. "
+            "History follows."
+        )
+        base = {
+            "conversations": [
+                {"from": "human", "value": base_prompt},
+                {"from": "gpt", "value": ""},
+            ],
+            "video_segments": object(),
+        }
+        augmented = inject_memory_context(base, context, max_chars=320)
+        audit = audit_prompt_injection(base, augmented, context, max_chars=320)
+        assert audit["roundtrip_ok"] is True, label
+        assert INSTRUCTION_1012 in augmented["conversations"][0]["value"]
+        assert augmented["video_segments"] is base["video_segments"]
+
+        def counter(text: str) -> int:
+            return max(1, len(text) // 4)
+
+        for capacity in (120, 60, 30):
+            selection = select_context_lines(
+                context, capacity_tokens=capacity, count_tokens=counter,
+            )
+            assert selection.block_tokens <= capacity, label
+            if selection.context is not None:
+                for item in selection.context.layer_items:
+                    assert item.metadata["serialized_text"] in (
+                        selection.context.text
+                    )
+
+
+def test_generic_non_1012_instruction_rendering_ablation() -> None:
+    instruction = "walk towards the red chair next to the window and stop."
+    specs = [("object-chair", "chair", (2.0, 0.0, 1.0), 0.9)]
+    scores = {
+        "red chair next to the window": {"chair": 0.9},
+        "window": {"chair": 0.01},
+    }
+    outputs = {}
+    for label, kwargs in {
+        "G": {"ordered": True, "geometry_fallback": False},
+        "H1": {
+            "ordered": True, "geometry_fallback": False,
+            "include_placeholders": False,
+        },
+        "H2": {
+            "ordered": True, "geometry_fallback": False,
+            "preserve_original_fact": True,
+        },
+        "H3": {
+            "ordered": True, "geometry_fallback": False,
+            "include_placeholders": False,
+            "preserve_original_fact": True,
+        },
+    }.items():
+        _, context = _variant(
+            scores, specs, max_chars=320, instruction=instruction, **kwargs,
+        )
+        assert context is not None, label
+        outputs[label] = context.text
+        assert '"red chair"' in context.text
+        assert "red chair" in context.text
+        if label in {"H1", "H3"}:
+            assert "no 3D evidence" not in context.text
+            assert '"window"' not in context.text
+        else:
+            assert '"window"' in context.text
+        if label in {"H2", "H3"}:
+            assert "Spatial history: chair observed at world" in context.text
+            assert "at world (2.0,0.0,1.0)m" not in context.text
+        else:
+            assert "chair at world (2.0,0.0,1.0)m" in context.text
+    assert outputs["H1"] != outputs["G"]
+    assert outputs["H3"] != outputs["H2"]
+    assert len(set(outputs.values())) == 4
+
+
+def test_generic_compact_h2_fails_closed_while_h3_fits_final_fact() -> None:
+    # Six generic landmarks and a long F sentence: the compact Plan line leaves
+    # no room for any original F fact in H2, while H3 (no Plan reservation) fits
+    # the final fact.  This is the same budget interaction as the 168 arm but
+    # uses no Episode ID or real instruction.
+    roles = [
+        "source", "intermediate", "transition", "intermediate",
+        "transition", "final",
+    ]
+    long_fact = (
+        "Spatial history: object observed at world (1.0,2.0,3.0) m; "
+        "now 4.5 m straight-line, bearing -45 deg (left +); "
+        "3 observations; source YOLO11n-seg; passage unknown."
+    )
+    rows = [
+        _row(
+            landmark_order=order, landmark_role=role,
+            landmark_phrase=f"landmark {order}", target_object="object",
+            evidence_ids=(f"ev-{order}",),
+            selected_object_id=f"object-{order}",
+            spatial_fact=long_fact, original_spatial_fact=long_fact,
+            spatial_label="object", center_world=(1.0, 2.0, 3.0),
+            distance_m=4.5, bearing_deg=-45.0, observation_count=3,
+        )
+        for order, role in enumerate(roles, start=1)
+    ]
+    g_text, g_rows = render_ordered_landmark_memory(rows, max_chars=320)
+    assert g_text is not None and "Plan:" in g_text
+    assert sum(row.spatial_fact_included for row in g_rows) == 1
+
+    h2_text, h2_rows = render_ordered_landmark_memory(
+        rows, max_chars=320, preserve_original_spatial_fact=True,
+    )
+    assert h2_text is None and h2_rows == ()
+
+    h3_text, h3_rows = render_ordered_landmark_memory(
+        rows, max_chars=320, include_missing_landmark_placeholders=False,
+        preserve_original_spatial_fact=True,
+    )
+    assert h3_text is not None
+    assert len(h3_text) <= 320
+    assert "Plan:" not in h3_text
+    assert "no 3D evidence" not in h3_text
+    assert '"landmark 6"' in h3_text
+    assert "Spatial history:" in h3_text
+    assert sum(row.spatial_fact_included for row in h3_rows) == 1
