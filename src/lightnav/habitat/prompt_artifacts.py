@@ -32,6 +32,18 @@ _PER_EPISODE_FIELDS = (
     "termination_reason", "forced_stop",
 )
 
+#: C-arm object-level admission fields shared with memory_diagnostics.jsonl.
+HISTORY_ADMISSION_FIELDS = (
+    "history_admission_mode",
+    "history_admission_candidate_object_ids",
+    "history_admission_accepted_object_ids",
+    "history_admission_rejected_seen_object_ids",
+    "history_admission_missing_object_id_count",
+    "history_admission_confirmed_object_ids",
+    "history_admission_adopted_object_ids",
+    "history_admission_pending_object_ids",
+)
+
 
 def build_prompt_protocol(memory: Any) -> dict[str, Any]:
     """Describe one mode's layer activation, budget and injection contract."""
@@ -145,6 +157,9 @@ def build_prompt_protocol(memory: Any) -> dict[str, Any]:
                             grounder_config,
                             "preserve_original_spatial_fact", False,
                         )),
+                        "history_admission_mode": getattr(
+                            grounder_config, "history_admission_mode", "off",
+                        ),
                     })
     adaptive = getattr(memory, "adaptive_l3_query", None)
     if getattr(adaptive, "enabled", False):
@@ -234,6 +249,8 @@ def prompt_diagnostic_row(
         "prompt_hash_before": diagnostic.get("prompt_hash_before"),
         "prompt_hash_after": diagnostic.get("prompt_hash_after"),
     }
+    for field in HISTORY_ADMISSION_FIELDS:
+        row[field] = diagnostic.get(field)
     if not isinstance(context, dict):
         row["prompt_diagnostic_missing"] = True
         return row
@@ -375,6 +392,16 @@ def prompt_diagnostic_row(
                 "actual_injected_evidence_ids", []
             ),
         })
+    admission_source = diagnostic
+    if not any(
+        field in admission_source for field in HISTORY_ADMISSION_FIELDS
+    ) and isinstance(l3_query, dict):
+        admission_source = l3_query
+    for field in HISTORY_ADMISSION_FIELDS:
+        row[field] = admission_source.get(
+            field,
+            l3_query.get(field) if isinstance(l3_query, dict) else None,
+        )
     stats = context.get("l3_query_stats")
     if isinstance(stats, dict):
         row.update({

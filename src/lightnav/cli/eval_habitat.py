@@ -354,6 +354,17 @@ def build_parser() -> argparse.ArgumentParser:
              "--spatial_l3_grounder_ordered_landmarks.",
     )
     p.add_argument(
+        "--spatial_l3_history_admission_mode",
+        choices=("off", "once_per_object"), default="off",
+        help="C arm object-level admission at the final L3 history boundary. "
+             "off leaves every existing arm unchanged. once_per_object admits "
+             "a stable ObjectNode object_id once per Episode and refuses a "
+             "later re-selection even when its Evidence ID changed; candidates "
+             "without an object_id stay fail-open. Requires geometry_on_demand, "
+             "l1_original_only, eligible selection, the instance grounder and "
+             "ordered landmarks.",
+    )
+    p.add_argument(
         "--adaptive_l3_query", action="store_true",
         help="Enable the opt-in Adaptive L3 Query controller on the original L1 path. "
              "Requires --spatial_l3_mode shadow and a local --spatial_l3_clip_model_path.",
@@ -595,6 +606,7 @@ def config_from_args(args: argparse.Namespace) -> HabitatEvalConfig:
                 preserve_original_spatial_fact=(
                     args.spatial_l3_grounder_preserve_original_spatial_fact
                 ),
+                history_admission_mode=args.spatial_l3_history_admission_mode,
                 geometry=GeometryConfig(**{
                     name: getattr(args, f"spatial_l3_{name}") for name in (
                         "min_depth_m", "max_depth_m", "min_points",

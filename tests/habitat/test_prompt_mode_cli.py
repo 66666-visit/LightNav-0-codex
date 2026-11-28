@@ -202,3 +202,57 @@ def test_eval_launcher_snapshot_records_legacy_measurement_without_token_budget(
     assert snapshot["protocol_version"] == "local_graph_v1"
     assert snapshot["prompt_protocol_version"] == "l1_l3_prompt_ablation_v1"
     assert "--prompt_measurement_enabled" in snapshot["memory_args"]
+
+
+def test_history_admission_flag_defaults_off_and_maps_to_the_c_config() -> None:
+    args = _parse(["--model_path", "/tmp/model"])
+    assert args.spatial_l3_history_admission_mode == "off"
+
+    args = _parse([
+        "--model_path", "/tmp/model", "--output_dir", "/tmp/out",
+        "--memory_enabled", "--memory_extractor", "yolo11",
+        "--memory_extractor_model_path", "/tmp/yolo11n.pt",
+        "--memory_strategy", "hierarchical",
+        "--memory_layers", "short,mid,long", "--local_graph_enabled",
+        "--memory_prompt_mode", "l1_original_only",
+        "--spatial_l3_mode", "geometry_on_demand",
+        "--spatial_l3_seg_model_path", "/tmp/seg.pt",
+        "--spatial_l3_rgb_sidecar", "--spatial_l3_instance_grounder",
+        "--spatial_l3_grounder_checkpoint", "/tmp/student.pt",
+        "--spatial_l3_grounder_selection", "eligible",
+        "--spatial_l3_grounder_landmark_queries",
+        "--spatial_l3_grounder_geometry_fallback",
+        "--spatial_l3_grounder_ordered_landmarks",
+        "--no-spatial_l3_grounder_include_missing_landmark_placeholders",
+        "--spatial_l3_history_admission_mode", "once_per_object",
+    ])
+    config = config_from_args(args)
+    assert config.memory.spatial_l3.history_admission_mode == "once_per_object"
+    assert (
+        config.memory.spatial_l3.include_missing_landmark_placeholders is False
+    )
+
+
+def test_history_admission_requires_the_audited_l1_original_only_path() -> None:
+    config = dict(
+        enabled=True, extractor="yolo11", extractor_model_path="/tmp/yolo11n.pt",
+        strategy="hierarchical", layers=("short", "mid", "long"),
+        local_graph=LocalGraphConfig(enabled=True),
+        spatial_l3=SpatialL3Config(
+            mode="geometry_on_demand", seg_model_path="/tmp/seg.pt",
+            rgb_sidecar_enabled=True, instance_grounder_enabled=True,
+            grounder_checkpoint="/tmp/student.pt",
+            grounder_selection_mode="eligible",
+            grounder_landmark_queries=True,
+            grounder_geometry_fallback=True,
+            grounder_ordered_landmark_memory=True,
+            include_missing_landmark_placeholders=False,
+            history_admission_mode="once_per_object",
+        ),
+        prompt_mode="l1_original_only",
+    )
+    assert MemoryConfig(**config).spatial_l3.history_admission_mode == (
+        "once_per_object"
+    )
+    with pytest.raises(ValueError, match="history admission requires"):
+        MemoryConfig(**{**config, "prompt_mode": "legacy"})

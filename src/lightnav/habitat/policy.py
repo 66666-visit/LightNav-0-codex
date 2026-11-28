@@ -1208,6 +1208,10 @@ class TrajVocabVLNCEPolicy:
             manager.confirm_prompt_context(visible_ids, step=step)
         else:
             manager.discard_prompt_context()
+        admission_reader = getattr(manager, "history_admission_diagnostics", None)
+        history_admission = (
+            admission_reader() if callable(admission_reader) else {}
+        )
         historical_ids = []
         for evidence_id in visible_ids:
             record = manager.v3_store.get_evidence(evidence_id)
@@ -1266,9 +1270,11 @@ class TrajVocabVLNCEPolicy:
             ),
             "accepted_record_count": len(accepted_records),
         })
+        prompt_context.update(history_admission)
         if spatial_diagnostic is not None:
             prompt_context["spatial_l3"] = {
                 **spatial_diagnostic,
+                **history_admission,
                 "context_source": prompt_context.get("source", "none"),
                 "fallback_reason": spatial_fallback_reason,
                 "actual_injection": actual_injection if checked else None,
@@ -1282,6 +1288,7 @@ class TrajVocabVLNCEPolicy:
             if isinstance(on_demand, dict):
                 on_demand = dict(on_demand)
                 on_demand.update({
+                    **history_admission,
                     "actual_injection": actual_injection if checked else None,
                     "actual_injected_evidence_ids": (
                         list(visible_ids) if actual_injection else []
@@ -1319,6 +1326,7 @@ class TrajVocabVLNCEPolicy:
             ),
             "prompt_context": prompt_context,
             "model_input_diagnostic": dict(model_input) if checked else None,
+            **history_admission,
         }
         if "l3_query_stats" in prompt_context:
             diagnostic["l3_query_stats"] = prompt_context["l3_query_stats"]

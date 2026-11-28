@@ -349,6 +349,7 @@ the WebSocket inference server has no RGB-D map interface.
 | `--spatial_l3_grounder_ordered_landmarks` | off | Organize the existing `[Navigation Memory]` block as the ordered instruction plan. Every landmark keeps its verbatim phrase, role and instruction order; a real spatial fact is added only for a landmark with a selected `SpatialGraphAdapter` item. Requires `--spatial_l3_grounder_selection eligible`, `--spatial_l3_grounder_landmark_queries` and `--spatial_l3_instance_grounder` (ablation G for 1012) |
 | `--spatial_l3_grounder_include_missing_landmark_placeholders` | on | H1/H3 rendering switch. With `--spatial_l3_grounder_ordered_landmarks`, keep (default) or omit the coordinate-free `no 3D evidence` skeleton/`Plan:` lines for landmarks without a verified fact. Omitting them releases that budget to real fact lines; `ordered_memory_rendering` in the L3 diagnostic records the resulting line/fact/placeholder counts. Requires ordered landmarks |
 | `--spatial_l3_grounder_preserve_original_spatial_fact` | off | H2/H3 rendering switch. With `--spatial_l3_grounder_ordered_landmarks`, keep G's role/phrase prefix but render the fact body with F's original `render_context` sentence (coordinates, straight-line range, bearing sign, observation count, source, `passage unknown`) instead of G's compact sentence. Requires ordered landmarks |
+| `--spatial_l3_history_admission_mode` | `off` | C arm object-level admission at the final L3 history/Prompt boundary. `off` is a pure pass-through and leaves every existing arm unchanged. `once_per_object` admits a stable `ObjectNode.object_id` once per Episode and refuses a later re-selection of the same object even when its Evidence ID changed; different object IDs are independent (including same-class instances) and a candidate without a reliable `object_id` stays fail-open and is counted. Adoption is committed only after the final Prompt token audit proves the candidate's Evidence was injected, and the state is cleared at every Episode boundary. Requires `geometry_on_demand`, `l1_original_only`, eligible selection, the instance grounder and ordered landmarks |
 | `--adaptive_l3_query` | off | Opt-in Adaptive L3 Query arm: a local controller decides whether to query L3 on any step, not only when L1 is empty |
 | `--adaptive_l3_query_max_new_tokens` | `24` | Maximum decoded tokens for one local controller decision |
 | `--adaptive_l3_query_max_query_chars` | `256` | Maximum characters of a controller-produced CLIP query |
@@ -416,6 +417,22 @@ Enabling both is H3. The L3 diagnostic records
 fact/placeholder line counts, so a budget-selection difference is never silent.
 Candidate filtering, Evidence IDs, fact enrichment order, map updates, query
 frequency and Grounding are not changed by either switch.
+
+The C arm is H1 plus `--spatial_l3_history_admission_mode once_per_object`.
+It adds one episode-local gate at that same final L3 history boundary: the
+first Prompt that actually injects a stable `object_id` adopts it, and a later
+Step that re-selects the same object (even through a new Evidence ID) is
+refused. The gate never scores, thresholds, decays, re-ranks or merges
+categories; it only keys on the complete stable `object_id`. A candidate
+without a reliable `object_id` is admitted fail-open so missing metadata cannot
+suppress the original L3 injection. Pending admission is written to
+`memory_diagnostics.jsonl` and `prompt_diagnostics.jsonl` as
+`history_admission_mode`, `history_admission_candidate_object_ids`,
+`history_admission_accepted_object_ids`,
+`history_admission_rejected_seen_object_ids`,
+`history_admission_missing_object_id_count` (plus the audit-confirmed and
+cumulative adopted/pending lists). `--spatial_l3_history_admission_mode off`
+is the default and changes no Prompt byte.
 
 The checkpoint, BERT vocab and compiled extension must be local;
 inference never downloads anything. Install the small official-model dependencies with

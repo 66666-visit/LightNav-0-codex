@@ -17,6 +17,11 @@ from lightnav.memory.adaptive_l3_query_config import AdaptiveL3QueryConfig
 from lightnav.memory.clip_features import clip_crop_boxes
 from lightnav.memory.conceptgraphs_lite import ObjectMap, RGBDFrame
 from lightnav.memory.episodic_memory import EpisodicMemory
+from lightnav.memory.history_admission import (
+    AdmissionCandidate,
+    AdmissionDecision,
+    HistoryAdmissionGate,
+)
 from lightnav.memory.instruction_landmarks import (
     InstructionLandmarks,
     parse_instruction_landmarks,
@@ -131,6 +136,32 @@ def _render_original_spatial_fact(item: LayerMemoryItem) -> str | None:
         return None
     _, separator, line = text.partition("\n")
     return line if separator else None
+
+
+def _drop_rendered_landmark_rows(text: str, rows: list[LandmarkMemoryRow]) -> str | None:
+    """Remove rejected fact lines while keeping every surviving line verbatim.
+
+    The ordered renderer may emit a shared compact ``Plan:`` line plus fact
+    lines, so this removes one occurrence per rejected row instead of rebuilding
+    from rows (which would duplicate the shared plan line).
+    """
+    lines = text.splitlines()
+    if len(lines) <= 1:
+        return None
+    removals: dict[str, int] = {}
+    for row in rows:
+        if isinstance(row.rendered_text, str):
+            removals[row.rendered_text] = removals.get(row.rendered_text, 0) + 1
+    kept = [lines[0]]
+    for line in lines[1:]:
+        count = removals.get(line, 0)
+        if count:
+            removals[line] = count - 1
+        else:
+            kept.append(line)
+    if len(kept) == 1:
+        return None
+    return "\n".join(kept)
 
 
 def _grounding_failure_reason(eligibility: list, result: object) -> str:
@@ -364,6 +395,11 @@ class MemoryManager:
         )
         self.last_local_graph_status = "not_attempted"
         self.last_l3_query_diagnostic: dict = {}
+        # C arm: Episode-local object-level admission for the final L3 history
+        # boundary.  ``off`` is a pure pass-through and is the default.
+        self.history_admission_gate = HistoryAdmissionGate(
+            self.spatial_l3_config.history_admission_mode
+        )
         self.adaptive_l3_query_config = (
             adaptive_l3_query_config or AdaptiveL3QueryConfig()
         )
@@ -587,6 +623,9 @@ class MemoryManager:
         self.last_adaptive_l3_diagnostic = {}
         self.last_local_graph_status = "not_attempted"
         self.last_l3_query_diagnostic = {}
+        self.history_admission_gate.reset_episode(
+            self.v3_scene_id, episode_id, rollout_idx,
+        )
         self.l3_query_stats = _empty_l3_query_stats()
         self.last_episode_l3_query_stats = {}
         self._l3_stats_step = None
@@ -860,6 +899,11 @@ class MemoryManager:
             raise RuntimeError("legacy prompts use the original Local Graph path")
         if self.v3_store is None:
             raise RuntimeError("memory prompt modes require a V3 evidence store")
+        # Start every prompt Step with no stale L3 admission proposal.  The
+        # on-demand builder calls begin_step again immediately before it runs;
+        # this first call also covers Steps where L1 satisfies the prompt and no
+        # L3 query happens, so diagnostics never repeat a previous Step's list.
+        self.history_admission_gate.begin_step(step)
         token_limited = token_budget is not None and token_budget.available
         fusion = (
             self.prompt_local_graph_fusion
@@ -992,7 +1036,13 @@ class MemoryManager:
         return result
 
     def confirm_prompt_context(self, evidence_ids: list[str], *, step: int) -> None:
-        """Record an injected Local Graph selection only after the prompt proves it."""
+        """Record an injected selection only after the prompt proves it.
+
+        The L3 history gate is confirmed first and independently of the L1
+        pending flag: an L1-empty Step injects L3 only, so the L1 selection is
+        not pending even though an object must still be adopted.
+        """
+        self.history_admission_gate.confirm(evidence_ids, step=step)
         if not self._prompt_context_pending:
             return
         self._prompt_context_pending = False
@@ -1010,11 +1060,21 @@ class MemoryManager:
 
     def discard_prompt_context(self) -> None:
         """Release a prompt-mode selection rejected by the prompt/token contract."""
+        self.history_admission_gate.discard_pending()
         if not self._prompt_context_pending:
             return
         self._prompt_context_pending = False
         self._prompt_context_pending_ids = frozenset()
         self._active_prompt_fusion.discard_selection()
+
+    def history_admission_diagnostics(self) -> dict:
+        """Report the C-arm gate state without changing any navigation state."""
+        return self.history_admission_gate.diagnostics()
+
+    def _attach_history_admission_diagnostic(self) -> None:
+        diagnostic = self.last_l3_query_diagnostic
+        if isinstance(diagnostic, dict) and diagnostic:
+            diagnostic.update(self.history_admission_gate.diagnostics())
 
     def record_v4_frame_id(self, step: int, frame_id: int) -> None:
         """Bind one memory Step to the TrackingAgent frame actually observed."""
@@ -1579,6 +1639,26 @@ class MemoryManager:
             self._record_l3_query(diagnostic)
             return None
         item = selected_items[0]
+        metadata = item.metadata
+        evidence_ids = list(dict.fromkeys(
+            value for value in metadata.get("evidence_ids", [])
+            if isinstance(value, str)
+        ))
+        admission_decision = self.history_admission_gate.admit(
+            [AdmissionCandidate(selected_id, tuple(evidence_ids))],
+            step=step,
+        )
+        if admission_decision.rejected_count:
+            diagnostic.update({
+                "candidate_count": 0,
+                "skipped_reason": "history_admission_rejected_seen_object",
+                "rejection_reason": "history_admission_rejected_seen_object",
+                "actual_injection": False,
+                "actual_injected_evidence_ids": [],
+            })
+            self.last_l3_query_diagnostic = diagnostic
+            self._record_l3_query(diagnostic)
+            return None
         text = "[Navigation Memory]\n" + item.description
         if len(text) > max_chars:
             diagnostic["candidate_count"] = 0
@@ -1588,11 +1668,6 @@ class MemoryManager:
             self.last_l3_query_diagnostic = diagnostic
             self._record_l3_query(diagnostic)
             return None
-        metadata = item.metadata
-        evidence_ids = list(dict.fromkeys(
-            value for value in metadata.get("evidence_ids", [])
-            if isinstance(value, str)
-        ))
         diagnostic.update({
             "injected_count": 1,
             "selected_object_id": selected_id,
@@ -1806,6 +1881,56 @@ class MemoryManager:
                 self._record_l3_query(diagnostic)
                 return None
             fallback_items = fallback_context.layer_items
+            admission_decision = self.history_admission_gate.admit(
+                [
+                    AdmissionCandidate(
+                        item.metadata.get("object_id"),
+                        tuple(
+                            evidence_id
+                            for evidence_id in item.metadata.get(
+                                "evidence_ids", []
+                            )
+                            if isinstance(evidence_id, str)
+                        ),
+                    )
+                    for item in fallback_items
+                ],
+                step=step,
+            )
+            if admission_decision.rejected_count:
+                accepted_identity = {
+                    id(fallback_items[index])
+                    for index in admission_decision.accepted_indices
+                }
+                fallback_items = [
+                    item for item in fallback_items
+                    if id(item) in accepted_identity
+                ]
+                if not fallback_items:
+                    diagnostic.update({
+                        "candidate_count": 0,
+                        "skipped_reason": (
+                            "history_admission_rejected_seen_object"
+                        ),
+                        "rejection_reason": (
+                            "history_admission_rejected_seen_object"
+                        ),
+                        "actual_injection": False,
+                        "actual_injected_evidence_ids": [],
+                    })
+                    diagnostic["query_ms"] = (
+                        (perf_counter() - started) * 1000.0
+                    )
+                    self.last_l3_query_diagnostic = diagnostic
+                    self._record_l3_query(diagnostic)
+                    return None
+                fallback_context = MemoryContext(
+                    text=(
+                        _NAVIGATION_MEMORY_HEADER + "\n"
+                        + "\n".join(item.description for item in fallback_items)
+                    ),
+                    layer_items=fallback_items,
+                )
             fallback_evidence_ids = list(dict.fromkeys(
                 evidence_id for item in fallback_items
                 for evidence_id in item.metadata.get("evidence_ids", [])
@@ -2347,6 +2472,42 @@ class MemoryManager:
                     self.spatial_l3_config.preserve_original_spatial_fact
                 ),
             )
+            admission_decision: AdmissionDecision | None = None
+            admission_rejected_all = False
+            if text is not None:
+                # C arm: the final L3 history boundary.  Only rows carrying a
+                # real spatial fact are historical objects; skeleton/Plan lines
+                # are instruction semantics and are never admission candidates.
+                fact_rows = [
+                    row for row in included if row.spatial_fact_included
+                ]
+                admission_decision = self.history_admission_gate.admit(
+                    [
+                        AdmissionCandidate(
+                            row.selected_object_id, tuple(row.evidence_ids),
+                        )
+                        for row in fact_rows
+                    ],
+                    step=step,
+                )
+                if admission_decision.rejected_count:
+                    accepted_orders = {
+                        fact_rows[index].landmark_order
+                        for index in admission_decision.accepted_indices
+                    }
+                    rejected_rows = [
+                        row for row in fact_rows
+                        if row.landmark_order not in accepted_orders
+                    ]
+                    included = [
+                        row for row in included
+                        if (
+                            not row.spatial_fact_included
+                            or row.landmark_order in accepted_orders
+                        )
+                    ]
+                    text = _drop_rendered_landmark_rows(text, rejected_rows)
+                    admission_rejected_all = text is None
             included_by_order = {
                 row.landmark_order: row for row in included
             }
@@ -2358,10 +2519,15 @@ class MemoryManager:
                 row.to_dict() for row in all_rows
             ]
             if text is None:
+                reason = (
+                    "history_admission_rejected_seen_object"
+                    if admission_rejected_all
+                    else "ordered_memory_budget_excluded"
+                )
                 diagnostic.update({
                     "candidate_count": 0,
-                    "skipped_reason": "ordered_memory_budget_excluded",
-                    "rejection_reason": "ordered_memory_budget_excluded",
+                    "skipped_reason": reason,
+                    "rejection_reason": reason,
                     "actual_injection": False,
                     "actual_injected_evidence_ids": [],
                 })
@@ -2372,10 +2538,16 @@ class MemoryManager:
                 row for row in included if row.spatial_fact_included
             ]
             if not evidence_rows:
+                reason = (
+                    "history_admission_rejected_seen_object"
+                    if admission_decision is not None
+                    and admission_decision.rejected_count
+                    else "no_evidence_fact_within_budget"
+                )
                 diagnostic.update({
                     "candidate_count": 0,
-                    "skipped_reason": "no_evidence_fact_within_budget",
-                    "rejection_reason": "no_evidence_fact_within_budget",
+                    "skipped_reason": reason,
+                    "rejection_reason": reason,
                     "actual_injection": False,
                     "actual_injected_evidence_ids": [],
                 })
@@ -2545,6 +2717,42 @@ class MemoryManager:
                 selected_items, header=_NAVIGATION_MEMORY_HEADER,
                 max_chars=max_chars,
             )
+            admission_rejected_all = False
+            if text is not None:
+                # Same C-arm boundary for the non-ordered eligible formatter:
+                # one decision per historical object, item order preserved.
+                admission_decision = self.history_admission_gate.admit(
+                    [
+                        AdmissionCandidate(
+                            item.metadata.get("object_id"),
+                            tuple(
+                                evidence_id
+                                for evidence_id in item.metadata.get(
+                                    "evidence_ids", []
+                                )
+                                if isinstance(evidence_id, str)
+                            ),
+                        )
+                        for item in included
+                    ],
+                    step=step,
+                )
+                if admission_decision.rejected_count:
+                    accepted_identity = {
+                        id(included[index])
+                        for index in admission_decision.accepted_indices
+                    }
+                    included = [
+                        item for item in included
+                        if id(item) in accepted_identity
+                    ]
+                    if not included:
+                        text = None
+                        admission_rejected_all = True
+                    else:
+                        text = _NAVIGATION_MEMORY_HEADER + "\n" + "\n".join(
+                            item.description for item in included
+                        )
             if text is not None:
                 included_identity = {id(item) for item in included}
                 included_records = [
@@ -2690,13 +2898,22 @@ class MemoryManager:
                 self.last_l3_query_diagnostic = diagnostic
                 self._record_l3_query(diagnostic)
                 return context
-            diagnostic.update({
-                "candidate_count": 0,
-                "skipped_reason": "prompt_budget_excluded",
-                "prompt_budget_excluded": True,
-                "actual_injection": False,
-                "actual_injected_evidence_ids": [],
-            })
+            if admission_rejected_all:
+                diagnostic.update({
+                    "candidate_count": 0,
+                    "skipped_reason": "history_admission_rejected_seen_object",
+                    "rejection_reason": "history_admission_rejected_seen_object",
+                    "actual_injection": False,
+                    "actual_injected_evidence_ids": [],
+                })
+            else:
+                diagnostic.update({
+                    "candidate_count": 0,
+                    "skipped_reason": "prompt_budget_excluded",
+                    "prompt_budget_excluded": True,
+                    "actual_injection": False,
+                    "actual_injected_evidence_ids": [],
+                })
             diagnostic["ordered_landmarks"] = [
                 row.to_dict() for row in rows_in_order
             ]
@@ -2746,15 +2963,23 @@ class MemoryManager:
         cosine score exists on this path.
         """
         if self.spatial_l3_config.instance_grounder_enabled:
+            # C arm: start a fresh admission Step before the final L3 history
+            # build.  ``off`` leaves this as a no-op pass-through.
+            self.history_admission_gate.begin_step(step)
             if self.spatial_l3_config.grounder_selection_mode == "argmax":
-                return self._grounded_argmax_geometry_context(
+                context = self._grounded_argmax_geometry_context(
                     step=step, instruction=instruction, l1_status=l1_status,
                     max_chars=max_chars,
                 )
-            return self._grounded_geometry_context(
-                step=step, instruction=instruction, l1_status=l1_status,
-                max_chars=max_chars,
-            )
+            else:
+                context = self._grounded_geometry_context(
+                    step=step, instruction=instruction, l1_status=l1_status,
+                    max_chars=max_chars,
+                )
+            # Attach after the builder so even an empty/refused build reports
+            # the exact admission decision and zero accepted candidates.
+            self._attach_history_admission_diagnostic()
+            return context
         controller = self.geometry_on_demand_controller
         if controller is None or self.spatial_map is None:
             return None

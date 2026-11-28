@@ -67,6 +67,13 @@ class SpatialL3Config:
     #: original ``render_context`` sentence.
     include_missing_landmark_placeholders: bool = True
     preserve_original_spatial_fact: bool = False
+    #: C arm: H1 plus one object-level admission decision at the final L3
+    #: history/Prompt boundary.  ``off`` keeps every existing arm byte-identical
+    #: to its previous behaviour.  ``once_per_object`` admits a stable
+    #: ObjectNode ``object_id`` once per Episode; a later re-selection of the
+    #: same object is refused even when its Evidence ID changed.  Candidates
+    #: without a reliable object ID stay fail-open and are only counted.
+    history_admission_mode: str = "off"
     geometry: GeometryConfig = field(default_factory=GeometryConfig)
 
     def __post_init__(self) -> None:
@@ -171,6 +178,34 @@ class SpatialL3Config:
                 "spatial_l3.preserve_original_spatial_fact=True requires "
                 "grounder_ordered_landmark_memory"
             )
+        if self.history_admission_mode not in {"off", "once_per_object"}:
+            raise ValueError(
+                "spatial_l3.history_admission_mode must be off or once_per_object"
+            )
+        if self.history_admission_mode == "once_per_object":
+            # The C arm adds one decision to H1's final L3 history boundary.
+            # Refuse configurations where that boundary is not the ordered
+            # Grounding path, instead of silently running with an inert switch.
+            if self.mode != "geometry_on_demand":
+                raise ValueError(
+                    "spatial_l3.history_admission_mode=once_per_object requires "
+                    "mode=geometry_on_demand"
+                )
+            if not self.instance_grounder_enabled:
+                raise ValueError(
+                    "spatial_l3.history_admission_mode=once_per_object requires "
+                    "instance_grounder_enabled"
+                )
+            if self.grounder_selection_mode != "eligible":
+                raise ValueError(
+                    "spatial_l3.history_admission_mode=once_per_object requires "
+                    "grounder_selection_mode=eligible"
+                )
+            if not self.grounder_ordered_landmark_memory:
+                raise ValueError(
+                    "spatial_l3.history_admission_mode=once_per_object requires "
+                    "grounder_ordered_landmark_memory"
+                )
         for name in (
             "grounder_checkpoint", "grounder_config", "grounder_device",
             "grounder_bert_vocab_path",

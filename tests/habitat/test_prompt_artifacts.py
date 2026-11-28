@@ -480,3 +480,37 @@ def test_prompt_diagnostic_row_flattens_ordered_landmark_fields() -> None:
         "fact_line_count": 1,
         "placeholder_line_count": 0,
     }
+
+
+def test_prompt_diagnostic_row_flattens_history_admission_fields() -> None:
+    admission = {
+        "history_admission_mode": "once_per_object",
+        "history_admission_candidate_object_ids": ["object-bed", "object-door"],
+        "history_admission_accepted_object_ids": ["object-bed"],
+        "history_admission_rejected_seen_object_ids": ["object-door"],
+        "history_admission_missing_object_id_count": 1,
+        "history_admission_confirmed_object_ids": ["object-bed"],
+        "history_admission_adopted_object_ids": ["object-bed"],
+        "history_admission_pending_object_ids": [],
+    }
+    row = prompt_diagnostic_row(
+        {
+            "step": 3,
+            "prompt_mode": "l1_original_only",
+            "prompt_protocol_version": "l1_l3_prompt_ablation_v1",
+            **admission,
+            "prompt_context": {
+                "source": "l3_geometry_on_demand",
+                "layers": {},
+                "spatial_l3": {
+                    "l3_query": {
+                        "query_executed": True,
+                        **admission,
+                    },
+                },
+            },
+        },
+        episode_id="ep", habitat_episode_id="168", scene_id="s",
+    )
+    for field, expected in admission.items():
+        assert row[field] == expected

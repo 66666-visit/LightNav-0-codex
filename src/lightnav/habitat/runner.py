@@ -156,6 +156,14 @@ class MemoryConfig:
             raise ValueError(
                 "on-demand L3 requires legacy or l1_original_only L1 prompt mode"
             )
+        if (
+            self.spatial_l3.history_admission_mode != "off"
+            and self.prompt_mode != "l1_original_only"
+        ):
+            raise ValueError(
+                "history admission requires the l1_original_only prompt mode "
+                "whose final Prompt audit confirms adoption"
+            )
         if not isinstance(self.adaptive_l3_query, AdaptiveL3QueryConfig):
             raise ValueError("memory.adaptive_l3_query must be AdaptiveL3QueryConfig")
         if self.adaptive_l3_query.enabled:
